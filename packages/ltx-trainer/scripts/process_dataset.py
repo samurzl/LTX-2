@@ -16,17 +16,26 @@ from pathlib import Path
 
 import typer
 from decode_latents import LatentsDecoder
-from process_captions import compute_captions_embeddings
+from process_captions import CaptionEmbeddingTask, compute_caption_embeddings_from_tasks, compute_captions_embeddings
 from process_videos import compute_latents, compute_scaled_resolution_buckets, parse_resolution_buckets
 from rich.console import Console
 
 from ltx_trainer import logger
 from ltx_trainer.gpu_utils import free_gpu_memory_context
 from ltx_trainer.negative_generation import (
+    NegativeLatentGenerationSpec,
+    generate_negative_latents,
     generate_missing_negative_latents,
     load_negative_sample_specs,
     split_negative_sample_specs,
     write_negative_media_subset,
+)
+from ltx_trainer.nsync_manifest import (
+    NSYNC_MANIFEST_FILENAME,
+    build_nsync_manifest,
+    filter_advanced_nsync_specs,
+    load_advanced_nsync_specs,
+    write_nsync_manifest,
 )
 
 console = Console()
@@ -79,13 +88,23 @@ def preprocess_dataset(  # noqa: PLR0913
     negative_latents_dir = output_base / "negative_latents"
     negative_audio_latents_dir = output_base / "negative_audio_latents"
 
-    negative_specs = load_negative_sample_specs(
+    advanced_nsync_specs = load_advanced_nsync_specs(
         dataset_file,
         media_column=video_column,
-        negative_caption_column=negative_caption_column,
-        negative_media_column=negative_media_column,
+        legacy_negative_caption_column=negative_caption_column,
+        legacy_negative_media_column=negative_media_column,
     )
-    manual_negative_specs, generated_negative_specs = split_negative_sample_specs(negative_specs)
+    negative_specs = []
+    manual_negative_specs = []
+    generated_negative_specs = []
+    if advanced_nsync_specs is None:
+        negative_specs = load_negative_sample_specs(
+            dataset_file,
+            media_column=video_column,
+            negative_caption_column=negative_caption_column,
+            negative_media_column=negative_media_column,
+        )
+        manual_negative_specs, generated_negative_specs = split_negative_sample_specs(negative_specs)
 
     if lora_trigger:
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
@@ -105,7 +124,6 @@ def preprocess_dataset(  # noqa: PLR0913
             device=device,
             load_in_8bit=load_text_encoder_in_8bit,
         )
-
         if negative_specs:
             compute_captions_embeddings(
                 dataset_file=dataset_file,
@@ -219,6 +237,83 @@ def preprocess_dataset(  # noqa: PLR0913
                 load_text_encoder_in_8bit=load_text_encoder_in_8bit,
             )
 
+        if advanced_nsync_specs is not None:
+            available_sample_rel_paths = {
+                str(path.relative_to(latents_dir))
+                for path in sorted(latents_dir.glob("**/*.pt"))
+            }
+            filtered_advanced_specs = filter_advanced_nsync_specs(
+                advanced_nsync_specs,
+                available_sample_rel_paths=available_sample_rel_paths,
+            )
+            filtered_count = len(advanced_nsync_specs) - len(filtered_advanced_specs)
+            if filtered_count > 0:
+                logger.warning(
+                    f"Skipping {filtered_count} advanced NSYNC sample(s) without matching positive latents after "
+                    "preprocessing"
+                )
+
+            manifest = build_nsync_manifest(
+                filtered_advanced_specs,
+                with_audio=with_audio,
+            )
+
+            negative_caption_tasks: list[CaptionEmbeddingTask] = []
+            synthetic_generation_specs: list[NegativeLatentGenerationSpec] = []
+            for sample_spec, manifest_sample in zip(filtered_advanced_specs, manifest.samples, strict=True):
+                for negative_spec, manifest_negative in zip(sample_spec.negatives, manifest_sample.negatives, strict=True):
+                    negative_caption_tasks.append(
+                        CaptionEmbeddingTask(
+                            prompt=negative_spec.caption,
+                            output_path=manifest_negative.condition_rel_path,
+                        )
+                    )
+                    if negative_spec.media == "synthetic":
+                        if manifest_negative.latent_rel_path is None or negative_spec.prompt is None:
+                            raise ValueError("Synthetic advanced NSYNC negatives must provide both output path and prompt")
+                        synthetic_generation_specs.append(
+                            NegativeLatentGenerationSpec(
+                                positive_media_path=sample_spec.media_path,
+                                output_rel_path=manifest_negative.latent_rel_path,
+                                prompt=negative_spec.prompt,
+                            )
+                        )
+
+            with free_gpu_memory_context():
+                compute_caption_embeddings_from_tasks(
+                    tasks=negative_caption_tasks,
+                    output_dir=str(negative_conditions_dir),
+                    model_path=model_path,
+                    text_encoder_path=text_encoder_path,
+                    lora_trigger=lora_trigger,
+                    remove_llm_prefixes=remove_llm_prefixes,
+                    batch_size=batch_size,
+                    device=device,
+                    load_in_8bit=load_text_encoder_in_8bit,
+                )
+
+            if synthetic_generation_specs:
+                generate_negative_latents(
+                    synthetic_generation_specs,
+                    positive_latents_dir=latents_dir,
+                    output_dir=negative_latents_dir,
+                    model_path=model_path,
+                    text_encoder_path=text_encoder_path,
+                    device=device,
+                    with_audio=with_audio,
+                    audio_output_dir=negative_audio_latents_dir if with_audio else None,
+                    inference_steps=negative_inference_steps,
+                    guidance_scale=negative_guidance_scale,
+                    negative_prompt=negative_prompt,
+                    seed=negative_seed,
+                    save_previews=save_generated_negatives,
+                    preview_output_dir=output_base / "generated_negative_previews",
+                    load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+                )
+
+            manifest_path = write_nsync_manifest(manifest, output_base / NSYNC_MANIFEST_FILENAME)
+            logger.info(f"Advanced NSYNC manifest saved to {manifest_path}")
+
     # Handle decoding if requested (for verification)
     if decode:
         logger.info("Decoding latents for verification...")
@@ -253,6 +348,8 @@ def preprocess_dataset(  # noqa: PLR0913
         logger.info("NSYNC negatives saved to negative_conditions/ and negative_latents/ directories")
         if with_audio:
             logger.info("NSYNC negative audio latents saved to negative_audio_latents/ directory")
+    if advanced_nsync_specs is not None:
+        logger.info("Advanced NSYNC metadata saved to nsync_manifest.json")
 
 
 def _validate_dataset_file(dataset_path: str) -> None:

@@ -13,6 +13,7 @@ Can be used as a standalone script:
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
@@ -82,6 +83,12 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Process text captions and save embeddings for video generation training.",
 )
+
+
+@dataclass(frozen=True)
+class CaptionEmbeddingTask:
+    prompt: str
+    output_path: str
 
 
 class CaptionsDataset(Dataset):
@@ -213,11 +220,109 @@ class CaptionsDataset(Dataset):
     def _clean_llm_prefixes(self) -> None:
         """Remove common LLM-generated prefixes from captions."""
         for i in range(len(self.prompts)):
-            self.prompts[i] = self.prompts[i].strip()
-            for phrase in COMMON_LLM_START_PHRASES:
-                if self.prompts[i].startswith(phrase):
-                    self.prompts[i] = self.prompts[i].removeprefix(phrase).strip()
-                    break
+            self.prompts[i] = strip_llm_prefix(self.prompts[i])
+
+
+def strip_llm_prefix(prompt: str) -> str:
+    stripped = prompt.strip()
+    for phrase in COMMON_LLM_START_PHRASES:
+        if stripped.startswith(phrase):
+            return stripped.removeprefix(phrase).strip()
+    return stripped
+
+
+def compute_caption_embeddings_from_tasks(  # noqa: PLR0913
+    tasks: list[CaptionEmbeddingTask],
+    output_dir: str,
+    model_path: str,
+    text_encoder_path: str,
+    *,
+    lora_trigger: str | None = None,
+    remove_llm_prefixes: bool = False,
+    batch_size: int = 8,
+    device: str = "cuda",
+    load_in_8bit: bool = False,
+) -> None:
+    """Encode explicit prompt/output pairs into trainer-format caption embedding files."""
+    console = Console()
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    if not tasks:
+        logger.info(f"No caption embedding tasks for {output_path}")
+        return
+
+    prompt_prefix = f"{lora_trigger.strip()} " if lora_trigger else ""
+    normalized_tasks = [
+        CaptionEmbeddingTask(
+            prompt=prompt_prefix
+            + (strip_llm_prefix(task.prompt) if remove_llm_prefixes else task.prompt.strip()),
+            output_path=task.output_path,
+        )
+        for task in tasks
+    ]
+
+    with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
+        text_encoder = load_text_encoder(
+            text_encoder_path,
+            device=device,
+            dtype=torch.bfloat16,
+            load_in_8bit=load_in_8bit,
+        )
+        embeddings_processor = load_embeddings_processor(
+            model_path,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+    logger.info("Text encoder and embeddings processor loaded successfully")
+
+    if batch_size > 1:
+        logger.warning(
+            "Batch size greater than 1 is not currently supported with the Gemma tokenizer. "
+            "Overriding batch_size to 1. This will be fixed in a future update."
+        )
+        batch_size = 1
+
+    total_batches = (len(normalized_tasks) + batch_size - 1) // batch_size
+    logger.info(f"Processing {len(normalized_tasks):,} caption task(s) in {total_batches:,} batches...")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Processing captions", total=total_batches)
+        for batch_start in range(0, len(normalized_tasks), batch_size):
+            batch = normalized_tasks[batch_start : batch_start + batch_size]
+            with torch.inference_mode():
+                for caption_task in batch:
+                    hidden_states, prompt_attention_mask = text_encoder.encode(caption_task.prompt, padding_side="left")
+                    video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
+                        hidden_states, prompt_attention_mask, "left"
+                    )
+
+                    output_rel_path = Path(caption_task.output_path)
+                    output_file = output_path / output_rel_path
+                    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+                    embedding_data = {
+                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
+                        "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
+                    }
+                    if audio_prompt_embeds is not None:
+                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
+
+                    torch.save(embedding_data, output_file)
+
+            progress.advance(task)
+
+    logger.info(f"Processed {len(normalized_tasks):,} caption task(s). Embeddings saved to {output_path}")
 
 
 def compute_captions_embeddings(  # noqa: PLR0913
@@ -249,8 +354,6 @@ def compute_captions_embeddings(  # noqa: PLR0913
         load_in_8bit: Whether to load the Gemma text encoder in 8-bit precision
     """
 
-    console = Console()
-
     # Create dataset
     dataset = CaptionsDataset(
         dataset_file=dataset_file,
@@ -260,84 +363,16 @@ def compute_captions_embeddings(  # noqa: PLR0913
         remove_llm_prefixes=remove_llm_prefixes,
     )
     logger.info(f"Loaded {len(dataset):,} captions")
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Load text encoder and embeddings processor
-    with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
-        text_encoder = load_text_encoder(
-            text_encoder_path,
-            device=device,
-            dtype=torch.bfloat16,
-            load_in_8bit=load_in_8bit,
-        )
-        embeddings_processor = load_embeddings_processor(
-            model_path,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-
-    logger.info("Text encoder and embeddings processor loaded successfully")
-
-    # TODO(batch-tokenization): The current Gemma tokenizer doesn't support batched tokenization.
-    if batch_size > 1:
-        logger.warning(
-            "Batch size greater than 1 is not currently supported with the Gemma tokenizer. "
-            "Overriding batch_size to 1. This will be fixed in a future update."
-        )
-        batch_size = 1
-
-    # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    # Process batches
-    total_batches = len(dataloader)
-    logger.info(f"Processing captions in {total_batches:,} batches...")
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Processing captions", total=len(dataloader))
-        for batch in dataloader:
-            # Encode prompts using text_encoder.encode() + feature_extractor
-            # (returns video/audio features before connector).
-            # The connector is applied during training via embeddings_processor
-            with torch.inference_mode():
-                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
-                # For now, process one at a time:
-                for i in range(len(batch["prompt"])):
-                    hidden_states, prompt_attention_mask = text_encoder.encode(batch["prompt"][i], padding_side="left")
-                    video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
-                        hidden_states, prompt_attention_mask, "left"
-                    )
-
-                    output_rel_path = Path(batch["output_path"][i])
-
-                    # Create output directory maintaining structure
-                    output_dir_path = output_path / output_rel_path.parent
-                    output_dir_path.mkdir(parents=True, exist_ok=True)
-
-                    embedding_data = {
-                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
-                        "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
-                    }
-                    if audio_prompt_embeds is not None:
-                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
-
-                    output_file = output_path / output_rel_path
-                    torch.save(embedding_data, output_file)
-
-            progress.advance(task)
-
-    logger.info(f"Processed {len(dataset):,} captions. Embeddings saved to {output_path}")
+    tasks = [CaptionEmbeddingTask(prompt=item["prompt"], output_path=item["output_path"]) for item in dataset]
+    compute_caption_embeddings_from_tasks(
+        tasks=tasks,
+        output_dir=output_dir,
+        model_path=model_path,
+        text_encoder_path=text_encoder_path,
+        batch_size=batch_size,
+        device=device,
+        load_in_8bit=load_in_8bit,
+    )
 
 
 @app.command()

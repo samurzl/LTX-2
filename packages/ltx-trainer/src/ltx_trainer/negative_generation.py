@@ -27,6 +27,15 @@ class NegativeSampleSpec:
     negative_media_path: str | None = None
 
 
+@dataclass(frozen=True)
+class NegativeLatentGenerationSpec:
+    """Description of one synthetic negative latent file to generate."""
+
+    positive_media_path: str
+    output_rel_path: str
+    prompt: str
+
+
 def load_negative_sample_specs(
     dataset_file: str | Path,
     *,
@@ -131,6 +140,52 @@ def generate_missing_negative_latents(  # noqa: PLR0913
     load_text_encoder_in_8bit: bool = False,
 ) -> None:
     """Generate paired NSYNC negatives directly into trainer-format latent files."""
+    generation_specs = [
+        NegativeLatentGenerationSpec(
+            positive_media_path=spec.media_path,
+            output_rel_path=str(Path(spec.media_path).with_suffix(".pt")),
+            prompt=spec.negative_caption,
+        )
+        for spec in specs
+    ]
+    generate_negative_latents(
+        generation_specs,
+        positive_latents_dir=positive_latents_dir,
+        output_dir=output_dir,
+        model_path=model_path,
+        text_encoder_path=text_encoder_path,
+        device=device,
+        with_audio=with_audio,
+        audio_output_dir=audio_output_dir,
+        inference_steps=inference_steps,
+        guidance_scale=guidance_scale,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        save_previews=save_previews,
+        preview_output_dir=preview_output_dir,
+        load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+    )
+
+
+def generate_negative_latents(  # noqa: PLR0913
+    specs: list[NegativeLatentGenerationSpec],
+    *,
+    positive_latents_dir: str | Path,
+    output_dir: str | Path,
+    model_path: str | Path,
+    text_encoder_path: str | Path,
+    device: str = "cuda",
+    with_audio: bool = False,
+    audio_output_dir: str | Path | None = None,
+    inference_steps: int = 30,
+    guidance_scale: float = 4.0,
+    negative_prompt: str = "",
+    seed: int = 42,
+    save_previews: bool = False,
+    preview_output_dir: str | Path | None = None,
+    load_text_encoder_in_8bit: bool = False,
+) -> None:
+    """Generate synthetic negative latents directly into trainer-format latent files."""
     if with_audio and audio_output_dir is None:
         raise ValueError("audio_output_dir must be provided when with_audio=True")
 
@@ -151,7 +206,7 @@ def generate_missing_negative_latents(  # noqa: PLR0913
         preview_root = Path(preview_output_dir) if preview_output_dir is not None else output_root.parent / "generated_negative_previews"
         preview_root.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Generating {len(specs):,} paired NSYNC negatives from captions...")
+    logger.info(f"Generating {len(specs):,} paired NSYNC negatives from prompts...")
 
     components = load_ltx_model(
         checkpoint_path=model_path,
@@ -189,15 +244,15 @@ def generate_missing_negative_latents(  # noqa: PLR0913
     audio_sample_rate = getattr(components.audio_vae_decoder, "sample_rate", None)
 
     for spec in specs:
-        output_rel_path = Path(spec.media_path).with_suffix(".pt")
-        positive_latent_path = positive_latents_root / output_rel_path
+        output_rel_path = Path(spec.output_rel_path)
+        positive_latent_path = positive_latents_root / Path(spec.positive_media_path).with_suffix(".pt")
         if not positive_latent_path.is_file():
             raise FileNotFoundError(f"Positive latent file not found for negative generation: {positive_latent_path}")
 
         positive_latent_data = torch.load(positive_latent_path, map_location="cpu", weights_only=True)
         generation_config = _build_generation_config(
             positive_latent_data,
-            prompt=spec.negative_caption,
+            prompt=spec.prompt,
             negative_prompt=negative_prompt,
             inference_steps=inference_steps,
             guidance_scale=guidance_scale,

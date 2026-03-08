@@ -248,7 +248,8 @@ data:
 
 ### NsyncConfig
 
-Controls paired positive/negative NSYNC training.
+Controls paired positive/negative NSYNC training. Advanced structured datasets additionally emit
+`nsync_manifest.json`, which the trainer uses automatically when present.
 
 ```yaml
 nsync:
@@ -265,14 +266,15 @@ nsync:
 | Parameter                    | Description                                                                                       |
 |-----------------------------|---------------------------------------------------------------------------------------------------|
 | `enabled`                   | Enable NSYNC gradient projection training                                                         |
-| `use_anchor`                | Use a second positive batch as the anchor branch                                                  |
+| `use_anchor`                | Enable or ignore manifest-defined anchor rules during NSYNC training                              |
 | `negative_latents_dir`      | Directory name for paired negative video latents                                                  |
 | `negative_conditions_dir`   | Directory name for paired negative text embeddings                                                |
 | `negative_audio_latents_dir`| Directory name for paired negative audio latents when `training_strategy.with_audio: true`        |
 | `projection_eps`            | Minimum denominator used when computing the projection coefficients                               |
 
 When `nsync.enabled: true`, preprocessing must also create `negative_conditions/` and `negative_latents/`.
-For joint audio-video training, `negative_audio_latents/` is required as well.
+For joint audio-video training, `negative_audio_latents/` is required as well. Advanced structured
+datasets also write `nsync_manifest.json` and use it automatically at training time.
 
 ### ValidationConfig
 

@@ -1,6 +1,7 @@
 import torch
 
 from ltx_trainer.nsync import (
+    combine_advanced_tensor_gradients,
     combine_tensor_gradients,
     extend_data_sources_for_nsync,
     negative_branch_source_keys,
@@ -64,3 +65,18 @@ def test_negative_branch_source_keys_reuse_positive_reference_latents() -> None:
     assert source_keys.conditions == "negative_conditions"
     assert source_keys.audio_latents == "negative_audio_latents"
     assert source_keys.ref_latents == "ref_latents"
+
+
+def test_combine_advanced_tensor_gradients_applies_negative_anchor_and_agreement_terms() -> None:
+    positive = torch.tensor([2.0, 2.0])
+    negatives = [torch.tensor([1.0, 0.0]), torch.tensor([0.0, 2.0])]
+    anchors = [torch.tensor([2.0, 0.0]), torch.tensor([0.0, 2.0])]
+
+    combined = combine_advanced_tensor_gradients(
+        positive,
+        negatives,
+        anchors=anchors,
+    )
+
+    expected = torch.tensor([3.0, 3.0])
+    assert torch.allclose(combined, expected)

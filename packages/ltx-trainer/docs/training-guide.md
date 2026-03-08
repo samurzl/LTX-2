@@ -35,15 +35,14 @@ The trainer will:
 
 ## 🧭 NSYNC Training
 
-To train with `nsync`, first preprocess paired negative branches alongside your normal dataset:
+To train with advanced `nsync`, first preprocess the structured `nsync` metadata alongside your
+normal dataset:
 
 ```bash
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
-    --negative-caption-column negative_caption \
-    --negative-media-column negative_media_path
+    --text-encoder-path /path/to/gemma-model
 ```
 
 Then enable the `nsync` section in your training config:
@@ -58,8 +57,11 @@ nsync:
   projection_eps: 1.0e-12
 ```
 
-`negative_caption` is always the conditioning text for the negative branch. If a row omits `negative_media_path`,
-preprocessing will generate the missing negative media automatically from `negative_caption`.
+Advanced preprocessing writes `nsync_manifest.json`, negative caption embeddings, and any synthetic
+negative media latents. In structured mode, `caption` is always the training text for a negative
+branch, while `prompt` is only used when `media: "synthetic"` to generate that branch's media.
+Legacy single-negative preprocessing with `negative_caption` and `negative_media_path` remains
+supported for older datasets.
 
 ## 🖥️ Distributed / Multi-GPU Training
 

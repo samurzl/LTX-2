@@ -25,10 +25,11 @@ All detailed guides and technical documentation are in the [docs](./docs/) direc
 
 ## 🧭 NSYNC at a Glance
 
-`nsync` training works with the existing offline `.precomputed` workflow. Add `negative_caption`
-to your dataset metadata, optionally add `negative_media_path`, preprocess with
-[`scripts/process_dataset.py`](scripts/process_dataset.py), then enable the `nsync` section in your
-training config.
+`nsync` training works with the existing offline `.precomputed` workflow. Advanced datasets use a
+per-row `nsync` object in JSON/JSONL metadata for categories, multiple negatives, and randomized
+anchors. Legacy single-negative datasets can still use `negative_caption` and
+`negative_media_path`. Preprocess with [`scripts/process_dataset.py`](scripts/process_dataset.py),
+then enable the `nsync` section in your training config.
 
 Start here:
 

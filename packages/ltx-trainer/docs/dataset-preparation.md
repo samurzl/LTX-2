@@ -149,31 +149,59 @@ caption,media_path
 
 ### NSYNC Dataset Columns
 
-When preparing a dataset for `nsync` training, add these optional paired columns:
-
-- `negative_caption`: Required for `nsync`. The negative text prompt paired to the positive sample.
-- `negative_media_path`: Optional. If provided, preprocessing uses this media file as the negative target instead of generating one.
-
-If `negative_media_path` is omitted for a row, `process_dataset.py` will generate the negative media automatically from
-`negative_caption` and save it into `negative_latents/` (and `negative_audio_latents/` when `--with-audio` is enabled).
-
-**JSON example with NSYNC columns:**
+Advanced `nsync` datasets are authored in JSON or JSONL with a per-row `nsync` object:
 
 ```json
 [
   {
     "caption": "A cinematic close-up of a cat on a windowsill",
     "media_path": "videos/cat.mp4",
-    "negative_caption": "A low-detail surveillance-camera style cat video",
-    "negative_media_path": "negatives/cat.mp4"
+    "nsync": {
+      "categories": ["cat", "cinematic"],
+      "negatives": [
+        {
+          "media": "positive",
+          "caption": "A low-detail surveillance-camera style cat video"
+        },
+        {
+          "media": "synthetic",
+          "prompt": "A shaky handheld phone recording of a cat in flat lighting",
+          "caption": "A shaky handheld cat video"
+        }
+      ],
+      "anchors": [
+        { "required_categories": ["cat"] },
+        { "required_categories": ["cat"], "extra_random_category": true }
+      ]
+    }
   },
   {
     "caption": "A dog running through a park at golden hour",
     "media_path": "videos/dog.mp4",
-    "negative_caption": "A shaky handheld phone recording of a dog in flat lighting"
+    "nsync": {
+      "categories": ["dog", "studio"],
+      "negatives": [
+        {
+          "media": "positive",
+          "caption": "A low-detail studio-lit dog clip"
+        }
+      ]
+    }
   }
 ]
 ```
+
+Rules:
+
+- `nsync.categories` is required and every training sample must have at least one category.
+- `nsync.negatives` is required and can contain multiple negatives per positive.
+- Negative `media` can be `positive` or `synthetic`.
+- Negative `caption` is the training text.
+- Negative `prompt` is only used when `media: "synthetic"` and drives base-model media generation.
+- `nsync.anchors` is optional. Anchors always reuse another positive sample's media and caption.
+
+Legacy single-negative preprocessing still works with `negative_caption` and optional
+`negative_media_path`, but it does not support categories, multiple negatives, or structured anchors.
 
 ### 📐 Resolution Buckets
 
@@ -260,20 +288,24 @@ dataset/
 
 ### NSYNC Negative Preprocessing
 
-To preprocess paired negatives for `nsync`, keep `negative_caption` in your metadata and optionally add
-`negative_media_path` for rows where you already have curated negative media:
+To preprocess advanced `nsync` metadata, keep the structured `nsync` object in your JSON/JSONL rows and run:
 
 ```bash
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
-    --negative-caption-column negative_caption \
-    --negative-media-column negative_media_path
+    --text-encoder-path /path/to/gemma-model
 ```
 
-If a row has only `negative_caption`, the script auto-generates the missing negative sample using the base LTX model and
-saves trainer-format latents directly. Add `--save-generated-negatives` if you also want decoded preview videos.
+This writes the normal positive artifacts plus:
+
+- `negative_conditions/` for every negative caption
+- `negative_latents/` and `negative_audio_latents/` only for `media: "synthetic"` negatives
+- `nsync_manifest.json` with categories, negative branch metadata, and anchor rules
+
+Legacy flat-column NSYNC preprocessing still works. In that mode, `negative_caption` remains the
+conditioning text and `negative_media_path` is optional. Add `--save-generated-negatives` if you
+also want decoded preview videos for generated legacy negatives.
 
 ## 🪄 IC-LoRA Reference Video Preprocessing
 

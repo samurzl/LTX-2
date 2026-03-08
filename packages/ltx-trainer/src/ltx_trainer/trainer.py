@@ -32,11 +32,12 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
-from ltx_trainer.datasets import PrecomputedDataset
+from ltx_trainer.datasets import ManifestNsyncDataset, PrecomputedDataset, collate_manifest_nsync_batch
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 from ltx_trainer.model_loader import load_model as load_ltx_model
+from ltx_trainer.nsync_manifest import resolve_nsync_manifest_path
 from ltx_trainer.nsync import (
     extend_data_sources_for_nsync,
     gradient_statistics,
@@ -105,6 +106,7 @@ class LtxvTrainer:
         self._prepare_models_for_training()
         self._dataset = None
         self._anchor_dataloader = None
+        self._use_manifest_nsync = False
         self._global_step = -1
         self._checkpoint_paths = []
         self._init_wandb()
@@ -355,6 +357,9 @@ class LtxvTrainer:
         anchor_batch: dict[str, dict[str, Tensor]] | None,
     ) -> TrainingStepResult:
         """Run NSYNC positive/negative/anchor branches and set the projected gradient update."""
+        if self._use_manifest_nsync:
+            return self._training_step_nsync_manifest(batch)
+
         positive_keys = positive_branch_source_keys()
         negative_keys = negative_branch_source_keys()
 
@@ -390,6 +395,67 @@ class LtxvTrainer:
         if self._config.nsync.use_anchor:
             metrics["train/loss_anchor"] = anchor_loss_value
             branch_losses.append(torch.tensor(anchor_loss_value, device=positive_loss.device))
+
+        return TrainingStepResult(
+            loss=torch.stack(branch_losses).mean(),
+            metrics=metrics,
+        )
+
+    def _training_step_nsync_manifest(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+    ) -> TrainingStepResult:
+        """Run manifest-backed NSYNC branches and set the projected gradient update."""
+        positive_keys = positive_branch_source_keys()
+
+        positive_loss = self._compute_branch_loss(batch, positive_keys)
+        self._accelerator.backward(positive_loss)
+        positive_grads = self._clone_trainable_gradients()
+        self._clear_trainable_gradients()
+
+        negative_slot_weights = batch["negative_slot_weights"]
+        negative_grads_per_slot: list[list[Tensor | None]] = []
+        negative_loss_values: list[float] = []
+        for slot_batch, slot_weight in zip(batch["negative_slots"], negative_slot_weights, strict=True):
+            negative_loss = self._compute_branch_loss(slot_batch, positive_keys)
+            negative_loss_values.append(negative_loss.detach().item())
+            scaled_negative_loss = negative_loss * slot_weight.to(device=negative_loss.device, dtype=negative_loss.dtype)
+            self._accelerator.backward(scaled_negative_loss)
+            negative_grads_per_slot.append(self._clone_trainable_gradients())
+            self._clear_trainable_gradients()
+
+        anchor_slot_weights = batch["anchor_slot_weights"]
+        anchor_grads_per_slot: list[list[Tensor | None]] = []
+        anchor_loss_values: list[float] = []
+        for slot_batch, slot_weight in zip(batch["anchor_slots"], anchor_slot_weights, strict=True):
+            anchor_loss = self._compute_branch_loss(slot_batch, positive_keys)
+            anchor_loss_values.append(anchor_loss.detach().item())
+            scaled_anchor_loss = anchor_loss * slot_weight.to(device=anchor_loss.device, dtype=anchor_loss.dtype)
+            self._accelerator.backward(scaled_anchor_loss)
+            anchor_grads_per_slot.append(self._clone_trainable_gradients())
+            self._clear_trainable_gradients()
+
+        self._apply_manifest_nsync_gradients(
+            positive_grads=positive_grads,
+            negative_grads_per_slot=negative_grads_per_slot,
+            negative_slot_weights=negative_slot_weights,
+            anchor_grads_per_slot=anchor_grads_per_slot,
+            anchor_slot_weights=anchor_slot_weights,
+        )
+
+        metrics = {
+            "train/loss": positive_loss.detach().item(),
+            "train/loss_positive": positive_loss.detach().item(),
+            "train/loss_negative": self._weighted_scalar_mean(negative_loss_values, negative_slot_weights),
+        }
+
+        branch_losses = [
+            positive_loss.detach(),
+            torch.tensor(metrics["train/loss_negative"], device=positive_loss.device),
+        ]
+        if anchor_loss_values:
+            metrics["train/loss_anchor"] = self._weighted_scalar_mean(anchor_loss_values, anchor_slot_weights)
+            branch_losses.append(torch.tensor(metrics["train/loss_anchor"], device=positive_loss.device))
 
         return TrainingStepResult(
             loss=torch.stack(branch_losses).mean(),
@@ -505,6 +571,151 @@ class LtxvTrainer:
                 updated_grad = updated_grad + anchor_scale.to(dtype=anchor_grad.dtype) * anchor_grad
 
             param.grad = updated_grad
+
+    def _apply_manifest_nsync_gradients(
+        self,
+        *,
+        positive_grads: list[Tensor | None],
+        negative_grads_per_slot: list[list[Tensor | None]],
+        negative_slot_weights: Tensor,
+        anchor_grads_per_slot: list[list[Tensor | None]],
+        anchor_slot_weights: Tensor,
+    ) -> None:
+        """Apply the advanced NSYNC update rule for manifest-backed multi-branch batches."""
+        negative_projection = self._average_projection_terms(
+            source_grads=positive_grads,
+            target_grads_per_slot=negative_grads_per_slot,
+            slot_weights=negative_slot_weights,
+        )
+        positive_anchor_projection = self._average_projection_terms(
+            source_grads=positive_grads,
+            target_grads_per_slot=anchor_grads_per_slot,
+            slot_weights=anchor_slot_weights,
+        )
+        anchor_positive_projection = self._average_reverse_projection_terms(
+            source_grads_per_slot=anchor_grads_per_slot,
+            target_grads=positive_grads,
+            slot_weights=anchor_slot_weights,
+        )
+
+        for param, positive_grad, negative_proj, positive_anchor_proj, anchor_positive_proj in zip(
+            self._trainable_params,
+            positive_grads,
+            negative_projection,
+            positive_anchor_projection,
+            anchor_positive_projection,
+            strict=True,
+        ):
+            reference_grad = next(
+                (grad for grad in (positive_grad, negative_proj, positive_anchor_proj, anchor_positive_proj) if grad is not None),
+                None,
+            )
+            if reference_grad is None:
+                param.grad = None
+                continue
+
+            updated_grad = torch.zeros_like(reference_grad)
+            if positive_grad is not None:
+                updated_grad = updated_grad + positive_grad
+            if negative_proj is not None:
+                updated_grad = updated_grad - negative_proj.to(dtype=updated_grad.dtype)
+            if positive_anchor_proj is not None:
+                updated_grad = updated_grad + positive_anchor_proj.to(dtype=updated_grad.dtype)
+            if positive_anchor_proj is not None or anchor_positive_proj is not None:
+                agree_term = torch.zeros_like(updated_grad)
+                if positive_anchor_proj is not None:
+                    agree_term = agree_term + positive_anchor_proj.to(dtype=updated_grad.dtype)
+                if anchor_positive_proj is not None:
+                    agree_term = agree_term + anchor_positive_proj.to(dtype=updated_grad.dtype)
+                updated_grad = updated_grad + 0.5 * agree_term
+
+            param.grad = updated_grad
+
+    def _average_projection_terms(
+        self,
+        *,
+        source_grads: list[Tensor | None],
+        target_grads_per_slot: list[list[Tensor | None]],
+        slot_weights: Tensor,
+    ) -> list[Tensor | None]:
+        """Average projections of one gradient list onto multiple target gradient lists."""
+        if not target_grads_per_slot:
+            return [None] * len(self._trainable_params)
+
+        total_weight = slot_weights.sum().clamp_min(self._config.nsync.projection_eps)
+        projection_scales = [
+            self._compute_projection_scale(source_grads, target_grads)
+            for target_grads in target_grads_per_slot
+        ]
+        return self._combine_projection_terms(
+            target_grads_per_slot=target_grads_per_slot,
+            projection_scales=projection_scales,
+            slot_weights=slot_weights,
+            total_weight=total_weight,
+        )
+
+    def _average_reverse_projection_terms(
+        self,
+        *,
+        source_grads_per_slot: list[list[Tensor | None]],
+        target_grads: list[Tensor | None],
+        slot_weights: Tensor,
+    ) -> list[Tensor | None]:
+        """Average projections of multiple source gradient lists onto one target gradient list."""
+        if not source_grads_per_slot:
+            return [None] * len(self._trainable_params)
+
+        total_weight = slot_weights.sum().clamp_min(self._config.nsync.projection_eps)
+        projection_scales = [
+            self._compute_projection_scale(source_grads, target_grads)
+            for source_grads in source_grads_per_slot
+        ]
+        target_grads_per_slot = [target_grads for _ in source_grads_per_slot]
+        return self._combine_projection_terms(
+            target_grads_per_slot=target_grads_per_slot,
+            projection_scales=projection_scales,
+            slot_weights=slot_weights,
+            total_weight=total_weight,
+        )
+
+    def _combine_projection_terms(
+        self,
+        *,
+        target_grads_per_slot: list[list[Tensor | None]],
+        projection_scales: list[Tensor],
+        slot_weights: Tensor,
+        total_weight: Tensor,
+    ) -> list[Tensor | None]:
+        """Combine weighted projection vectors slot-by-slot into one gradient list."""
+        combined_terms: list[Tensor | None] = []
+        for param_index in range(len(self._trainable_params)):
+            slot_terms = []
+            for slot_index, target_grads in enumerate(target_grads_per_slot):
+                target_grad = target_grads[param_index]
+                if target_grad is None:
+                    continue
+                scale = projection_scales[slot_index].to(device=target_grad.device, dtype=target_grad.dtype)
+                weight = slot_weights[slot_index].to(device=target_grad.device, dtype=target_grad.dtype)
+                slot_terms.append(weight * scale * target_grad)
+
+            if not slot_terms:
+                combined_terms.append(None)
+                continue
+
+            combined_terms.append(torch.stack(slot_terms).sum(dim=0) / total_weight.to(slot_terms[0].device, slot_terms[0].dtype))
+
+        return combined_terms
+
+    def _weighted_scalar_mean(self, values: list[float], weights: Tensor) -> float:
+        if not values:
+            return 0.0
+
+        weight_values = weights.detach().cpu().tolist()
+        total_weight = sum(weight_values)
+        if total_weight <= 0:
+            return 0.0
+
+        return sum(value * weight for value, weight in zip(values, weight_values, strict=True)) / total_weight
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -763,25 +974,48 @@ class LtxvTrainer:
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
         if self._dataset is None:
-            data_sources = self._build_data_sources()
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
-            logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
+            manifest_path = resolve_nsync_manifest_path(self._config.data.preprocessed_data_root)
+            self._use_manifest_nsync = self._config.nsync.enabled and manifest_path.is_file()
+            data_sources = self._build_data_sources(use_manifest_nsync=self._use_manifest_nsync)
+            base_dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
+            logger.debug(f"Loaded dataset with {len(base_dataset):,} samples from sources: {list(data_sources)}")
 
-        dataloader = self._create_dataloader(self._dataset, seed_offset=0)
-        if self._config.nsync.enabled and self._config.nsync.use_anchor:
+            if self._use_manifest_nsync:
+                logger.info(f"Using advanced NSYNC manifest: {manifest_path}")
+                self._dataset = ManifestNsyncDataset(
+                    base_dataset,
+                    manifest_path=manifest_path,
+                    negative_conditions_dir=self._config.nsync.negative_conditions_dir,
+                    negative_latents_dir=self._config.nsync.negative_latents_dir,
+                    negative_audio_latents_dir=self._config.nsync.negative_audio_latents_dir,
+                    with_audio=self._training_strategy.requires_audio,
+                    use_anchor=self._config.nsync.use_anchor,
+                )
+            else:
+                self._dataset = base_dataset
+
+        dataloader = self._create_dataloader(
+            self._dataset,
+            seed_offset=0,
+            collate_fn=collate_manifest_nsync_batch if self._use_manifest_nsync else None,
+        )
+        if self._config.nsync.enabled and self._config.nsync.use_anchor and not self._use_manifest_nsync:
             anchor_dataloader = self._create_dataloader(self._dataset, seed_offset=1)
             self._dataloader, self._anchor_dataloader = self._accelerator.prepare(dataloader, anchor_dataloader)
         else:
             self._dataloader = self._accelerator.prepare(dataloader)
             self._anchor_dataloader = None
 
-    def _build_data_sources(self) -> dict[str, str]:
+    def _build_data_sources(self, *, use_manifest_nsync: bool) -> dict[str, str]:
         """Build the dataset source mapping, including optional NSYNC branches."""
         strategy_sources = self._training_strategy.get_data_sources()
         if isinstance(strategy_sources, list):
             base_sources = {source: source for source in strategy_sources}
         else:
             base_sources = strategy_sources.copy()
+
+        if use_manifest_nsync:
+            return base_sources
 
         return extend_data_sources_for_nsync(
             base_sources,
@@ -792,7 +1026,13 @@ class LtxvTrainer:
             negative_audio_latents_dir=self._config.nsync.negative_audio_latents_dir,
         )
 
-    def _create_dataloader(self, dataset: PrecomputedDataset, *, seed_offset: int) -> DataLoader:
+    def _create_dataloader(
+        self,
+        dataset: PrecomputedDataset | ManifestNsyncDataset,
+        *,
+        seed_offset: int,
+        collate_fn: Callable | None = None,
+    ) -> DataLoader:
         """Create a shuffled dataloader with a deterministic but branch-specific seed."""
         num_workers = self._config.data.num_dataloader_workers
         generator = torch.Generator()
@@ -807,6 +1047,7 @@ class LtxvTrainer:
             pin_memory=num_workers > 0,
             persistent_workers=num_workers > 0,
             generator=generator,
+            collate_fn=collate_fn,
         )
 
     def _init_lora_weights(self) -> None:

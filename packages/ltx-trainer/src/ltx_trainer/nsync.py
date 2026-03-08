@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 from torch import Tensor
@@ -68,6 +68,77 @@ def combine_tensor_gradients(
     return updated
 
 
+def weighted_tensor_projection_average(
+    source: Tensor,
+    targets: Sequence[Tensor],
+    *,
+    weights: Sequence[float] | Tensor | None = None,
+    eps: float = 1e-12,
+) -> Tensor:
+    """Return a weighted average of projections of ``source`` onto each target."""
+    if not targets:
+        return torch.zeros_like(source)
+
+    normalized_weights = _normalize_projection_weights(targets, weights, device=source.device, dtype=source.dtype)
+    projection_terms = [
+        weight * tensor_projection(source, target, eps=eps)
+        for weight, target in zip(normalized_weights, targets, strict=True)
+    ]
+    return torch.stack(projection_terms).sum(dim=0)
+
+
+def weighted_reverse_tensor_projection_average(
+    sources: Sequence[Tensor],
+    target: Tensor,
+    *,
+    weights: Sequence[float] | Tensor | None = None,
+    eps: float = 1e-12,
+) -> Tensor:
+    """Return a weighted average of projections of each source onto ``target``."""
+    if not sources:
+        return torch.zeros_like(target)
+
+    normalized_weights = _normalize_projection_weights(sources, weights, device=target.device, dtype=target.dtype)
+    projection_terms = [
+        weight * tensor_projection(source, target, eps=eps)
+        for weight, source in zip(normalized_weights, sources, strict=True)
+    ]
+    return torch.stack(projection_terms).sum(dim=0)
+
+
+def combine_advanced_tensor_gradients(
+    positive: Tensor,
+    negatives: Sequence[Tensor],
+    *,
+    anchors: Sequence[Tensor] | None = None,
+    negative_weights: Sequence[float] | Tensor | None = None,
+    anchor_weights: Sequence[float] | Tensor | None = None,
+    eps: float = 1e-12,
+) -> Tensor:
+    """Apply the advanced NSYNC update rule to standalone tensors."""
+    anchor_list = list(anchors or [])
+    negative_projection = weighted_tensor_projection_average(
+        positive,
+        negatives,
+        weights=negative_weights,
+        eps=eps,
+    )
+    positive_anchor_projection = weighted_tensor_projection_average(
+        positive,
+        anchor_list,
+        weights=anchor_weights,
+        eps=eps,
+    )
+    anchor_positive_projection = weighted_reverse_tensor_projection_average(
+        anchor_list,
+        positive,
+        weights=anchor_weights,
+        eps=eps,
+    )
+    agree_projection = 0.5 * (positive_anchor_projection + anchor_positive_projection)
+    return positive - negative_projection + positive_anchor_projection + agree_projection
+
+
 def gradient_statistics(
     source_grads: Iterable[Tensor | None],
     target_grads: Iterable[Tensor | None],
@@ -85,3 +156,20 @@ def gradient_statistics(
         target_norm_sq = target_norm_sq + torch.sum(target_grad.float().pow(2))
 
     return dot_product, target_norm_sq
+
+
+def _normalize_projection_weights(
+    items: Sequence[Tensor],
+    weights: Sequence[float] | Tensor | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    if weights is None:
+        normalized = torch.ones(len(items), device=device, dtype=dtype)
+    else:
+        normalized = torch.as_tensor(weights, device=device, dtype=dtype)
+        if normalized.shape != (len(items),):
+            raise ValueError("Projection weights must match the number of tensors")
+
+    return normalized / normalized.sum().clamp_min(torch.finfo(dtype).eps)

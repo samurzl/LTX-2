@@ -75,22 +75,23 @@ preprocessed_data_root/
 
 ## 🧭 NSYNC Contrastive Training
 
-`nsync` adds a paired negative branch to standard training. Each positive training sample is matched with:
+`nsync` adds structured contrastive branches to standard training. In the advanced JSON/JSONL path,
+each positive sample defines:
 
-- a negative caption
-- an optional user-supplied negative media sample
-- or an auto-generated negative sample produced during preprocessing when only the negative caption is available
+- one or more categories
+- one or more negative branches
+- zero or more anchor rules that resolve to other positive samples at training time
 
 During training, the trainer runs:
 
 - the normal positive branch
-- a paired negative branch loaded from `negative_latents/` and `negative_conditions/`
-- an anchor branch from a second shuffled positive batch when `nsync.use_anchor: true`
+- one negative branch per configured negative slot
+- one randomized anchor branch per configured anchor rule when `nsync.use_anchor: true`
 
 The update is applied with the NSYNC projection rule:
 
 ```text
-g = pos - proj(pos→neg) + proj(pos→anchor)
+g = pos - proj_pos_neg + proj_pos_anchor + agree_pos_anchor
 ```
 
 ### When to Use NSYNC
@@ -101,7 +102,7 @@ g = pos - proj(pos→neg) + proj(pos→anchor)
 
 ### Preprocessing Requirements
 
-Your metadata should include `negative_caption` for every training row. `negative_media_path` is optional.
+Advanced NSYNC metadata uses a structured `nsync` object in JSON/JSONL:
 
 Example:
 
@@ -110,7 +111,21 @@ Example:
   {
     "caption": "A cinematic close-up of a cat on a windowsill",
     "media_path": "videos/cat.mp4",
-    "negative_caption": "A low-detail surveillance-camera style cat video"
+    "nsync": {
+      "categories": ["cat", "cinematic"],
+      "negatives": [
+        { "media": "positive", "caption": "A low-detail surveillance-camera style cat video" },
+        {
+          "media": "synthetic",
+          "prompt": "A shaky handheld phone recording of a cat in flat lighting",
+          "caption": "A shaky handheld cat video"
+        }
+      ],
+      "anchors": [
+        { "required_categories": ["cat"] },
+        { "required_categories": ["cat"], "extra_random_category": true }
+      ]
+    }
   }
 ]
 ```
@@ -121,9 +136,7 @@ Then preprocess with:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
-    --negative-caption-column negative_caption \
-    --negative-media-column negative_media_path
+    --text-encoder-path /path/to/gemma-model
 ```
 
 This creates:
@@ -134,7 +147,8 @@ preprocessed_data_root/
 ├── conditions/
 ├── negative_latents/
 ├── negative_conditions/
-└── negative_audio_latents/   # only when with_audio: true
+├── negative_audio_latents/   # only when with_audio: true
+└── nsync_manifest.json
 ```
 
 ### Enabling NSYNC in Training Configs
@@ -154,8 +168,11 @@ nsync:
 Notes:
 
 - For `text_to_video` with `with_audio: true`, preprocessing must also produce `negative_audio_latents/`.
-- For `video_to_video`, the negative branch reuses the positive sample's `reference_latents`.
-- `negative_caption` remains the conditioning text even when `negative_media_path` is provided.
+- For `video_to_video`, negative branches still reuse the positive sample's `reference_latents`.
+- `media: "positive"` reuses the positive sample's latent media and swaps only the conditioning caption.
+- `media: "synthetic"` generates negative media from `prompt` and still trains on `caption`.
+- `extra_random_category: true` first samples a feasible extra category name, then picks an anchor that has both the required categories and that sampled extra category.
+- Legacy single-negative NSYNC datasets without `nsync_manifest.json` still use the old paired-negative path.
 
 ## 🔥 Full Model Fine-tuning
 

@@ -61,21 +61,45 @@ See [Dataset Preparation](dataset-preparation.md) for detailed instructions.
 
 ### Optional: Prepare NSYNC Negatives
 
-If you want to train with `nsync`, add `negative_caption` to each dataset row and optionally
-`negative_media_path` for rows where you already have a curated negative sample. Then preprocess with:
+If you want to train with advanced `nsync`, add a structured `nsync` object to each JSON/JSONL row.
+For example:
+
+```json
+{
+  "caption": "A cinematic close-up of a cat on a windowsill",
+  "media_path": "videos/cat.mp4",
+  "nsync": {
+    "categories": ["cat", "cinematic"],
+    "negatives": [
+      { "media": "positive", "caption": "A low-detail surveillance-camera style cat video" },
+      {
+        "media": "synthetic",
+        "prompt": "A shaky handheld phone recording of a cat in flat lighting",
+        "caption": "A shaky handheld cat video"
+      }
+    ],
+    "anchors": [
+      { "required_categories": ["cat"] },
+      { "required_categories": ["cat"], "extra_random_category": true }
+    ]
+  }
+}
+```
+
+Then preprocess with:
 
 ```bash
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
-    --negative-caption-column negative_caption \
-    --negative-media-column negative_media_path
+    --text-encoder-path /path/to/gemma-model
 ```
 
-This produces the normal `latents/` and `conditions/` outputs plus `negative_conditions/` and
-`negative_latents/`. If a row omits `negative_media_path`, preprocessing will generate the missing
-negative media automatically from `negative_caption`.
+This produces the normal `latents/` and `conditions/` outputs plus `negative_conditions/`,
+optional generated `negative_latents/`, and `nsync_manifest.json`.
+
+Legacy single-negative NSYNC preprocessing with `negative_caption` and optional
+`negative_media_path` still works if you are not using categories or structured anchors.
 
 ### 2. Configure Training
 
@@ -134,8 +158,9 @@ Once the negative branches have been preprocessed and your config enables `nsync
 uv run python scripts/train.py configs/ltx2_av_lora.yaml
 ```
 
-The trainer will automatically load the paired positive and negative branches and apply the NSYNC gradient update
-rule during optimization.
+The trainer will automatically load the manifest-backed positive, negative, and anchor branches and
+apply the NSYNC gradient update rule during optimization. Legacy manifest-free NSYNC datasets still
+use the old paired-negative path automatically.
 
 ## 🎯 Training Modes
 
