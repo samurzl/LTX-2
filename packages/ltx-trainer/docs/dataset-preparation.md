@@ -147,6 +147,34 @@ caption,media_path
 "A dog running in the park","videos/dog_running.mp4"
 ```
 
+### NSYNC Dataset Columns
+
+When preparing a dataset for `nsync` training, add these optional paired columns:
+
+- `negative_caption`: Required for `nsync`. The negative text prompt paired to the positive sample.
+- `negative_media_path`: Optional. If provided, preprocessing uses this media file as the negative target instead of generating one.
+
+If `negative_media_path` is omitted for a row, `process_dataset.py` will generate the negative media automatically from
+`negative_caption` and save it into `negative_latents/` (and `negative_audio_latents/` when `--with-audio` is enabled).
+
+**JSON example with NSYNC columns:**
+
+```json
+[
+  {
+    "caption": "A cinematic close-up of a cat on a windowsill",
+    "media_path": "videos/cat.mp4",
+    "negative_caption": "A low-detail surveillance-camera style cat video",
+    "negative_media_path": "negatives/cat.mp4"
+  },
+  {
+    "caption": "A dog running through a park at golden hour",
+    "media_path": "videos/dog.mp4",
+    "negative_caption": "A shaky handheld phone recording of a dog in flat lighting"
+  }
+]
+```
+
 ### 📐 Resolution Buckets
 
 Videos are organized into "buckets" of specific dimensions (width × height × frames).
@@ -224,8 +252,28 @@ dataset/
     ├── latents/            # Cached video latents
     ├── conditions/         # Cached text embeddings
     ├── audio_latents/      # (only if --with-audio) Cached audio latents
-    └── reference_latents/  # (only for IC-LoRA) Cached reference video latents
+    ├── negative_conditions/ # (only for NSYNC) Cached negative text embeddings
+    ├── negative_latents/    # (only for NSYNC) Cached/generated negative video latents
+    ├── negative_audio_latents/ # (only for NSYNC + --with-audio) Cached/generated negative audio latents
+    └── reference_latents/   # (only for IC-LoRA) Cached reference video latents
 ```
+
+### NSYNC Negative Preprocessing
+
+To preprocess paired negatives for `nsync`, keep `negative_caption` in your metadata and optionally add
+`negative_media_path` for rows where you already have curated negative media:
+
+```bash
+uv run python scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model \
+    --negative-caption-column negative_caption \
+    --negative-media-column negative_media_path
+```
+
+If a row has only `negative_caption`, the script auto-generates the missing negative sample using the base LTX model and
+saves trainer-format latents directly. Add `--save-generated-negatives` if you also want decoded preview videos.
 
 ## 🪄 IC-LoRA Reference Video Preprocessing
 

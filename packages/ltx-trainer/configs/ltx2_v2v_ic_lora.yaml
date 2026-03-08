@@ -172,12 +172,26 @@ acceleration:
 # Specifies the training data location and loading parameters.
 data:
   # Root directory containing preprocessed training data
-  # Should contain: latents/, conditions/, and reference_latents/ subdirectories
+  # Should contain: latents/, conditions/, reference_latents/, and when NSYNC is
+  # enabled also negative_conditions/ and negative_latents/
   preprocessed_data_root: "/path/to/preprocessed/data"
 
   # Number of worker processes for data loading
   # Used for parallel data loading to speed up data loading
   num_dataloader_workers: 2
+
+# -----------------------------------------------------------------------------
+# NSYNC Configuration
+# -----------------------------------------------------------------------------
+# Enables paired positive/negative contrastive training. For IC-LoRA the negative
+# branch reuses the positive sample's reference latents during training.
+nsync:
+  enabled: false
+  use_anchor: true
+  negative_latents_dir: "negative_latents"
+  negative_conditions_dir: "negative_conditions"
+  negative_audio_latents_dir: "negative_audio_latents"
+  projection_eps: 1.0e-12
 
 # -----------------------------------------------------------------------------
 # Validation Configuration

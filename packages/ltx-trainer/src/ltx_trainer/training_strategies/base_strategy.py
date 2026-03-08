@@ -59,6 +59,16 @@ class ModelInputs:
     ref_seq_len: int | None = None  # For IC-LoRA: length of reference sequence
 
 
+@dataclass(frozen=True)
+class BatchSourceKeys:
+    """Key mapping for selecting a specific training branch from a batch."""
+
+    latents: str = "latents"
+    conditions: str = "conditions"
+    audio_latents: str = "audio_latents"
+    ref_latents: str = "ref_latents"
+
+
 class TrainingStrategy(ABC):
     """Abstract base class for training strategies.
     Each strategy encapsulates the logic for a specific training mode,
@@ -97,6 +107,7 @@ class TrainingStrategy(ABC):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        source_keys: BatchSourceKeys | None = None,
     ) -> ModelInputs:
         """Prepare training inputs from a raw data batch.
         Args:
@@ -108,6 +119,7 @@ class TrainingStrategy(ABC):
                     - "prompt_attention_mask": Attention mask
                 - Additional keys depending on strategy (e.g., "ref_latents" for IC-LoRA)
             timestep_sampler: Sampler for generating timesteps and noise
+            source_keys: Optional key mapping for selecting alternative batch branches
         Returns:
             ModelInputs containing Modality objects and training targets
         """

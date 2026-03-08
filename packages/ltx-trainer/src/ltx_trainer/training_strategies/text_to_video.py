@@ -16,6 +16,7 @@ from ltx_core.model.transformer.modality import Modality
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
+    BatchSourceKeys,
     DEFAULT_FPS,
     ModelInputs,
     TrainingStrategy,
@@ -88,10 +89,13 @@ class TextToVideoStrategy(TrainingStrategy):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        source_keys: BatchSourceKeys | None = None,
     ) -> ModelInputs:
         """Prepare inputs for text-to-video training."""
+        keys = source_keys or BatchSourceKeys()
+
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
-        latents = batch["latents"]
+        latents = batch[keys.latents]
         video_latents = latents["latents"]
 
         # Get video dimensions (assume same for all batch elements)
@@ -111,7 +115,7 @@ class TextToVideoStrategy(TrainingStrategy):
         fps = fps[0].item() if fps is not None else DEFAULT_FPS
 
         # Get text embeddings (already processed by embedding connectors in trainer)
-        conditions = batch["conditions"]
+        conditions = batch[keys.conditions]
         video_prompt_embeds = conditions["video_prompt_embeds"]
         audio_prompt_embeds = conditions["audio_prompt_embeds"]
         prompt_attention_mask = conditions["prompt_attention_mask"]
@@ -188,6 +192,7 @@ class TextToVideoStrategy(TrainingStrategy):
                 batch_size=batch_size,
                 device=device,
                 dtype=dtype,
+                audio_key=keys.audio_latents,
             )
 
         return ModelInputs(
@@ -208,6 +213,7 @@ class TextToVideoStrategy(TrainingStrategy):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        audio_key: str,
     ) -> tuple[Modality, Tensor, Tensor]:
         """Prepare audio inputs for joint audio-video training.
         Args:
@@ -222,7 +228,7 @@ class TextToVideoStrategy(TrainingStrategy):
             Tuple of (audio_modality, audio_targets, audio_loss_mask)
         """
         # Get audio latents - dataset provides uniform non-patchified format [B, C, T, F]
-        audio_data = batch["audio_latents"]
+        audio_data = batch[audio_key]
         audio_latents = audio_data["latents"]
 
         # Patchify audio latents: [B, C, T, F] -> [B, T, C*F]

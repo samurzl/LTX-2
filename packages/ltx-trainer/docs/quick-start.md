@@ -59,6 +59,24 @@ uv run python scripts/process_dataset.py dataset.json \
 
 See [Dataset Preparation](dataset-preparation.md) for detailed instructions.
 
+### Optional: Prepare NSYNC Negatives
+
+If you want to train with `nsync`, add `negative_caption` to each dataset row and optionally
+`negative_media_path` for rows where you already have a curated negative sample. Then preprocess with:
+
+```bash
+uv run python scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model \
+    --negative-caption-column negative_caption \
+    --negative-media-column negative_media_path
+```
+
+This produces the normal `latents/` and `conditions/` outputs plus `negative_conditions/` and
+`negative_latents/`. If a row omits `negative_media_path`, preprocessing will generate the missing
+negative media automatically from `negative_caption`.
+
 ### 2. Configure Training
 
 Create or modify a configuration YAML file. Start with one of the example configs:
@@ -82,6 +100,18 @@ output_dir: "outputs/my_training_run"
 
 See [Configuration Reference](configuration-reference.md) for all available options.
 
+To enable `nsync`, also add:
+
+```yaml
+nsync:
+  enabled: true
+  use_anchor: true
+  negative_latents_dir: "negative_latents"
+  negative_conditions_dir: "negative_conditions"
+  negative_audio_latents_dir: "negative_audio_latents"
+  projection_eps: 1.0e-12
+```
+
 ### 3. Start Training
 
 ```bash
@@ -95,6 +125,17 @@ uv run accelerate launch scripts/train.py configs/ltx2_av_lora.yaml
 ```
 
 See [Training Guide](training-guide.md) for distributed training and advanced options.
+
+### 4. Start NSYNC Training
+
+Once the negative branches have been preprocessed and your config enables `nsync`, launch training the same way:
+
+```bash
+uv run python scripts/train.py configs/ltx2_av_lora.yaml
+```
+
+The trainer will automatically load the paired positive and negative branches and apply the NSYNC gradient update
+rule during optimization.
 
 ## 🎯 Training Modes
 

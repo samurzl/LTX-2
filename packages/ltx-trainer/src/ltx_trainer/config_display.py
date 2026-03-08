@@ -64,6 +64,21 @@ def print_config(config: LtxTrainerConfig) -> None:
 
     sections.append(("🎯 Strategy", strategy_items))
 
+    if cfg.nsync.enabled:
+        sections.append(
+            (
+                "🧭 NSYNC",
+                [
+                    ("Enabled", fmt(cfg.nsync.enabled)),
+                    ("Anchor Branch", fmt(cfg.nsync.use_anchor)),
+                    ("Neg Latents Dir", cfg.nsync.negative_latents_dir),
+                    ("Neg Cond Dir", cfg.nsync.negative_conditions_dir),
+                    ("Neg Audio Dir", cfg.nsync.negative_audio_latents_dir),
+                    ("Projection Eps", f"{cfg.nsync.projection_eps:.1e}"),
+                ],
+            )
+        )
+
     sections.extend(
         [
             (

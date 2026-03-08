@@ -182,6 +182,44 @@ class DataConfig(ConfigBaseModel):
     )
 
 
+class NsyncConfig(ConfigBaseModel):
+    """Configuration for NSYNC contrastive training."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable NSYNC contrastive gradient projection during training.",
+    )
+
+    use_anchor: bool = Field(
+        default=True,
+        description="Whether to use a second positive batch as the anchor branch.",
+    )
+
+    negative_latents_dir: str = Field(
+        default="negative_latents",
+        description="Directory name for paired negative video latents within preprocessed_data_root.",
+        min_length=1,
+    )
+
+    negative_conditions_dir: str = Field(
+        default="negative_conditions",
+        description="Directory name for paired negative text embeddings within preprocessed_data_root.",
+        min_length=1,
+    )
+
+    negative_audio_latents_dir: str = Field(
+        default="negative_audio_latents",
+        description="Directory name for paired negative audio latents when audio training is enabled.",
+        min_length=1,
+    )
+
+    projection_eps: float = Field(
+        default=1e-12,
+        description="Minimum denominator used when computing NSYNC projection coefficients.",
+        gt=0.0,
+    )
+
+
 class ValidationConfig(ConfigBaseModel):
     """Configuration for validation during training"""
 
@@ -471,6 +509,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     optimization: OptimizationConfig = Field(default_factory=OptimizationConfig)
     acceleration: AccelerationConfig = Field(default_factory=AccelerationConfig)
     data: DataConfig
+    nsync: NsyncConfig = Field(default_factory=NsyncConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     checkpoints: CheckpointsConfig = Field(default_factory=CheckpointsConfig)
     hub: HubConfig = Field(default_factory=HubConfig)
@@ -516,5 +555,17 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        if self.nsync.enabled:
+            if not self.nsync.negative_latents_dir.strip():
+                raise ValueError("nsync.negative_latents_dir must be provided when nsync is enabled")
+            if not self.nsync.negative_conditions_dir.strip():
+                raise ValueError("nsync.negative_conditions_dir must be provided when nsync is enabled")
+
+            uses_audio = getattr(self.training_strategy, "with_audio", False)
+            if uses_audio and not self.nsync.negative_audio_latents_dir.strip():
+                raise ValueError(
+                    "nsync.negative_audio_latents_dir must be provided when nsync is enabled with audio training"
+                )
 
         return self

@@ -2,7 +2,8 @@
 
 This package provides tools and scripts for training and fine-tuning
 Lightricks' **LTX-2** audio-video generation model. It enables LoRA training, full
-fine-tuning, and training of video-to-video transformations (IC-LoRA) on custom datasets.
+fine-tuning, `nsync` contrastive training with paired negatives, and training of
+video-to-video transformations (IC-LoRA) on custom datasets.
 
 ---
 
@@ -19,6 +20,21 @@ All detailed guides and technical documentation are in the [docs](./docs/) direc
 - [🔧 Utility Scripts](docs/utility-scripts.md)
 - [📚 LTX-Core Documentation](../ltx-core/README.md)
 - [🛡️ Troubleshooting Guide](docs/troubleshooting.md)
+
+---
+
+## 🧭 NSYNC at a Glance
+
+`nsync` training works with the existing offline `.precomputed` workflow. Add `negative_caption`
+to your dataset metadata, optionally add `negative_media_path`, preprocess with
+[`scripts/process_dataset.py`](scripts/process_dataset.py), then enable the `nsync` section in your
+training config.
+
+Start here:
+
+- [🎬 Dataset Preparation](docs/dataset-preparation.md#nsync-negative-preprocessing)
+- [🛠️ Training Modes](docs/training-modes.md#-nsync-contrastive-training)
+- [🚀 Training Guide](docs/training-guide.md#-nsync-training)
 
 ---
 

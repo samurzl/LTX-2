@@ -180,6 +180,20 @@ data:
   num_dataloader_workers: 2
 
 # -----------------------------------------------------------------------------
+# NSYNC Configuration
+# -----------------------------------------------------------------------------
+# Enables paired positive/negative contrastive training. When enabled, preprocessing
+# must also create negative_conditions/ and negative_latents/ (and
+# negative_audio_latents/ when with_audio is true).
+nsync:
+  enabled: false
+  use_anchor: true
+  negative_latents_dir: "negative_latents"
+  negative_conditions_dir: "negative_conditions"
+  negative_audio_latents_dir: "negative_audio_latents"
+  projection_eps: 1.0e-12
+
+# -----------------------------------------------------------------------------
 # Validation Configuration
 # -----------------------------------------------------------------------------
 # Controls validation video generation during training.

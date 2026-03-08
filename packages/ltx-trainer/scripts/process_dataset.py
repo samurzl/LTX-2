@@ -11,6 +11,7 @@ Basic usage:
 The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
 """
 
+import tempfile
 from pathlib import Path
 
 import typer
@@ -21,8 +22,16 @@ from rich.console import Console
 
 from ltx_trainer import logger
 from ltx_trainer.gpu_utils import free_gpu_memory_context
+from ltx_trainer.negative_generation import (
+    generate_missing_negative_latents,
+    load_negative_sample_specs,
+    split_negative_sample_specs,
+    write_negative_media_subset,
+)
 
 console = Console()
+
+DEFAULT_NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
@@ -50,6 +59,13 @@ def preprocess_dataset(  # noqa: PLR0913
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
+    negative_caption_column: str = "negative_caption",
+    negative_media_column: str = "negative_media_path",
+    negative_inference_steps: int = 30,
+    negative_guidance_scale: float = 4.0,
+    negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+    negative_seed: int = 42,
+    save_generated_negatives: bool = False,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -59,6 +75,17 @@ def preprocess_dataset(  # noqa: PLR0913
     output_base = Path(output_dir) if output_dir else Path(dataset_file).parent / ".precomputed"
     conditions_dir = output_base / "conditions"
     latents_dir = output_base / "latents"
+    negative_conditions_dir = output_base / "negative_conditions"
+    negative_latents_dir = output_base / "negative_latents"
+    negative_audio_latents_dir = output_base / "negative_audio_latents"
+
+    negative_specs = load_negative_sample_specs(
+        dataset_file,
+        media_column=video_column,
+        negative_caption_column=negative_caption_column,
+        negative_media_column=negative_media_column,
+    )
+    manual_negative_specs, generated_negative_specs = split_negative_sample_specs(negative_specs)
 
     if lora_trigger:
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
@@ -78,6 +105,21 @@ def preprocess_dataset(  # noqa: PLR0913
             device=device,
             load_in_8bit=load_text_encoder_in_8bit,
         )
+
+        if negative_specs:
+            compute_captions_embeddings(
+                dataset_file=dataset_file,
+                output_dir=str(negative_conditions_dir),
+                model_path=model_path,
+                text_encoder_path=text_encoder_path,
+                caption_column=negative_caption_column,
+                media_column=video_column,
+                lora_trigger=lora_trigger,
+                remove_llm_prefixes=remove_llm_prefixes,
+                batch_size=batch_size,
+                device=device,
+                load_in_8bit=load_text_encoder_in_8bit,
+            )
 
     # Process videos using the dedicated function
     audio_latents_dir = None
@@ -135,6 +177,48 @@ def preprocess_dataset(  # noqa: PLR0913
                 vae_tiling=vae_tiling,
             )
 
+        if manual_negative_specs:
+            logger.info(f"Processing {len(manual_negative_specs):,} user-supplied NSYNC negative media files...")
+            with tempfile.TemporaryDirectory(prefix="ltx-negative-media-") as temp_dir:
+                subset_path = write_negative_media_subset(
+                    manual_negative_specs,
+                    output_path=Path(temp_dir) / "negative_media_subset.jsonl",
+                    media_column=video_column,
+                    negative_media_column=negative_media_column,
+                )
+                compute_latents(
+                    dataset_file=subset_path,
+                    main_media_column=video_column,
+                    video_column=negative_media_column,
+                    resolution_buckets=resolution_buckets,
+                    output_dir=str(negative_latents_dir),
+                    model_path=model_path,
+                    batch_size=batch_size,
+                    device=device,
+                    vae_tiling=vae_tiling,
+                    with_audio=with_audio,
+                    audio_output_dir=str(negative_audio_latents_dir) if with_audio else None,
+                )
+
+        if generated_negative_specs:
+            generate_missing_negative_latents(
+                generated_negative_specs,
+                positive_latents_dir=latents_dir,
+                output_dir=negative_latents_dir,
+                model_path=model_path,
+                text_encoder_path=text_encoder_path,
+                device=device,
+                with_audio=with_audio,
+                audio_output_dir=negative_audio_latents_dir if with_audio else None,
+                inference_steps=negative_inference_steps,
+                guidance_scale=negative_guidance_scale,
+                negative_prompt=negative_prompt,
+                seed=negative_seed,
+                save_previews=save_generated_negatives,
+                preview_output_dir=output_base / "generated_negative_previews",
+                load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+            )
+
     # Handle decoding if requested (for verification)
     if decode:
         logger.info("Decoding latents for verification...")
@@ -165,6 +249,10 @@ def preprocess_dataset(  # noqa: PLR0913
         logger.info("Reference videos processed and saved to reference_latents/ directory for IC-LoRA training")
     if with_audio:
         logger.info("Audio latents saved to audio_latents/ directory for audio-video training")
+    if negative_specs:
+        logger.info("NSYNC negatives saved to negative_conditions/ and negative_latents/ directories")
+        if with_audio:
+            logger.info("NSYNC negative audio latents saved to negative_audio_latents/ directory")
 
 
 def _validate_dataset_file(dataset_path: str) -> None:
@@ -247,6 +335,34 @@ def main(  # noqa: PLR0913
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
     ),
+    negative_caption_column: str = typer.Option(
+        default="negative_caption",
+        help="Column name containing paired negative captions for NSYNC preprocessing",
+    ),
+    negative_media_column: str = typer.Option(
+        default="negative_media_path",
+        help="Optional column name containing paired user-supplied negative media paths for NSYNC preprocessing",
+    ),
+    negative_inference_steps: int = typer.Option(
+        default=30,
+        help="Number of denoising steps used when auto-generating missing NSYNC negative media",
+    ),
+    negative_guidance_scale: float = typer.Option(
+        default=4.0,
+        help="CFG guidance scale used when auto-generating missing NSYNC negative media",
+    ),
+    negative_prompt: str = typer.Option(
+        default=DEFAULT_NEGATIVE_PROMPT,
+        help="Artifact-suppression prompt used as the CFG negative prompt during missing-negative generation",
+    ),
+    negative_seed: int = typer.Option(
+        default=42,
+        help="Seed used when auto-generating missing NSYNC negative media",
+    ),
+    save_generated_negatives: bool = typer.Option(
+        default=False,
+        help="Decode and save preview videos for auto-generated NSYNC negatives",
+    ),
     reference_downscale_factor: int = typer.Option(
         default=1,
         help="Downscale factor for reference video resolution. When > 1, reference videos are processed at "
@@ -310,6 +426,13 @@ def main(  # noqa: PLR0913
         reference_downscale_factor=reference_downscale_factor,
         with_audio=with_audio,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+        negative_caption_column=negative_caption_column,
+        negative_media_column=negative_media_column,
+        negative_inference_steps=negative_inference_steps,
+        negative_guidance_scale=negative_guidance_scale,
+        negative_prompt=negative_prompt,
+        negative_seed=negative_seed,
+        save_generated_negatives=save_generated_negatives,
     )
 
 

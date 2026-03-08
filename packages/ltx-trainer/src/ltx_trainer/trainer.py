@@ -1,6 +1,7 @@
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -36,10 +37,17 @@ from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 from ltx_trainer.model_loader import load_model as load_ltx_model
+from ltx_trainer.nsync import (
+    extend_data_sources_for_nsync,
+    gradient_statistics,
+    negative_branch_source_keys,
+    positive_branch_source_keys,
+)
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies.base_strategy import BatchSourceKeys
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
 from ltx_trainer.video_utils import read_video, save_video
@@ -75,6 +83,14 @@ class TrainingStats(BaseModel):
     num_processes: int
 
 
+@dataclass
+class TrainingStepResult:
+    """Loss tensor plus scalar metrics collected for a single optimization micro-step."""
+
+    loss: Tensor
+    metrics: dict[str, float]
+
+
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
@@ -88,6 +104,7 @@ class LtxvTrainer:
         self._load_checkpoint()
         self._prepare_models_for_training()
         self._dataset = None
+        self._anchor_dataloader = None
         self._global_step = -1
         self._checkpoint_paths = []
         self._init_wandb()
@@ -115,6 +132,7 @@ class LtxvTrainer:
         self._init_optimizer()
         self._init_dataloader()
         data_iter = iter(self._dataloader)
+        anchor_iter = iter(self._anchor_dataloader) if self._anchor_dataloader is not None else None
         self._init_timestep_sampler()
 
         # Synchronize all processes after initialization
@@ -161,14 +179,25 @@ class LtxvTrainer:
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
 
+                anchor_batch = None
+                if anchor_iter is not None:
+                    try:
+                        anchor_batch = next(anchor_iter)
+                    except StopIteration:
+                        anchor_iter = iter(self._anchor_dataloader)
+                        anchor_batch = next(anchor_iter)
+
                 step_start_time = time.time()
                 with self._accelerator.accumulate(self._transformer):
                     is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
                     if is_optimization_step:
                         self._global_step += 1
 
-                    loss = self._training_step(batch)
-                    self._accelerator.backward(loss)
+                    step_result = self._training_step(batch, anchor_batch=anchor_batch)
+                    loss = step_result.loss
+
+                    if not self._config.nsync.enabled:
+                        self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
@@ -230,14 +259,13 @@ class LtxvTrainer:
 
                     # Log metrics to W&B (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
-                        self._log_metrics(
-                            {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": current_lr,
-                                "train/step_time": step_time,
-                                "train/global_step": self._global_step,
-                            }
-                        )
+                        metrics = {
+                            "train/learning_rate": current_lr,
+                            "train/step_time": step_time,
+                            "train/global_step": self._global_step,
+                            **step_result.metrics,
+                        }
+                        self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
                     if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
@@ -306,17 +334,96 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
+    def _training_step(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+        anchor_batch: dict[str, dict[str, Tensor]] | None = None,
+    ) -> TrainingStepResult:
         """Perform a single training step using the configured strategy."""
-        # Apply embedding connectors to transform pre-computed text embeddings
-        conditions = batch["conditions"]
+        if self._config.nsync.enabled:
+            return self._training_step_nsync(batch, anchor_batch)
 
+        loss = self._compute_branch_loss(batch, positive_branch_source_keys())
+        return TrainingStepResult(
+            loss=loss,
+            metrics={"train/loss": loss.detach().item()},
+        )
+
+    def _training_step_nsync(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+        anchor_batch: dict[str, dict[str, Tensor]] | None,
+    ) -> TrainingStepResult:
+        """Run NSYNC positive/negative/anchor branches and set the projected gradient update."""
+        positive_keys = positive_branch_source_keys()
+        negative_keys = negative_branch_source_keys()
+
+        positive_loss = self._compute_branch_loss(batch, positive_keys)
+        self._accelerator.backward(positive_loss)
+        positive_grads = self._clone_trainable_gradients()
+        self._clear_trainable_gradients()
+
+        negative_loss = self._compute_branch_loss(batch, negative_keys)
+        self._accelerator.backward(negative_loss)
+        negative_grads = self._clone_trainable_gradients()
+        self._clear_trainable_gradients()
+
+        anchor_loss_value = 0.0
+        anchor_grads = None
+        if self._config.nsync.use_anchor:
+            if anchor_batch is None:
+                raise ValueError("Anchor batch is required when nsync.use_anchor is enabled")
+            anchor_loss = self._compute_branch_loss(anchor_batch, positive_keys)
+            self._accelerator.backward(anchor_loss)
+            anchor_grads = self._clone_trainable_gradients()
+            anchor_loss_value = anchor_loss.detach().item()
+            self._clear_trainable_gradients()
+
+        self._apply_nsync_gradients(positive_grads, negative_grads, anchor_grads)
+
+        metrics = {
+            "train/loss": positive_loss.detach().item(),
+            "train/loss_positive": positive_loss.detach().item(),
+            "train/loss_negative": negative_loss.detach().item(),
+        }
+        branch_losses = [positive_loss.detach(), negative_loss.detach()]
+        if self._config.nsync.use_anchor:
+            metrics["train/loss_anchor"] = anchor_loss_value
+            branch_losses.append(torch.tensor(anchor_loss_value, device=positive_loss.device))
+
+        return TrainingStepResult(
+            loss=torch.stack(branch_losses).mean(),
+            metrics=metrics,
+        )
+
+    def _compute_branch_loss(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+        source_keys: BatchSourceKeys,
+    ) -> Tensor:
+        """Compute the training loss for a specific batch branch."""
+        branch_batch = batch.copy()
+        branch_batch[source_keys.conditions] = self._prepare_text_conditions(batch[source_keys.conditions])
+
+        model_inputs = self._training_strategy.prepare_training_inputs(
+            branch_batch,
+            self._timestep_sampler,
+            source_keys=source_keys,
+        )
+
+        video_pred, audio_pred = self._transformer(
+            video=model_inputs.video,
+            audio=model_inputs.audio,
+            perturbations=None,
+        )
+        return self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
+
+    def _prepare_text_conditions(self, conditions: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Apply embedding connectors to a branch's precomputed text features."""
         if "video_prompt_embeds" in conditions:
-            # New format: separate video/audio features from precompute()
             video_features = conditions["video_prompt_embeds"]
             audio_features = conditions.get("audio_prompt_embeds")
         else:
-            # Legacy format: single prompt_embeds tensor — duplicate for both modalities
             video_features = conditions["prompt_embeds"]
             audio_features = conditions["prompt_embeds"]
 
@@ -326,24 +433,78 @@ class LtxvTrainer:
             video_features, audio_features, additive_mask
         )
 
-        conditions["video_prompt_embeds"] = video_embeds
-        conditions["audio_prompt_embeds"] = audio_embeds
-        conditions["prompt_attention_mask"] = attention_mask
+        return {
+            **conditions,
+            "video_prompt_embeds": video_embeds,
+            "audio_prompt_embeds": audio_embeds,
+            "prompt_attention_mask": attention_mask,
+        }
 
-        # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
-        model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
+    def _clone_trainable_gradients(self) -> list[Tensor | None]:
+        """Clone the current trainable gradients for later projection."""
+        cloned_grads: list[Tensor | None] = []
+        for param in self._trainable_params:
+            cloned_grads.append(param.grad.detach().clone() if param.grad is not None else None)
+        return cloned_grads
 
-        # Run transformer forward pass with Modality-based interface
-        video_pred, audio_pred = self._transformer(
-            video=model_inputs.video,
-            audio=model_inputs.audio,
-            perturbations=None,
+    def _clear_trainable_gradients(self) -> None:
+        """Clear gradients on trainable parameters without touching optimizer state."""
+        for param in self._trainable_params:
+            param.grad = None
+
+    def _compute_projection_scale(
+        self,
+        source_grads: list[Tensor | None],
+        target_grads: list[Tensor | None],
+    ) -> Tensor:
+        """Compute a globally reduced projection coefficient for a gradient list."""
+        local_dot, local_target_norm = gradient_statistics(
+            source_grads,
+            target_grads,
+            device=self._accelerator.device,
+        )
+        reduced_stats = self._accelerator.reduce(
+            torch.stack([local_dot, local_target_norm]),
+            reduction="sum",
+        )
+        return reduced_stats[0] / reduced_stats[1].clamp_min(self._config.nsync.projection_eps)
+
+    def _apply_nsync_gradients(
+        self,
+        positive_grads: list[Tensor | None],
+        negative_grads: list[Tensor | None],
+        anchor_grads: list[Tensor | None] | None,
+    ) -> None:
+        """Apply the NSYNC gradient update rule to the current trainable parameters."""
+        negative_scale = self._compute_projection_scale(positive_grads, negative_grads)
+        anchor_scale = (
+            self._compute_projection_scale(positive_grads, anchor_grads)
+            if self._config.nsync.use_anchor and anchor_grads is not None
+            else None
         )
 
-        # Use strategy to compute loss
-        loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
+        for param, positive_grad, negative_grad, anchor_grad in zip(
+            self._trainable_params,
+            positive_grads,
+            negative_grads,
+            anchor_grads or [None] * len(self._trainable_params),
+            strict=True,
+        ):
+            available_grads = [grad for grad in (positive_grad, negative_grad, anchor_grad) if grad is not None]
+            reference_grad = available_grads[0] if available_grads else None
+            if reference_grad is None:
+                param.grad = None
+                continue
 
-        return loss
+            updated_grad = torch.zeros_like(reference_grad)
+            if positive_grad is not None:
+                updated_grad = updated_grad + positive_grad
+            if negative_grad is not None:
+                updated_grad = updated_grad - negative_scale.to(dtype=negative_grad.dtype) * negative_grad
+            if anchor_grad is not None and anchor_scale is not None:
+                updated_grad = updated_grad + anchor_scale.to(dtype=anchor_grad.dtype) * anchor_grad
+
+            param.grad = updated_grad
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -602,24 +763,51 @@ class LtxvTrainer:
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
         if self._dataset is None:
-            # Get data sources from the training strategy
-            data_sources = self._training_strategy.get_data_sources()
-
+            data_sources = self._build_data_sources()
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
+        dataloader = self._create_dataloader(self._dataset, seed_offset=0)
+        if self._config.nsync.enabled and self._config.nsync.use_anchor:
+            anchor_dataloader = self._create_dataloader(self._dataset, seed_offset=1)
+            self._dataloader, self._anchor_dataloader = self._accelerator.prepare(dataloader, anchor_dataloader)
+        else:
+            self._dataloader = self._accelerator.prepare(dataloader)
+            self._anchor_dataloader = None
+
+    def _build_data_sources(self) -> dict[str, str]:
+        """Build the dataset source mapping, including optional NSYNC branches."""
+        strategy_sources = self._training_strategy.get_data_sources()
+        if isinstance(strategy_sources, list):
+            base_sources = {source: source for source in strategy_sources}
+        else:
+            base_sources = strategy_sources.copy()
+
+        return extend_data_sources_for_nsync(
+            base_sources,
+            enabled=self._config.nsync.enabled,
+            with_audio=self._training_strategy.requires_audio,
+            negative_latents_dir=self._config.nsync.negative_latents_dir,
+            negative_conditions_dir=self._config.nsync.negative_conditions_dir,
+            negative_audio_latents_dir=self._config.nsync.negative_audio_latents_dir,
+        )
+
+    def _create_dataloader(self, dataset: PrecomputedDataset, *, seed_offset: int) -> DataLoader:
+        """Create a shuffled dataloader with a deterministic but branch-specific seed."""
         num_workers = self._config.data.num_dataloader_workers
-        dataloader = DataLoader(
-            self._dataset,
+        generator = torch.Generator()
+        generator.manual_seed(self._config.seed + seed_offset)
+
+        return DataLoader(
+            dataset,
             batch_size=self._config.optimization.batch_size,
             shuffle=True,
             drop_last=True,
             num_workers=num_workers,
             pin_memory=num_workers > 0,
             persistent_workers=num_workers > 0,
+            generator=generator,
         )
-
-        self._dataloader = self._accelerator.prepare(dataloader)
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""

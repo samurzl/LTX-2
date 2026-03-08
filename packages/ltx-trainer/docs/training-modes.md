@@ -73,6 +73,90 @@ preprocessed_data_root/
 > You can generate audio during validation even if you're not training the audio branch.
 > Set `validation.generate_audio: true` independently of `training_strategy.with_audio`.
 
+## 🧭 NSYNC Contrastive Training
+
+`nsync` adds a paired negative branch to standard training. Each positive training sample is matched with:
+
+- a negative caption
+- an optional user-supplied negative media sample
+- or an auto-generated negative sample produced during preprocessing when only the negative caption is available
+
+During training, the trainer runs:
+
+- the normal positive branch
+- a paired negative branch loaded from `negative_latents/` and `negative_conditions/`
+- an anchor branch from a second shuffled positive batch when `nsync.use_anchor: true`
+
+The update is applied with the NSYNC projection rule:
+
+```text
+g = pos - proj(pos→neg) + proj(pos→anchor)
+```
+
+### When to Use NSYNC
+
+- Style or aesthetic fine-tuning where you want the LoRA to move away from a specific undesired look
+- Datasets where each positive sample can be paired with a "what this should not look like" caption
+- Cases where you want to bootstrap negatives automatically instead of curating a full negative media set
+
+### Preprocessing Requirements
+
+Your metadata should include `negative_caption` for every training row. `negative_media_path` is optional.
+
+Example:
+
+```json
+[
+  {
+    "caption": "A cinematic close-up of a cat on a windowsill",
+    "media_path": "videos/cat.mp4",
+    "negative_caption": "A low-detail surveillance-camera style cat video"
+  }
+]
+```
+
+Then preprocess with:
+
+```bash
+uv run python scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model \
+    --negative-caption-column negative_caption \
+    --negative-media-column negative_media_path
+```
+
+This creates:
+
+```text
+preprocessed_data_root/
+├── latents/
+├── conditions/
+├── negative_latents/
+├── negative_conditions/
+└── negative_audio_latents/   # only when with_audio: true
+```
+
+### Enabling NSYNC in Training Configs
+
+Add the `nsync` section to any standard text-to-video or IC-LoRA config:
+
+```yaml
+nsync:
+  enabled: true
+  use_anchor: true
+  negative_latents_dir: "negative_latents"
+  negative_conditions_dir: "negative_conditions"
+  negative_audio_latents_dir: "negative_audio_latents"
+  projection_eps: 1.0e-12
+```
+
+Notes:
+
+- For `text_to_video` with `with_audio: true`, preprocessing must also produce `negative_audio_latents/`.
+- For `video_to_video`, the negative branch reuses the positive sample's `reference_latents`.
+- `negative_caption` remains the conditioning text even when `negative_media_path` is provided.
+
 ## 🔥 Full Model Fine-tuning
 
 Full model fine-tuning updates all parameters of the base model, providing maximum flexibility but
@@ -239,14 +323,14 @@ validation:
 
 ## 📊 Training Mode Comparison
 
-| Aspect               | LoRA                           | Audio-Video LoRA               | Full Fine-tuning | IC-LoRA                        |
-|----------------------|--------------------------------|--------------------------------|------------------|--------------------------------|
-| **Memory Usage**     | Low                            | Low-Medium                     | High             | Medium                         |
-| **Training Speed**   | Fast                           | Fast                           | Slow             | Medium                         |
-| **Output Size**      | 100MB-few GB (depends on rank) | 100MB-few GB (depends on rank) | Tens of GB       | 100MB-few GB (depends on rank) |
-| **Flexibility**      | Medium                         | Medium                         | High             | Specialized                    |
-| **Audio Support**    | Optional                       | Yes                            | Optional         | No                             |
-| **Reference Videos** | No                             | No                             | No               | Yes (required)                 |
+| Aspect               | LoRA                           | Audio-Video LoRA               | NSYNC                         | Full Fine-tuning | IC-LoRA                        |
+|----------------------|--------------------------------|--------------------------------|-------------------------------|------------------|--------------------------------|
+| **Memory Usage**     | Low                            | Low-Medium                     | Medium                        | High             | Medium                         |
+| **Training Speed**   | Fast                           | Fast                           | Medium                        | Slow             | Medium                         |
+| **Output Size**      | 100MB-few GB (depends on rank) | 100MB-few GB (depends on rank) | Same as underlying train mode | Tens of GB       | 100MB-few GB (depends on rank) |
+| **Flexibility**      | Medium                         | Medium                         | Medium-High                   | High             | Specialized                    |
+| **Audio Support**    | Optional                       | Yes                            | Optional                      | Optional         | No                             |
+| **Reference Videos** | No                             | No                             | No / reused for IC-LoRA       | No               | Yes (required)                 |
 
 ## 🎬 Using Trained Models for Inference
 

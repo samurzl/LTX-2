@@ -33,6 +33,34 @@ The trainer will:
 - `training_config.yaml` - Copy of training configuration
 - `validation_samples/` - Generated validation videos (if enabled)
 
+## 🧭 NSYNC Training
+
+To train with `nsync`, first preprocess paired negative branches alongside your normal dataset:
+
+```bash
+uv run python scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model \
+    --negative-caption-column negative_caption \
+    --negative-media-column negative_media_path
+```
+
+Then enable the `nsync` section in your training config:
+
+```yaml
+nsync:
+  enabled: true
+  use_anchor: true
+  negative_latents_dir: "negative_latents"
+  negative_conditions_dir: "negative_conditions"
+  negative_audio_latents_dir: "negative_audio_latents"
+  projection_eps: 1.0e-12
+```
+
+`negative_caption` is always the conditioning text for the negative branch. If a row omits `negative_media_path`,
+preprocessing will generate the missing negative media automatically from `negative_caption`.
+
 ## 🖥️ Distributed / Multi-GPU Training
 
 We use Hugging Face 🤗 [Accelerate](https://huggingface.co/docs/accelerate/index) for multi-GPU DDP and FSDP.

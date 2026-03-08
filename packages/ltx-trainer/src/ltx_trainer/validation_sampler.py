@@ -106,6 +106,22 @@ class GenerationConfig:
             object.__setattr__(self, "tiled_decoding", TiledDecodingConfig(enabled=False))
 
 
+@dataclass
+class GeneratedLatents:
+    """Generated latent outputs in the same shape used by trainer preprocessing."""
+
+    video_latents: Tensor  # [C, F, H, W]
+    num_frames: int
+    height: int
+    width: int
+    audio_latents: Tensor | None = None  # [C, T, F]
+    num_time_steps: int | None = None
+    frequency_bins: int | None = None
+    duration: float | None = None
+    preview_video: Tensor | None = None  # [C, F, H, W] in [0, 1]
+    preview_audio: Tensor | None = None  # [C, samples]
+
+
 class ValidationSampler:
     """Generates validation samples during training using ltx-core components.
     This class provides a simplified interface for generating video (and optionally audio)
@@ -172,43 +188,86 @@ class ValidationSampler:
                 - audio: Audio waveform tensor [C, samples] or None
         """
         device = torch.device(device) if isinstance(device, str) else device
-        self._validate_config(config)
+        self._validate_config(config, require_video_decoder=True, require_audio_decoder=True)
 
         # Route to appropriate generation method
         if config.reference_video is not None:
             return self._generate_with_reference(config, device)
         return self._generate_standard(config, device)
 
+    @torch.no_grad()
+    def generate_latents(
+        self,
+        config: GenerationConfig,
+        device: torch.device | str = "cuda",
+        *,
+        decode_preview: bool = False,
+    ) -> GeneratedLatents:
+        """Generate latent outputs directly without a decode/re-encode round trip."""
+        device = torch.device(device) if isinstance(device, str) else device
+        self._validate_config(
+            config,
+            require_video_decoder=decode_preview,
+            require_audio_decoder=decode_preview,
+        )
+
+        if config.reference_video is not None:
+            raise ValueError("generate_latents does not support reference_video conditioning")
+
+        video_state, audio_state = self._generate_standard_latent_states(config, device)
+
+        preview_video = self._decode_video(video_state, device, config.tiled_decoding) if decode_preview else None
+        preview_audio = self._decode_audio(audio_state, device) if decode_preview and audio_state is not None else None
+
+        audio_latents = audio_state.latent[0].float().cpu() if audio_state is not None else None
+        num_time_steps = audio_state.latent.shape[2] if audio_state is not None else None
+        frequency_bins = audio_state.latent.shape[3] if audio_state is not None else None
+        duration = config.num_frames / config.frame_rate if audio_state is not None else None
+
+        return GeneratedLatents(
+            video_latents=video_state.latent[0].float().cpu(),
+            num_frames=video_state.latent.shape[2],
+            height=video_state.latent.shape[3],
+            width=video_state.latent.shape[4],
+            audio_latents=audio_latents,
+            num_time_steps=num_time_steps,
+            frequency_bins=frequency_bins,
+            duration=duration,
+            preview_video=preview_video,
+            preview_audio=preview_audio,
+        )
+
     def _generate_standard(self, config: GenerationConfig, device: torch.device) -> tuple[Tensor, Tensor | None]:
         """Standard generation (text-to-video or image-to-video)."""
-        # Get prompt embeddings (from cache or encode on-the-fly)
+        video_state, audio_state = self._generate_standard_latent_states(config, device)
+        video_output = self._decode_video(video_state, device, config.tiled_decoding)
+        audio_output = self._decode_audio(audio_state, device) if audio_state is not None else None
+        return video_output, audio_output
+
+    def _generate_standard_latent_states(
+        self,
+        config: GenerationConfig,
+        device: torch.device,
+    ) -> tuple[LatentState, LatentState | None]:
+        """Generate standard video/audio latent states before decoder invocation."""
         v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg = self._get_prompt_embeddings(config, device)
 
-        # Setup generator
         generator = torch.Generator(device=device).manual_seed(config.seed)
-
-        # Create latent tools
         video_tools = self._create_video_latent_tools(config)
         audio_tools = self._create_audio_latent_tools(config) if config.generate_audio else None
 
-        # Create initial states
         video_clean_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
         audio_clean_state = (
             audio_tools.create_initial_state(device=device, dtype=torch.bfloat16) if audio_tools else None
         )
 
-        # Apply image conditioning if provided
         if config.condition_image is not None:
-            video_clean_state = self._apply_image_conditioning(
-                video_clean_state, config.condition_image, config, device
-            )
+            video_clean_state = self._apply_image_conditioning(video_clean_state, config.condition_image, config, device)
 
-        # Add noise
         noiser = GaussianNoiser(generator=generator)
         video_state = noiser(latent_state=video_clean_state, noise_scale=1.0)
         audio_state = noiser(latent_state=audio_clean_state, noise_scale=1.0) if audio_clean_state else None
 
-        # Run denoising loop
         video_state, audio_state = self._run_denoising(
             config=config,
             video_state=video_state,
@@ -222,18 +281,14 @@ class ValidationSampler:
             device=device,
         )
 
-        # Decode outputs
         video_state = video_tools.clear_conditioning(video_state)
         video_state = video_tools.unpatchify(video_state)
-        video_output = self._decode_video(video_state, device, config.tiled_decoding)
 
-        audio_output = None
         if audio_state is not None and audio_tools is not None:
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
-            audio_output = self._decode_audio(audio_state, device)
 
-        return video_output, audio_output
+        return video_state, audio_state
 
     def _generate_with_reference(self, config: GenerationConfig, device: torch.device) -> tuple[Tensor, Tensor | None]:
         """Generate with reference video conditioning (IC-LoRA style).
@@ -665,13 +720,21 @@ class ValidationSampler:
 
         return decoded_video[0].float().cpu()
 
-    def _validate_config(self, config: GenerationConfig) -> None:
+    def _validate_config(
+        self,
+        config: GenerationConfig,
+        *,
+        require_video_decoder: bool = False,
+        require_audio_decoder: bool = True,
+    ) -> None:
         """Validate generation configuration."""
         if config.height % 32 != 0 or config.width % 32 != 0:
             raise ValueError(f"height and width must be divisible by 32, got {config.height}x{config.width}")
         if config.num_frames % 8 != 1:
             raise ValueError(f"num_frames must satisfy num_frames % 8 == 1, got {config.num_frames}")
-        if config.generate_audio and (self._audio_decoder is None or self._vocoder is None):
+        if require_video_decoder and self._vae_decoder is None:
+            raise ValueError("Video decoding requires vae_decoder")
+        if require_audio_decoder and config.generate_audio and (self._audio_decoder is None or self._vocoder is None):
             raise ValueError("Audio generation requires audio_decoder and vocoder")
         if config.condition_image is not None and self._vae_encoder is None:
             raise ValueError("Image conditioning requires vae_encoder")

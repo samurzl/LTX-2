@@ -15,6 +15,7 @@ from ltx_core.model.transformer.modality import Modality
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
+    BatchSourceKeys,
     DEFAULT_FPS,
     ModelInputs,
     TrainingStrategy,
@@ -74,19 +75,22 @@ class VideoToVideoStrategy(TrainingStrategy):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        source_keys: BatchSourceKeys | None = None,
     ) -> ModelInputs:
         """Prepare inputs for IC-LoRA training with reference videos."""
+        keys = source_keys or BatchSourceKeys()
+
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
-        latents = batch["latents"]
+        latents = batch[keys.latents]
         target_latents = latents["latents"]
-        ref_latents = batch["ref_latents"]["latents"]
+        ref_latents = batch[keys.ref_latents]["latents"]
 
         # Get dimensions
         num_frames = latents["num_frames"][0].item()
         height = latents["height"][0].item()
         width = latents["width"][0].item()
 
-        ref_latents_info = batch["ref_latents"]
+        ref_latents_info = batch[keys.ref_latents]
         ref_frames = ref_latents_info["num_frames"][0].item()
         ref_height = ref_latents_info["height"][0].item()
         ref_width = ref_latents_info["width"][0].item()
@@ -125,7 +129,7 @@ class VideoToVideoStrategy(TrainingStrategy):
 
         # Get text embeddings (already processed by embedding connectors in trainer)
         # Video-to-video uses only video embeddings
-        conditions = batch["conditions"]
+        conditions = batch[keys.conditions]
         prompt_embeds = conditions["video_prompt_embeds"]
         prompt_attention_mask = conditions["prompt_attention_mask"]
 

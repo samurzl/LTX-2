@@ -14,6 +14,7 @@ sub-configurations:
 - **OptimizationConfig**: Learning rate, batch sizes, and scheduler settings
 - **AccelerationConfig**: Mixed precision and quantization settings
 - **DataConfig**: Data loading parameters
+- **NsyncConfig**: Paired positive/negative contrastive training settings
 - **ValidationConfig**: Validation and inference settings
 - **CheckpointsConfig**: Checkpoint saving frequency and retention settings
 - **HubConfig**: Hugging Face Hub integration settings
@@ -242,8 +243,36 @@ data:
 
 | Parameter                | Description                                                                                |
 |--------------------------|--------------------------------------------------------------------------------------------|
-| `preprocessed_data_root` | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.)               |
+| `preprocessed_data_root` | Path to your preprocessed dataset (contains `latents/`, `conditions/`, and optionally `negative_*` dirs for NSYNC) |
 | `num_dataloader_workers` | Number of parallel data loading processes (0 = synchronous loading, useful when debugging) |
+
+### NsyncConfig
+
+Controls paired positive/negative NSYNC training.
+
+```yaml
+nsync:
+  enabled: false
+  use_anchor: true
+  negative_latents_dir: "negative_latents"
+  negative_conditions_dir: "negative_conditions"
+  negative_audio_latents_dir: "negative_audio_latents"
+  projection_eps: 1.0e-12
+```
+
+**Key parameters:**
+
+| Parameter                    | Description                                                                                       |
+|-----------------------------|---------------------------------------------------------------------------------------------------|
+| `enabled`                   | Enable NSYNC gradient projection training                                                         |
+| `use_anchor`                | Use a second positive batch as the anchor branch                                                  |
+| `negative_latents_dir`      | Directory name for paired negative video latents                                                  |
+| `negative_conditions_dir`   | Directory name for paired negative text embeddings                                                |
+| `negative_audio_latents_dir`| Directory name for paired negative audio latents when `training_strategy.with_audio: true`        |
+| `projection_eps`            | Minimum denominator used when computing the projection coefficients                               |
+
+When `nsync.enabled: true`, preprocessing must also create `negative_conditions/` and `negative_latents/`.
+For joint audio-video training, `negative_audio_latents/` is required as well.
 
 ### ValidationConfig
 
