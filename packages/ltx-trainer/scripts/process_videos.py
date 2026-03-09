@@ -444,6 +444,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
+    num_workers: int = 4,
 ) -> None:
     """
     Process videos and save latent representations.
@@ -460,15 +461,19 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae_tiling: Whether to enable VAE tiling
         with_audio: Whether to extract and encode audio from videos
         audio_output_dir: Directory to save audio latents (required if with_audio=True)
+        num_workers: Number of dataloader worker processes used for media loading
     """
     # Validate audio parameters
     if with_audio and audio_output_dir is None:
         raise ValueError("audio_output_dir must be provided when with_audio=True")
+    if num_workers < 0:
+        raise ValueError(f"num_workers must be >= 0, got {num_workers}")
 
     console = Console()
     torch_device = torch.device(device)
 
     # Create dataset
+    logger.info("Scanning dataset and validating media files (CPU-bound; GPU may stay idle during this phase)")
     dataset = MediaDataset(
         dataset_file=dataset_file,
         main_media_column=main_media_column or video_column,
@@ -516,7 +521,8 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     if with_audio and batch_size > 1:
         logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
         batch_size = 1
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    logger.info(f"Creating dataloader with {num_workers} worker(s)")
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # Track audio statistics
     audio_success_count = 0
@@ -981,6 +987,10 @@ def main(  # noqa: PLR0913
         default=None,
         help="Output directory for audio latents (required if --with-audio is set)",
     ),
+    num_workers: int = typer.Option(
+        default=4,
+        help="Number of dataloader worker processes. Set to 0 to debug or avoid worker hangs.",
+    ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
     This script processes videos and images from metadata files and saves latent representations
@@ -1032,6 +1042,7 @@ def main(  # noqa: PLR0913
         vae_tiling=vae_tiling,
         with_audio=with_audio,
         audio_output_dir=audio_output_dir,
+        num_workers=num_workers,
     )
 
 

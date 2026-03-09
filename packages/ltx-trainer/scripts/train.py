@@ -12,7 +12,14 @@ For multi-GPU/FSDP training, configure and launch via Accelerate:
     accelerate launch scripts/train.py CONFIG_PATH
 """
 
+import sys
 from pathlib import Path
+
+# Prefer the in-repo source tree when running from a checkout so config/schema
+# changes are not shadowed by an older installed ltx_trainer package.
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if SRC_DIR.is_dir():
+    sys.path.insert(0, str(SRC_DIR))
 
 import typer
 import yaml

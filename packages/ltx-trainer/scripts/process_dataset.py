@@ -68,6 +68,7 @@ def preprocess_dataset(  # noqa: PLR0913
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
+    num_workers: int = 4,
     negative_caption_column: str = "negative_caption",
     negative_media_column: str = "negative_media_path",
     negative_inference_steps: int = 30,
@@ -110,6 +111,7 @@ def preprocess_dataset(  # noqa: PLR0913
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
 
     with free_gpu_memory_context():
+        logger.info("Starting caption embedding preprocessing...")
         # Process captions using the dedicated function
         compute_captions_embeddings(
             dataset_file=dataset_file,
@@ -146,6 +148,7 @@ def preprocess_dataset(  # noqa: PLR0913
         audio_latents_dir = output_base / "audio_latents"
 
     with free_gpu_memory_context():
+        logger.info("Starting video latent preprocessing...")
         compute_latents(
             dataset_file=dataset_file,
             video_column=video_column,
@@ -157,6 +160,7 @@ def preprocess_dataset(  # noqa: PLR0913
             vae_tiling=vae_tiling,
             with_audio=with_audio,
             audio_output_dir=str(audio_latents_dir) if audio_latents_dir else None,
+            num_workers=num_workers,
         )
 
         # Process reference videos if reference_column is provided
@@ -193,6 +197,7 @@ def preprocess_dataset(  # noqa: PLR0913
                 batch_size=batch_size,
                 device=device,
                 vae_tiling=vae_tiling,
+                num_workers=num_workers,
             )
 
         if manual_negative_specs:
@@ -216,6 +221,7 @@ def preprocess_dataset(  # noqa: PLR0913
                     vae_tiling=vae_tiling,
                     with_audio=with_audio,
                     audio_output_dir=str(negative_audio_latents_dir) if with_audio else None,
+                    num_workers=num_workers,
                 )
 
         if generated_negative_specs:
@@ -432,6 +438,10 @@ def main(  # noqa: PLR0913
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
     ),
+    num_workers: int = typer.Option(
+        default=4,
+        help="Number of dataloader worker processes for media loading. Set to 0 to debug or avoid worker hangs.",
+    ),
     negative_caption_column: str = typer.Option(
         default="negative_caption",
         help="Column name containing paired negative captions for NSYNC preprocessing",
@@ -523,6 +533,7 @@ def main(  # noqa: PLR0913
         reference_downscale_factor=reference_downscale_factor,
         with_audio=with_audio,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+        num_workers=num_workers,
         negative_caption_column=negative_caption_column,
         negative_media_column=negative_media_column,
         negative_inference_steps=negative_inference_steps,
