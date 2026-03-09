@@ -85,6 +85,7 @@ class GenerationConfig:
     guidance_scale: float = 4.0  # CFG guidance scale
     seed: int = 42  # Random seed for reproducibility
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
+    condition_latents: Tensor | None = None  # Optional clean latent tensor; the first latent frame is used for conditioning
     reference_video: Tensor | None = None  # For IC-LoRA: [F, C, H, W] in [0, 1]
     reference_downscale_factor: int = 1  # For IC-LoRA: downscale factor (1 = same resolution, 2 = half resolution)
     generate_audio: bool = True  # Whether to generate audio alongside video
@@ -261,7 +262,9 @@ class ValidationSampler:
             audio_tools.create_initial_state(device=device, dtype=torch.bfloat16) if audio_tools else None
         )
 
-        if config.condition_image is not None:
+        if config.condition_latents is not None:
+            video_clean_state = self._apply_latent_conditioning(video_clean_state, config.condition_latents, device)
+        elif config.condition_image is not None:
             video_clean_state = self._apply_image_conditioning(video_clean_state, config.condition_image, config, device)
 
         noiser = GaussianNoiser(generator=generator)
@@ -323,8 +326,10 @@ class ValidationSampler:
         video_tools = self._create_video_latent_tools(config)
         target_clean_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
 
-        # Apply first-frame image conditioning to target if provided
-        if config.condition_image is not None:
+        # Apply first-frame conditioning to target if provided
+        if config.condition_latents is not None:
+            target_clean_state = self._apply_latent_conditioning(target_clean_state, config.condition_latents, device)
+        elif config.condition_image is not None:
             target_clean_state = self._apply_image_conditioning(
                 target_clean_state, config.condition_image, config, device
             )
@@ -432,6 +437,50 @@ class ValidationSampler:
         # Set denoise_mask to 0 for conditioned tokens (don't denoise them)
         new_denoise_mask = video_state.denoise_mask.clone()
         new_denoise_mask[:, :num_image_tokens] = 0.0
+
+        return LatentState(
+            latent=new_latent,
+            denoise_mask=new_denoise_mask,
+            positions=video_state.positions,
+            clean_latent=new_clean_latent,
+        )
+
+    def _apply_latent_conditioning(
+        self,
+        video_state: LatentState,
+        condition_latents: Tensor,
+        device: torch.device,
+    ) -> LatentState:
+        """Apply first-frame latent conditioning directly to the video state."""
+        if condition_latents.dim() == 4:
+            latent_tensor = condition_latents.unsqueeze(0)
+        elif condition_latents.dim() == 5:
+            latent_tensor = condition_latents
+        else:
+            raise ValueError(
+                f"condition_latents must have shape [C, F, H, W] or [B, C, F, H, W], got {tuple(condition_latents.shape)}"
+            )
+
+        if latent_tensor.shape[0] != 1:
+            raise ValueError(f"condition_latents batch size must be 1 for validation sampling, got {latent_tensor.shape[0]}")
+
+        first_frame_latents = latent_tensor[:, :, :1, :, :].to(device=device, dtype=video_state.latent.dtype)
+        patchified_latents = self._video_patchifier.patchify(first_frame_latents)
+        num_condition_tokens = patchified_latents.shape[1]
+
+        if num_condition_tokens > video_state.latent.shape[1]:
+            raise ValueError(
+                "condition_latents produced more first-frame tokens than the target latent state can accept"
+            )
+
+        new_latent = video_state.latent.clone()
+        new_latent[:, :num_condition_tokens] = patchified_latents
+
+        new_clean_latent = video_state.clean_latent.clone()
+        new_clean_latent[:, :num_condition_tokens] = patchified_latents
+
+        new_denoise_mask = video_state.denoise_mask.clone()
+        new_denoise_mask[:, :num_condition_tokens] = 0.0
 
         return LatentState(
             latent=new_latent,
@@ -736,6 +785,8 @@ class ValidationSampler:
             raise ValueError("Video decoding requires vae_decoder")
         if require_audio_decoder and config.generate_audio and (self._audio_decoder is None or self._vocoder is None):
             raise ValueError("Audio generation requires audio_decoder and vocoder")
+        if config.condition_latents is not None and config.condition_image is not None:
+            raise ValueError("Only one of condition_latents or condition_image may be provided")
         if config.condition_image is not None and self._vae_encoder is None:
             raise ValueError("Image conditioning requires vae_encoder")
         if config.reference_video is not None and self._vae_encoder is None:

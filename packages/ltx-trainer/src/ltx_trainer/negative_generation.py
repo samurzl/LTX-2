@@ -135,6 +135,7 @@ def generate_missing_negative_latents(  # noqa: PLR0913
     guidance_scale: float = 4.0,
     negative_prompt: str = "",
     seed: int = 42,
+    use_first_frame_conditioning: bool = False,
     save_previews: bool = False,
     preview_output_dir: str | Path | None = None,
     load_text_encoder_in_8bit: bool = False,
@@ -161,6 +162,7 @@ def generate_missing_negative_latents(  # noqa: PLR0913
         guidance_scale=guidance_scale,
         negative_prompt=negative_prompt,
         seed=seed,
+        use_first_frame_conditioning=use_first_frame_conditioning,
         save_previews=save_previews,
         preview_output_dir=preview_output_dir,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
@@ -181,6 +183,7 @@ def generate_negative_latents(  # noqa: PLR0913
     guidance_scale: float = 4.0,
     negative_prompt: str = "",
     seed: int = 42,
+    use_first_frame_conditioning: bool = False,
     save_previews: bool = False,
     preview_output_dir: str | Path | None = None,
     load_text_encoder_in_8bit: bool = False,
@@ -250,6 +253,10 @@ def generate_negative_latents(  # noqa: PLR0913
             raise FileNotFoundError(f"Positive latent file not found for negative generation: {positive_latent_path}")
 
         positive_latent_data = torch.load(positive_latent_path, map_location="cpu", weights_only=True)
+        condition_latents = None
+        if use_first_frame_conditioning:
+            condition_latents = _normalize_video_latents(positive_latent_data)["latents"][:, :1].contiguous()
+
         generation_config = _build_generation_config(
             positive_latent_data,
             prompt=spec.prompt,
@@ -258,6 +265,7 @@ def generate_negative_latents(  # noqa: PLR0913
             guidance_scale=guidance_scale,
             seed=seed,
             with_audio=with_audio,
+            condition_latents=condition_latents,
         )
 
         generated = sampler.generate_latents(generation_config, device=device, decode_preview=save_previews)
@@ -286,6 +294,7 @@ def _build_generation_config(
     guidance_scale: float,
     seed: int,
     with_audio: bool,
+    condition_latents: torch.Tensor | None = None,
 ) -> GenerationConfig:
     """Create a generation config aligned to the already-encoded positive sample shape."""
     latent_frames = int(positive_latent_data["num_frames"])
@@ -303,6 +312,7 @@ def _build_generation_config(
         num_inference_steps=inference_steps,
         guidance_scale=guidance_scale,
         seed=seed,
+        condition_latents=condition_latents,
         generate_audio=with_audio,
     )
 
@@ -337,6 +347,20 @@ def _save_generated_negative_audio(output_path: Path, generated: GeneratedLatent
         },
         output_path,
     )
+
+
+def _normalize_video_latents(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize saved video latents to non-patchified [C, F, H, W] format."""
+    latents = data["latents"]
+    if latents.dim() == 2:
+        num_frames = int(data["num_frames"])
+        height = int(data["height"])
+        width = int(data["width"])
+        latents = latents.reshape(num_frames, height, width, latents.shape[1]).permute(3, 0, 1, 2).contiguous()
+        return {**data, "latents": latents}
+    if latents.dim() != 4:
+        raise ValueError(f"Unsupported video latent shape for negative generation: {tuple(latents.shape)}")
+    return data
 
 
 def _load_dataset_records(dataset_file: Path) -> list[dict[str, Any]]:

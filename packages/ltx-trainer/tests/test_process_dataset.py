@@ -64,6 +64,8 @@ def test_preprocess_dataset_generates_negative_branches_from_negative_captions(
     assert len(generate_calls) == 1
     assert [spec.media_path for spec in generate_calls[0]["specs"]] == ["videos/one.mp4", "videos/two.mp4"]
     assert Path(generate_calls[0]["output_dir"]).name == "negative_latents"
+    assert generate_calls[0]["inference_steps"] == 40
+    assert generate_calls[0]["use_first_frame_conditioning"] is False
 
 
 def test_preprocess_dataset_uses_user_supplied_negative_media_without_generation(
@@ -184,6 +186,8 @@ def test_preprocess_dataset_only_generates_missing_negatives_and_tracks_audio_ou
     assert len(generate_calls) == 1
     assert [spec.media_path for spec in generate_calls[0]["specs"]] == ["videos/two.mp4"]
     assert Path(generate_calls[0]["audio_output_dir"]).name == "negative_audio_latents"
+    assert generate_calls[0]["inference_steps"] == 40
+    assert generate_calls[0]["use_first_frame_conditioning"] is False
 
 
 def test_preprocess_dataset_builds_advanced_nsync_manifest_and_artifacts(
@@ -272,6 +276,7 @@ def test_preprocess_dataset_builds_advanced_nsync_manifest_and_artifacts(
         model_path="/tmp/model.safetensors",
         text_encoder_path="/tmp/gemma",
         device="cpu",
+        negative_i2v_mode=True,
     )
 
     assert len(positive_caption_calls) == 1
@@ -281,4 +286,6 @@ def test_preprocess_dataset_builds_advanced_nsync_manifest_and_artifacts(
     assert len(synthetic_generate_calls[0]["specs"]) == 1
     assert synthetic_generate_calls[0]["specs"][0].positive_media_path == "videos/one.mp4"
     assert synthetic_generate_calls[0]["specs"][0].prompt == "synthetic negative one b prompt"
+    assert synthetic_generate_calls[0]["inference_steps"] == 40
+    assert synthetic_generate_calls[0]["use_first_frame_conditioning"] is True
     assert (tmp_path / ".precomputed" / "nsync_manifest.json").is_file()

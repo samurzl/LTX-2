@@ -61,7 +61,8 @@ Advanced preprocessing writes `nsync_manifest.json`, negative caption embeddings
 negative media latents. In structured mode, `caption` is always the training text for a negative
 branch, while `prompt` is only used when `media: "synthetic"` to generate that branch's media.
 Legacy single-negative preprocessing with `negative_caption` and `negative_media_path` remains
-supported for older datasets.
+supported for older datasets. Use `--negative-i2v-mode` during preprocessing if synthetic negatives
+should inherit the positive sample's first latent frame as I2V conditioning.
 
 ## 🖥️ Distributed / Multi-GPU Training
 

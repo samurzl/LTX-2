@@ -307,6 +307,10 @@ Legacy flat-column NSYNC preprocessing still works. In that mode, `negative_capt
 conditioning text and `negative_media_path` is optional. Add `--save-generated-negatives` if you
 also want decoded preview videos for generated legacy negatives.
 
+Add `--negative-i2v-mode` if synthetic negatives should reuse the positive sample's first latent
+frame as I2V conditioning during generation. Auto-generated negative media now uses 40 denoising
+steps by default.
+
 ## 🪄 IC-LoRA Reference Video Preprocessing
 
 For IC-LoRA training, you need to preprocess datasets that include reference videos.

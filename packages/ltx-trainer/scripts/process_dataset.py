@@ -71,10 +71,11 @@ def preprocess_dataset(  # noqa: PLR0913
     num_workers: int = 4,
     negative_caption_column: str = "negative_caption",
     negative_media_column: str = "negative_media_path",
-    negative_inference_steps: int = 30,
+    negative_inference_steps: int = 40,
     negative_guidance_scale: float = 4.0,
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
     negative_seed: int = 42,
+    negative_i2v_mode: bool = False,
     save_generated_negatives: bool = False,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
@@ -238,6 +239,7 @@ def preprocess_dataset(  # noqa: PLR0913
                 guidance_scale=negative_guidance_scale,
                 negative_prompt=negative_prompt,
                 seed=negative_seed,
+                use_first_frame_conditioning=negative_i2v_mode,
                 save_previews=save_generated_negatives,
                 preview_output_dir=output_base / "generated_negative_previews",
                 load_text_encoder_in_8bit=load_text_encoder_in_8bit,
@@ -312,6 +314,7 @@ def preprocess_dataset(  # noqa: PLR0913
                     guidance_scale=negative_guidance_scale,
                     negative_prompt=negative_prompt,
                     seed=negative_seed,
+                    use_first_frame_conditioning=negative_i2v_mode,
                     save_previews=save_generated_negatives,
                     preview_output_dir=output_base / "generated_negative_previews",
                     load_text_encoder_in_8bit=load_text_encoder_in_8bit,
@@ -451,7 +454,7 @@ def main(  # noqa: PLR0913
         help="Optional column name containing paired user-supplied negative media paths for NSYNC preprocessing",
     ),
     negative_inference_steps: int = typer.Option(
-        default=30,
+        default=40,
         help="Number of denoising steps used when auto-generating missing NSYNC negative media",
     ),
     negative_guidance_scale: float = typer.Option(
@@ -465,6 +468,10 @@ def main(  # noqa: PLR0913
     negative_seed: int = typer.Option(
         default=42,
         help="Seed used when auto-generating missing NSYNC negative media",
+    ),
+    negative_i2v_mode: bool = typer.Option(
+        default=False,
+        help="Condition synthetic NSYNC negatives on the positive sample's first latent frame",
     ),
     save_generated_negatives: bool = typer.Option(
         default=False,
@@ -540,6 +547,7 @@ def main(  # noqa: PLR0913
         negative_guidance_scale=negative_guidance_scale,
         negative_prompt=negative_prompt,
         negative_seed=negative_seed,
+        negative_i2v_mode=negative_i2v_mode,
         save_generated_negatives=save_generated_negatives,
     )
 
