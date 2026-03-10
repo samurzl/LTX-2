@@ -244,7 +244,7 @@ def generate_negative_latents(  # noqa: PLR0913
         embeddings_processor=embeddings_processor,
     )
 
-    audio_sample_rate = getattr(components.audio_vae_decoder, "sample_rate", None)
+    preview_audio_sample_rate = getattr(components.vocoder, "output_sampling_rate", None)
 
     for spec in specs:
         output_rel_path = Path(spec.output_rel_path)
@@ -280,8 +280,8 @@ def generate_negative_latents(  # noqa: PLR0913
                 generated.preview_video,
                 preview_path,
                 fps=float(positive_latent_data["fps"]),
-                audio=generated.preview_audio if audio_sample_rate is not None else None,
-                audio_sample_rate=audio_sample_rate if audio_sample_rate is not None else None,
+                audio=generated.preview_audio if preview_audio_sample_rate is not None else None,
+                audio_sample_rate=preview_audio_sample_rate if preview_audio_sample_rate is not None else None,
             )
 
 
