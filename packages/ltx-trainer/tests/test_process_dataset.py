@@ -68,6 +68,65 @@ def test_preprocess_dataset_generates_negative_branches_from_negative_captions(
     assert generate_calls[0]["use_first_frame_conditioning"] is False
 
 
+def test_preprocess_dataset_generates_negative_branches_for_image_datasets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_path = _write_dataset(
+        tmp_path,
+        [
+            {"caption": "positive one", "media_path": "images/one.webp", "negative_caption": "negative one"},
+            {"caption": "positive two", "media_path": "images/two.webp", "negative_caption": "negative two"},
+        ],
+    )
+
+    caption_calls: list[dict] = []
+    latent_calls: list[dict] = []
+    generate_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        process_dataset_script,
+        "compute_captions_embeddings",
+        lambda **kwargs: caption_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        process_dataset_script,
+        "compute_latents",
+        lambda **kwargs: latent_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        process_dataset_script,
+        "generate_missing_negative_latents",
+        lambda specs, **kwargs: generate_calls.append({"specs": specs, **kwargs}),
+    )
+
+    process_dataset_script.preprocess_dataset(
+        dataset_file=str(dataset_path),
+        caption_column="caption",
+        video_column="media_path",
+        resolution_buckets=[(1, 544, 960)],
+        batch_size=1,
+        output_dir=str(tmp_path / ".precomputed"),
+        lora_trigger=None,
+        vae_tiling=False,
+        decode=False,
+        model_path="/tmp/model.safetensors",
+        text_encoder_path="/tmp/gemma",
+        device="cpu",
+    )
+
+    assert len(caption_calls) == 2
+    assert len(latent_calls) == 1
+    assert [spec.media_path for spec in generate_calls[0]["specs"]] == [
+        "images/one.webp",
+        "images/two.webp",
+    ]
+    assert [spec.output_rel_path for spec in generate_calls[0]["specs"]] == [
+        "images/one.pt",
+        "images/two.pt",
+    ]
+
+
 def test_preprocess_dataset_uses_user_supplied_negative_media_without_generation(
     tmp_path: Path,
     monkeypatch,
@@ -260,7 +319,9 @@ def test_preprocess_dataset_builds_advanced_nsync_manifest_and_artifacts(
     monkeypatch.setattr(
         process_dataset_script,
         "generate_missing_negative_latents",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy negative generation should not run")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy negative generation should not run")
+        ),
     )
 
     process_dataset_script.preprocess_dataset(
@@ -288,4 +349,96 @@ def test_preprocess_dataset_builds_advanced_nsync_manifest_and_artifacts(
     assert synthetic_generate_calls[0]["specs"][0].prompt == "synthetic negative one b prompt"
     assert synthetic_generate_calls[0]["inference_steps"] == 40
     assert synthetic_generate_calls[0]["use_first_frame_conditioning"] is True
+    assert (tmp_path / ".precomputed" / "nsync_manifest.json").is_file()
+
+
+def test_preprocess_dataset_builds_advanced_nsync_manifest_for_image_datasets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_path = _write_dataset(
+        tmp_path,
+        [
+            {
+                "caption": "positive one",
+                "media_path": "images/one.png",
+                "nsync": {
+                    "categories": ["cat", "cinematic"],
+                    "negatives": [
+                        {"media": "positive", "caption": "negative one a"},
+                        {
+                            "media": "synthetic",
+                            "prompt": "synthetic negative one b prompt",
+                            "caption": "negative one b",
+                        },
+                    ],
+                    "anchors": [{"required_categories": ["cat"], "extra_random_category": True}],
+                },
+            },
+            {
+                "caption": "positive two",
+                "media_path": "images/two.png",
+                "nsync": {
+                    "categories": ["cat", "studio"],
+                    "negatives": [{"media": "positive", "caption": "negative two a"}],
+                    "anchors": [],
+                },
+            },
+        ],
+    )
+
+    negative_caption_task_calls: list[dict] = []
+    synthetic_generate_calls: list[dict] = []
+
+    monkeypatch.setattr(process_dataset_script, "compute_captions_embeddings", lambda **_: None)
+    monkeypatch.setattr(
+        process_dataset_script,
+        "compute_caption_embeddings_from_tasks",
+        lambda **kwargs: negative_caption_task_calls.append(kwargs),
+    )
+
+    def fake_compute_latents(**kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        for rel_path in ("images/one.pt", "images/two.pt"):
+            path = output_dir / rel_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"latent")
+
+    monkeypatch.setattr(process_dataset_script, "compute_latents", fake_compute_latents)
+    monkeypatch.setattr(
+        process_dataset_script,
+        "generate_negative_latents",
+        lambda specs, **kwargs: synthetic_generate_calls.append({"specs": specs, **kwargs}),
+    )
+    monkeypatch.setattr(
+        process_dataset_script,
+        "generate_missing_negative_latents",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy negative generation should not run")
+        ),
+    )
+
+    process_dataset_script.preprocess_dataset(
+        dataset_file=str(dataset_path),
+        caption_column="caption",
+        video_column="media_path",
+        resolution_buckets=[(1, 544, 960)],
+        batch_size=1,
+        output_dir=str(tmp_path / ".precomputed"),
+        lora_trigger=None,
+        vae_tiling=False,
+        decode=False,
+        model_path="/tmp/model.safetensors",
+        text_encoder_path="/tmp/gemma",
+        device="cpu",
+    )
+
+    assert len(negative_caption_task_calls) == 1
+    assert len(negative_caption_task_calls[0]["tasks"]) == 3
+    assert len(synthetic_generate_calls) == 1
+    assert synthetic_generate_calls[0]["specs"][0].positive_media_path == "images/one.png"
+    assert (
+        synthetic_generate_calls[0]["specs"][0].output_rel_path
+        == "images/one__nsync_negative_001.pt"
+    )
     assert (tmp_path / ".precomputed" / "nsync_manifest.json").is_file()

@@ -44,7 +44,7 @@ from ltx_core.model.audio_vae import AudioProcessor
 from ltx_core.types import Audio
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
-from ltx_trainer.utils import open_image_as_srgb
+from ltx_trainer.utils import is_image_file, open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
 
 disable_progress_bar()
@@ -142,7 +142,7 @@ class MediaDataset(Dataset):
         relative_path = str(video_path.relative_to(data_root))
         media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
 
-        if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
+        if is_image_file(video_path):
             media_tensor = self._preprocess_image(video_path)
             fps = 1.0
             audio_data = None  # Images don't have audio
@@ -282,7 +282,7 @@ class MediaDataset(Dataset):
         min_frames_required = min(self.resolution_buckets, key=lambda x: x[0])[0]
 
         for i, video_path in enumerate(self.video_paths):
-            if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
+            if is_image_file(video_path):
                 valid_video_paths.append(video_path)
                 valid_main_media_paths.append(self.main_media_paths[i])
                 continue

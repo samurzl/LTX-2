@@ -6,6 +6,20 @@ import torch
 from PIL import ExifTags, Image, ImageCms, ImageOps
 from PIL.Image import Image as PilImage
 
+IMAGE_FILE_EXTENSIONS: tuple[str, ...] = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".heic",
+    ".heif",
+    ".webp",
+)
+
+
+def is_image_file(path: str | Path) -> bool:
+    """Check whether a path points to a supported image file based on its extension."""
+    return str(path).lower().endswith(IMAGE_FILE_EXTENSIONS)
+
 
 def open_image_as_srgb(image_path: str | Path | io.BytesIO) -> PilImage:
     """

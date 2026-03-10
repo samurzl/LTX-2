@@ -49,7 +49,7 @@ from ltx_trainer.quantization import quantize_model
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.training_strategies.base_strategy import BatchSourceKeys
-from ltx_trainer.utils import open_image_as_srgb, save_image
+from ltx_trainer.utils import is_image_file, open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
 from ltx_trainer.video_utils import read_video, save_video
 
@@ -1422,7 +1422,7 @@ class LtxvTrainer:
             return
 
         # Determine if outputs are images or videos based on file extension
-        is_image = sample_paths and sample_paths[0].suffix.lower() in (".png", ".jpg", ".jpeg", ".heic", ".webp")
+        is_image = bool(sample_paths) and is_image_file(sample_paths[0])
         media_cls = wandb.Image if is_image else wandb.Video
 
         samples = [media_cls(str(path), caption=prompt) for path, prompt in zip(sample_paths, prompts, strict=True)]

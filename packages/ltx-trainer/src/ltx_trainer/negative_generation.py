@@ -11,6 +11,7 @@ import torch
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 from ltx_trainer.model_loader import load_model as load_ltx_model
+from ltx_trainer.utils import save_image
 from ltx_trainer.validation_sampler import GeneratedLatents, GenerationConfig, ValidationSampler
 from ltx_trainer.video_utils import save_video
 
@@ -275,14 +276,18 @@ def generate_negative_latents(  # noqa: PLR0913
             _save_generated_negative_audio(audio_output_root / output_rel_path, generated)
 
         if preview_root is not None and generated.preview_video is not None:
-            preview_path = preview_root / output_rel_path.with_suffix(".mp4")
-            save_video(
-                generated.preview_video,
-                preview_path,
-                fps=float(positive_latent_data["fps"]),
-                audio=generated.preview_audio if preview_audio_sample_rate is not None else None,
-                audio_sample_rate=preview_audio_sample_rate if preview_audio_sample_rate is not None else None,
-            )
+            if generated.preview_video.shape[1] == 1:
+                preview_path = preview_root / output_rel_path.with_suffix(".png")
+                save_image(generated.preview_video, preview_path)
+            else:
+                preview_path = preview_root / output_rel_path.with_suffix(".mp4")
+                save_video(
+                    generated.preview_video,
+                    preview_path,
+                    fps=float(positive_latent_data["fps"]),
+                    audio=generated.preview_audio if preview_audio_sample_rate is not None else None,
+                    audio_sample_rate=preview_audio_sample_rate if preview_audio_sample_rate is not None else None,
+                )
 
 
 def _build_generation_config(

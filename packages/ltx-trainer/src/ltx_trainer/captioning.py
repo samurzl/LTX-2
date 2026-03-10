@@ -17,6 +17,8 @@ from pathlib import Path
 
 import torch
 
+from ltx_trainer.utils import is_image_file
+
 # Instruction for audio-visual captioning (default) - includes speech transcription and sounds
 DEFAULT_CAPTION_INSTRUCTION = """\
 Analyze this media and provide a detailed caption in the following EXACT format. Fill in ALL sections:
@@ -83,7 +85,7 @@ class MediaCaptioningModel(ABC):
     @staticmethod
     def _is_image_file(path: str | Path) -> bool:
         """Check if the file is an image based on extension."""
-        return str(path).lower().endswith((".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp"))
+        return is_image_file(path)
 
     @staticmethod
     def _is_video_file(path: str | Path) -> bool:

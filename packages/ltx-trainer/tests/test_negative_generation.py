@@ -32,8 +32,14 @@ def test_generate_negative_latents_uses_vocoder_sample_rate_for_preview_audio(
     )
 
     monkeypatch.setattr("ltx_trainer.negative_generation.load_ltx_model", lambda **_: components)
-    monkeypatch.setattr("ltx_trainer.negative_generation.load_text_encoder", lambda **_: object())
-    monkeypatch.setattr("ltx_trainer.negative_generation.load_embeddings_processor", lambda **_: object())
+    monkeypatch.setattr(
+        "ltx_trainer.negative_generation.load_text_encoder",
+        lambda **_: object(),
+    )
+    monkeypatch.setattr(
+        "ltx_trainer.negative_generation.load_embeddings_processor",
+        lambda **_: object(),
+    )
 
     class FakeSampler:
         def __init__(self, **kwargs) -> None:
@@ -94,3 +100,98 @@ def test_generate_negative_latents_uses_vocoder_sample_rate_for_preview_audio(
     assert len(save_video_calls) == 1
     assert save_video_calls[0]["fps"] == 24.0
     assert save_video_calls[0]["audio_sample_rate"] == 48000
+
+
+def test_generate_negative_latents_saves_png_preview_for_single_frame_images(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    positive_latents_dir = tmp_path / "latents"
+    positive_latent_path = positive_latents_dir / "images" / "sample.pt"
+    positive_latent_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "latents": torch.zeros(128, 1, 2, 2),
+            "num_frames": 1,
+            "height": 2,
+            "width": 2,
+            "fps": 1.0,
+        },
+        positive_latent_path,
+    )
+
+    components = SimpleNamespace(
+        transformer=object(),
+        video_vae_decoder=object(),
+        audio_vae_decoder=None,
+        vocoder=None,
+    )
+
+    monkeypatch.setattr("ltx_trainer.negative_generation.load_ltx_model", lambda **_: components)
+    monkeypatch.setattr(
+        "ltx_trainer.negative_generation.load_text_encoder",
+        lambda **_: object(),
+    )
+    monkeypatch.setattr(
+        "ltx_trainer.negative_generation.load_embeddings_processor",
+        lambda **_: object(),
+    )
+
+    class FakeSampler:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def generate_latents(self, generation_config, device: str, decode_preview: bool = False):
+            assert decode_preview is True
+            assert generation_config.num_frames == 1
+            return SimpleNamespace(
+                video_latents=torch.zeros(128, 1, 2, 2),
+                num_frames=1,
+                height=2,
+                width=2,
+                audio_latents=None,
+                num_time_steps=None,
+                frequency_bins=None,
+                duration=None,
+                preview_video=torch.zeros(3, 1, 64, 64),
+                preview_audio=None,
+            )
+
+    monkeypatch.setattr("ltx_trainer.negative_generation.ValidationSampler", FakeSampler)
+
+    save_image_calls: list[dict] = []
+    monkeypatch.setattr(
+        "ltx_trainer.negative_generation.save_image",
+        lambda image_tensor, output_path: save_image_calls.append(
+            {
+                "image_tensor": image_tensor,
+                "output_path": output_path,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "ltx_trainer.negative_generation.save_video",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("single-frame previews should not be saved as video")
+        ),
+    )
+
+    generate_negative_latents(
+        [
+            NegativeLatentGenerationSpec(
+                positive_media_path="images/sample.png",
+                output_rel_path="images/sample.pt",
+                prompt="negative prompt",
+            )
+        ],
+        positive_latents_dir=positive_latents_dir,
+        output_dir=tmp_path / "negative_latents",
+        model_path=tmp_path / "model.safetensors",
+        text_encoder_path=tmp_path / "gemma",
+        device="cpu",
+        save_previews=True,
+        preview_output_dir=tmp_path / "previews",
+    )
+
+    assert len(save_image_calls) == 1
+    assert save_image_calls[0]["output_path"].suffix == ".png"
