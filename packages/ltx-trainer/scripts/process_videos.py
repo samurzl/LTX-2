@@ -22,6 +22,7 @@ import pandas as pd
 import torch
 import torchaudio
 import typer
+from PIL import UnidentifiedImageError
 from pillow_heif import register_heif_opener
 from rich.console import Console
 from rich.progress import (
@@ -113,7 +114,7 @@ class MediaDataset(Dataset):
         # Then load reference video paths
         self.video_paths = self._load_video_paths(video_column)
 
-        # Filter out videos with insufficient frames
+        # Filter out unreadable media and videos with insufficient frames
         self._filter_valid_videos()
 
         self.max_target_frames = max(self.resolution_buckets, key=lambda x: x[0])[0]
@@ -275,7 +276,7 @@ class MediaDataset(Dataset):
         return video_paths
 
     def _filter_valid_videos(self) -> None:
-        """Filter out videos with insufficient frames."""
+        """Filter out unreadable media and videos with insufficient frames."""
         original_length = len(self.video_paths)
         valid_video_paths = []
         valid_main_media_paths = []
@@ -283,8 +284,9 @@ class MediaDataset(Dataset):
 
         for i, video_path in enumerate(self.video_paths):
             if is_image_file(video_path):
-                valid_video_paths.append(video_path)
-                valid_main_media_paths.append(self.main_media_paths[i])
+                if self._validate_image(video_path):
+                    valid_video_paths.append(video_path)
+                    valid_main_media_paths.append(self.main_media_paths[i])
                 continue
 
             try:
@@ -307,9 +309,24 @@ class MediaDataset(Dataset):
 
         if len(self.video_paths) < original_length:
             logger.warning(
-                f"Filtered out {original_length - len(self.video_paths)} videos with insufficient frames. "
-                f"Proceeding with {len(self.video_paths)} valid videos."
+                f"Filtered out {original_length - len(self.video_paths)} media file(s) during validation. "
+                f"Proceeding with {len(self.video_paths)} valid sample(s)."
             )
+
+    @staticmethod
+    def _validate_image(path: Path) -> bool:
+        """Return True when an image can be opened and converted to sRGB."""
+        try:
+            image = open_image_as_srgb(path)
+        except UnidentifiedImageError as e:
+            logger.warning(f"Skipping image at {path} - PIL could not identify the image file: {e!s}")
+            return False
+        except Exception as e:
+            logger.warning(f"Skipping image at {path} - failed to read image: {e!s}")
+            return False
+
+        image.close()
+        return True
 
     def _preprocess_image(self, path: Path) -> torch.Tensor:
         """Preprocess a single image by resizing and applying transforms."""
