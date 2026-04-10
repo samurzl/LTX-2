@@ -1,7 +1,16 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from ltx_trainer.quantization import QuantizationOptions
 from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfigBase
@@ -89,7 +98,8 @@ def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
 
 # Union type for all strategy configs with discriminator
 TrainingStrategyConfig = Annotated[
-    Annotated[TextToVideoConfig, Tag("text_to_video")] | Annotated[VideoToVideoConfig, Tag("video_to_video")],
+    Annotated[TextToVideoConfig, Tag("text_to_video")]
+    | Annotated[VideoToVideoConfig, Tag("video_to_video")],
     Discriminator(_get_strategy_discriminator),
 ]
 
@@ -233,7 +243,9 @@ class ValidationConfig(ConfigBaseModel):
         if height % 32 != 0:
             raise ValueError(f"Height ({height}) must be divisible by 32")
         if frames % 8 != 1:
-            raise ValueError(f"Frames ({frames}) must satisfy frames % 8 == 1 for LTX-2 (e.g., 1, 9, 17, 25, ...)")
+            raise ValueError(
+                f"Frames ({frames}) must satisfy frames % 8 == 1 for LTX-2 (e.g., 1, 9, 17, 25, ...)"
+            )
 
         return v
 
@@ -257,6 +269,18 @@ class ValidationConfig(ConfigBaseModel):
     interval: int | None = Field(
         default=100,
         description="Number of steps between validation runs. If None, validation is disabled.",
+        gt=0,
+    )
+
+    preprocessed_data_root: str | None = Field(
+        default=None,
+        description="Path to a separate preprocessed validation dataset used for holdout loss evaluation.",
+    )
+
+    loss_interval: int | None = Field(
+        default=None,
+        description="Number of steps between holdout validation-loss runs. "
+        "Requires preprocessed_data_root to also be set.",
         gt=0,
     )
 
@@ -311,14 +335,18 @@ class ValidationConfig(ConfigBaseModel):
 
     @field_validator("images")
     @classmethod
-    def validate_images(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:
+    def validate_images(
+        cls, v: list[str] | None, info: ValidationInfo
+    ) -> list[str] | None:
         """Validate that number of images (if provided) matches number of prompts."""
         if v is None:
             return None
 
         num_prompts = len(info.data.get("prompts", []))
         if v is not None and len(v) != num_prompts:
-            raise ValueError(f"Number of images ({len(v)}) must match number of prompts ({num_prompts})")
+            raise ValueError(
+                f"Number of images ({len(v)}) must match number of prompts ({num_prompts})"
+            )
 
         for image_path in v:
             if not Path(image_path).exists():
@@ -328,20 +356,37 @@ class ValidationConfig(ConfigBaseModel):
 
     @field_validator("reference_videos")
     @classmethod
-    def validate_reference_videos(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:
+    def validate_reference_videos(
+        cls, v: list[str] | None, info: ValidationInfo
+    ) -> list[str] | None:
         """Validate that number of reference videos (if provided) matches number of prompts."""
         if v is None:
             return None
 
         num_prompts = len(info.data.get("prompts", []))
         if v is not None and len(v) != num_prompts:
-            raise ValueError(f"Number of reference videos ({len(v)}) must match number of prompts ({num_prompts})")
+            raise ValueError(
+                f"Number of reference videos ({len(v)}) must match number of prompts ({num_prompts})"
+            )
 
         for video_path in v:
             if not Path(video_path).exists():
                 raise ValueError(f"Reference video path '{video_path}' does not exist")
 
         return v
+
+    @field_validator("preprocessed_data_root")
+    @classmethod
+    def validate_preprocessed_data_root(cls, v: str | None) -> str | None:
+        """Validate and normalize the validation dataset path."""
+        if v is None:
+            return None
+
+        expanded = Path(v).expanduser().resolve()
+        if not expanded.exists():
+            raise ValueError(f"Validation dataset path does not exist: {expanded}")
+
+        return str(expanded)
 
     @model_validator(mode="after")
     def validate_scaled_reference_dimensions(self) -> "ValidationConfig":
@@ -375,6 +420,20 @@ class ValidationConfig(ConfigBaseModel):
                     f"Scaled reference height {scaled_height} (from {height} / {self.reference_downscale_factor}) "
                     f"is not divisible by 32. Choose a different downscale factor or adjust video_dims."
                 )
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_loss_config(self) -> "ValidationConfig":
+        """Require both validation-loss fields to be configured together."""
+        has_data_root = self.preprocessed_data_root is not None
+        has_loss_interval = self.loss_interval is not None
+
+        if has_data_root != has_loss_interval:
+            raise ValueError(
+                "validation.preprocessed_data_root and validation.loss_interval must both be set "
+                "to enable holdout validation loss."
+            )
 
         return self
 
@@ -418,9 +477,13 @@ class CheckpointsConfig(ConfigBaseModel):
 class HubConfig(ConfigBaseModel):
     """Configuration for Hugging Face Hub integration"""
 
-    push_to_hub: bool = Field(default=False, description="Whether to push the model weights to the Hugging Face Hub")
+    push_to_hub: bool = Field(
+        default=False,
+        description="Whether to push the model weights to the Hugging Face Hub",
+    )
     hub_model_id: str | None = Field(
-        default=None, description="Hugging Face Hub repository ID (e.g., 'username/repo-name')"
+        default=None,
+        description="Hugging Face Hub repository ID (e.g., 'username/repo-name')",
     )
 
     @model_validator(mode="after")
@@ -460,6 +523,28 @@ class WandbConfig(ConfigBaseModel):
     )
 
 
+class TensorboardConfig(ConfigBaseModel):
+    """Configuration for TensorBoard logging."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to enable TensorBoard scalar logging",
+    )
+
+    log_dir: str | None = Field(
+        default=None,
+        description="Directory for TensorBoard event files. Defaults to output_dir/tensorboard when enabled.",
+    )
+
+    @field_validator("log_dir")
+    @classmethod
+    def expand_log_dir(cls, v: str | None) -> str | None:
+        """Normalize the TensorBoard log directory when provided."""
+        if v is None:
+            return None
+        return str(Path(v).expanduser().resolve())
+
+
 class FlowMatchingConfig(ConfigBaseModel):
     """Configuration for flow matching training"""
 
@@ -492,6 +577,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+    tensorboard: TensorboardConfig = Field(default_factory=TensorboardConfig)
 
     # General configuration
     seed: int = Field(
@@ -527,10 +613,20 @@ class LtxTrainerConfig(ConfigBaseModel):
 
         # Check that LoRA config is provided when training mode is lora
         if self.model.training_mode == "lora" and self.lora is None:
-            raise ValueError("LoRA configuration must be provided when training_mode is 'lora'")
+            raise ValueError(
+                "LoRA configuration must be provided when training_mode is 'lora'"
+            )
 
         # Check that LoRA config is provided when using video_to_video strategy
-        if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
-            raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+        if (
+            self.training_strategy.name == "video_to_video"
+            and self.model.training_mode != "lora"
+        ):
+            raise ValueError(
+                "Training mode must be 'lora' when using video_to_video strategy"
+            )
+
+        if self.tensorboard.enabled and self.tensorboard.log_dir is None:
+            self.tensorboard.log_dir = str(Path(self.output_dir) / "tensorboard")
 
         return self

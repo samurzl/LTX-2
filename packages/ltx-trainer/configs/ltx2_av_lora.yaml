@@ -219,6 +219,13 @@ validation:
   # Set to null to disable validation during training
   interval: 100
 
+  # Optional: separate preprocessed holdout dataset for validation loss
+  preprocessed_data_root: null
+
+  # Evaluate holdout validation loss every N steps
+  # Requires preprocessed_data_root to also be set
+  loss_interval: null
+
   # Number of videos to generate per prompt
   videos_per_prompt: 1
 
@@ -300,6 +307,18 @@ wandb:
 
   # Log validation videos to W&B
   log_validation_videos: true
+
+# -----------------------------------------------------------------------------
+# TensorBoard Configuration
+# -----------------------------------------------------------------------------
+# Settings for scalar logging to TensorBoard.
+tensorboard:
+  # Enable TensorBoard scalar logging
+  enabled: false
+
+  # Directory for TensorBoard event files
+  # Set to null to use output_dir/tensorboard
+  log_dir: null
 
 # -----------------------------------------------------------------------------
 # General Configuration

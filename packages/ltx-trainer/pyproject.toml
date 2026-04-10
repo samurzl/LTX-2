@@ -26,6 +26,7 @@ dependencies = [
     "scenedetect>=0.6.5.2",
     "sentencepiece>=0.2.0",
     "torch>=2.6.0",
+    "tensorboard>=2.18.0",
     "torchaudio>=2.7.0",
     "torchcodec>=0.8.1",
     "torchvision>=0.21.0",

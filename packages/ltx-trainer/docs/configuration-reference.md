@@ -257,6 +257,8 @@ validation:
   negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
   images: null                        # Optional image paths for image-to-video
   reference_videos: null              # Reference video paths (IC-LoRA only)
+  preprocessed_data_root: null        # Separate preprocessed holdout dataset for validation loss
+  loss_interval: null                 # Steps between holdout validation-loss runs
   video_dims: [ 576, 576, 89 ]        # Video dimensions [width, height, frames]
   frame_rate: 25.0                    # Frame rate for generated videos
   seed: 42                            # Random seed for reproducibility
@@ -279,6 +281,8 @@ validation:
 | `prompts`                     | List of text prompts for validation video generation                                                                     |
 | `images`                      | List of image paths for image-to-video validation (must match number of prompts)                                         |
 | `reference_videos`            | List of reference video paths for IC-LoRA validation (must match number of prompts)                                      |
+| `preprocessed_data_root`      | Path to a separate preprocessed holdout dataset used for validation loss                                                 |
+| `loss_interval`               | Steps between holdout validation-loss runs (requires `preprocessed_data_root`)                                           |
 | `video_dims`                  | Output dimensions `[width, height, frames]`. Width/height must be divisible by 32, frames must satisfy `frames % 8 == 1` |
 | `interval`                    | Steps between validation runs (set to `null` to disable)                                                                 |
 | `guidance_scale`              | CFG (Classifier-Free Guidance) scale. Recommended: 4.0                                                                   |
@@ -286,6 +290,7 @@ validation:
 | `stg_blocks`                  | Transformer blocks to perturb for STG. Recommended: `[29]` (single block)                                                |
 | `stg_mode`                    | STG mode: `"stg_av"` perturbs both audio and video, `"stg_v"` perturbs video only                                        |
 | `generate_audio`              | Whether to generate audio in validation samples                                                                          |
+| `skip_initial_validation`     | Skip both step-0 validation loss and step-0 validation sample generation                                                 |
 | `include_reference_in_output` | For IC-LoRA: concatenate reference video side-by-side with output                                                        |
 
 ### CheckpointsConfig
@@ -345,6 +350,23 @@ wandb:
 | `project`               | W&B project name                                 |
 | `entity`                | W&B username or team (null uses default account) |
 | `log_validation_videos` | Whether to log validation videos to W&B          |
+
+### TensorboardConfig
+
+TensorBoard scalar logging configuration.
+
+```yaml
+tensorboard:
+  enabled: false  # Enable TensorBoard scalar logging
+  log_dir: null   # Defaults to output_dir/tensorboard when enabled
+```
+
+**Key parameters:**
+
+| Parameter | Description                                                              |
+|-----------|--------------------------------------------------------------------------|
+| `enabled` | Whether to enable TensorBoard scalar logging                             |
+| `log_dir` | Directory for TensorBoard event files (`null` uses `output_dir/tensorboard`) |
 
 ### FlowMatchingConfig
 

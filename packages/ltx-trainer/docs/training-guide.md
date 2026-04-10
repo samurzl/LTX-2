@@ -25,13 +25,15 @@ The trainer will:
 
 - `lora_weights.safetensors` - Main LoRA weights file
 - `training_config.yaml` - Copy of training configuration
-- `validation_samples/` - Generated validation videos (if enabled)
+- `samples/` - Generated validation videos (if enabled)
+- `tensorboard/` - TensorBoard event files (if enabled)
 
 **For full model fine-tuning:**
 
 - `model_weights.safetensors` - Full model weights
 - `training_config.yaml` - Copy of training configuration
-- `validation_samples/` - Generated validation videos (if enabled)
+- `samples/` - Generated validation videos (if enabled)
+- `tensorboard/` - TensorBoard event files (if enabled)
 
 ## 🖥️ Distributed / Multi-GPU Training
 
@@ -172,9 +174,32 @@ wandb:
 This will log:
 
 - Training loss and learning rate
+- Holdout validation loss
 - Validation videos
 - Model configuration
 - Training progress
+
+## 📈 TensorBoard Logging
+
+Enable TensorBoard scalar logging by adding to your configuration:
+
+```yaml
+tensorboard:
+  enabled: true
+  log_dir: null  # Uses output_dir/tensorboard by default
+```
+
+When holdout validation loss is configured, TensorBoard will log the same scalar metrics as W&B, including:
+
+- Training loss, learning rate, and step time
+- Holdout validation loss
+- Final training summary stats
+
+Launch TensorBoard against your run directory:
+
+```bash
+uv run tensorboard --logdir outputs/
+```
 
 ## 🚀 Next Steps
 
