@@ -6,6 +6,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from ltx_trainer import logger
+from ltx_trainer.preprocessing_manifest import PreprocessingManifest, normalize_rel_path, resolve_source_dir
 
 # Constants for precomputed data directories
 PRECOMPUTED_DIR_NAME = ".precomputed"
@@ -108,6 +109,8 @@ class PrecomputedDataset(Dataset):
 
         self.data_root = self._setup_data_root(data_root)
         self.data_sources = self._normalize_data_sources(data_sources)
+        self._manifest = self._load_manifest()
+        self._manifest_active_samples: dict[str, set[str]] = {}
         self.source_paths = self._setup_source_paths()
         self.sample_files = self._discover_samples()
         self._validate_setup()
@@ -125,6 +128,15 @@ class PrecomputedDataset(Dataset):
             data_root = data_root / PRECOMPUTED_DIR_NAME
 
         return data_root
+
+    def _load_manifest(self) -> PreprocessingManifest | None:
+        """Load the preprocessing manifest when present."""
+
+        manifest_path = self.data_root / "preprocessing_manifest.json"
+        if not manifest_path.exists():
+            return None
+
+        return PreprocessingManifest.load(self.data_root)
 
     @staticmethod
     def _normalize_data_sources(data_sources: dict[str, str] | list[str] | None) -> dict[str, str]:
@@ -145,7 +157,11 @@ class PrecomputedDataset(Dataset):
         source_paths = {}
 
         for dir_name in self.data_sources:
-            source_path = self.data_root / dir_name
+            if self._manifest is not None:
+                source = self._manifest.require_active_source(dir_name)
+                source_path = resolve_source_dir(self.data_root, source["source_dir"])
+            else:
+                source_path = self.data_root / dir_name
             source_paths[dir_name] = source_path
 
             # Check that all sources exist.
@@ -156,6 +172,9 @@ class PrecomputedDataset(Dataset):
 
     def _discover_samples(self) -> dict[str, list[Path]]:
         """Discover all valid sample files across all data sources."""
+        if self._manifest is not None:
+            return self._discover_samples_from_manifest()
+
         # Use first data source as the reference to discover samples
         data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
         data_path = self.source_paths[data_key]
@@ -177,9 +196,40 @@ class PrecomputedDataset(Dataset):
 
         return sample_files
 
+    def _discover_samples_from_manifest(self) -> dict[str, list[Path]]:
+        """Discover samples from the manifest's active sample lists."""
+
+        data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
+        data_source = self._manifest.require_active_source(data_key)
+        data_files = [Path(sample_path) for sample_path in data_source["active_samples"]]
+
+        if not data_files:
+            raise ValueError(f"No data files found in manifest for {data_key}")
+
+        self._manifest_active_samples = {
+            dir_name: set(self._manifest.require_active_source(dir_name)["active_samples"])
+            for dir_name in self.data_sources
+        }
+
+        sample_files = {output_key: [] for output_key in self.data_sources.values()}
+
+        for rel_path in data_files:
+            data_file = self.source_paths[data_key] / rel_path
+            if self._all_source_files_exist(data_file, rel_path):
+                self._fill_sample_data_files(data_file, rel_path, sample_files)
+
+        return sample_files
+
     def _all_source_files_exist(self, data_file: Path, rel_path: Path) -> bool:
         """Check if corresponding files exist in all data sources."""
+        normalized_rel_path = normalize_rel_path(rel_path)
         for dir_name in self.data_sources:
+            if self._manifest is not None and normalized_rel_path not in self._manifest_active_samples[dir_name]:
+                logger.warning(
+                    f"No active {dir_name} manifest entry found for: {data_file.name} (expected rel path: {rel_path})"
+                )
+                return False
+
             expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
             if not expected_path.exists():
                 logger.warning(

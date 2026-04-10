@@ -31,10 +31,18 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Subset
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+from ltx_trainer.preprocessing_manifest import (
+    PreprocessingManifest,
+    infer_manifest_root,
+    normalize_rel_path,
+    resolved_path_string,
+    stable_hash,
+)
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -123,7 +131,9 @@ class CaptionsDataset(Dataset):
 
         # Convert to lists for indexing
         self.output_paths = list(self.caption_data.keys())
-        self.prompts = list(self.caption_data.values())
+        self.raw_prompts = [sample["caption"] for sample in self.caption_data.values()]
+        self.prompts = self.raw_prompts.copy()
+        self.media_paths = [sample["media_path"] for sample in self.caption_data.values()]
 
         # Clean LLM start phrases if requested
         if remove_llm_prefixes:
@@ -141,7 +151,7 @@ class CaptionsDataset(Dataset):
             "index": index,
         }
 
-    def _load_caption_data(self) -> dict[str, str]:
+    def _load_caption_data(self) -> dict[str, dict[str, str]]:
         """Load captions and compute their output embedding paths."""
         if self.dataset_file.suffix == ".csv":
             return self._load_caption_data_from_csv()
@@ -152,7 +162,7 @@ class CaptionsDataset(Dataset):
         else:
             raise ValueError("Expected `dataset_file` to be a path to a CSV, JSON, or JSONL file.")
 
-    def _load_caption_data_from_csv(self) -> dict[str, str]:
+    def _load_caption_data_from_csv(self) -> dict[str, dict[str, str]]:
         """Load captions from a CSV file and compute output embedding paths."""
         df = pd.read_csv(self.dataset_file)
 
@@ -166,11 +176,14 @@ class CaptionsDataset(Dataset):
             media_path = Path(row[self.media_column].strip())
             # Convert media path to embedding output path (same structure, .pt extension)
             output_path = str(media_path.with_suffix(".pt"))
-            caption_data[output_path] = row[self.caption_column]
+            caption_data[output_path] = {
+                "caption": str(row[self.caption_column]),
+                "media_path": media_path.as_posix(),
+            }
 
         return caption_data
 
-    def _load_caption_data_from_json(self) -> dict[str, str]:
+    def _load_caption_data_from_json(self) -> dict[str, dict[str, str]]:
         """Load captions from a JSON file and compute output embedding paths."""
         with open(self.dataset_file, "r", encoding="utf-8") as file:
             data = json.load(file)
@@ -188,11 +201,14 @@ class CaptionsDataset(Dataset):
             media_path = Path(entry[self.media_column].strip())
             # Convert media path to embedding output path (same structure, .pt extension)
             output_path = str(media_path.with_suffix(".pt"))
-            caption_data[output_path] = entry[self.caption_column]
+            caption_data[output_path] = {
+                "caption": str(entry[self.caption_column]),
+                "media_path": media_path.as_posix(),
+            }
 
         return caption_data
 
-    def _load_caption_data_from_jsonl(self) -> dict[str, str]:
+    def _load_caption_data_from_jsonl(self) -> dict[str, dict[str, str]]:
         """Load captions from a JSONL file and compute output embedding paths."""
         caption_data = {}
         with open(self.dataset_file, "r", encoding="utf-8") as file:
@@ -206,7 +222,10 @@ class CaptionsDataset(Dataset):
                 media_path = Path(entry[self.media_column].strip())
                 # Convert media path to embedding output path (same structure, .pt extension)
                 output_path = str(media_path.with_suffix(".pt"))
-                caption_data[output_path] = entry[self.caption_column]
+                caption_data[output_path] = {
+                    "caption": str(entry[self.caption_column]),
+                    "media_path": media_path.as_posix(),
+                }
 
         return caption_data
 
@@ -232,7 +251,10 @@ def compute_captions_embeddings(  # noqa: PLR0913
     batch_size: int = 8,
     device: str = "cuda",
     load_in_8bit: bool = False,
-) -> None:
+    override: bool = False,
+    manifest_root: str | Path | None = None,
+    source_name: str = "conditions",
+) -> list[Path]:
     """
     Process captions and save text embeddings.
     Args:
@@ -261,8 +283,64 @@ def compute_captions_embeddings(  # noqa: PLR0913
     )
     logger.info(f"Loaded {len(dataset):,} captions")
 
-    output_path = Path(output_dir)
+    output_path = Path(output_dir).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    manifest_root_path = (
+        Path(manifest_root).expanduser().resolve()
+        if manifest_root is not None
+        else infer_manifest_root(output_path, source_name)
+    )
+    manifest = PreprocessingManifest.load(manifest_root_path)
+
+    config_signature = stable_hash(
+        {
+            "model_path": resolved_path_string(model_path),
+            "text_encoder_path": resolved_path_string(text_encoder_path),
+            "script_version": "process_captions_v2",
+        }
+    )
+
+    active_samples: list[str] = []
+    sample_fingerprints: dict[str, str] = {}
+    indices_to_process: list[int] = []
+
+    for index, output_rel_path in enumerate(dataset.output_paths):
+        normalized_rel_path = normalize_rel_path(output_rel_path)
+        sample_fingerprint = stable_hash(
+            {
+                "output_rel_path": normalized_rel_path,
+                "raw_caption": dataset.raw_prompts[index],
+                "media_path": dataset.media_paths[index],
+                "lora_trigger": lora_trigger,
+                "remove_llm_prefixes": remove_llm_prefixes,
+            }
+        )
+        active_samples.append(normalized_rel_path)
+        sample_fingerprints[normalized_rel_path] = sample_fingerprint
+
+        output_file = output_path / normalized_rel_path
+        if override or not manifest.is_sample_current(
+            source_name,
+            normalized_rel_path,
+            sample_fingerprint,
+            config_signature,
+            output_file,
+        ):
+            indices_to_process.append(index)
+
+    manifest.log_skip_summary(source_name, len(dataset), len(indices_to_process))
+
+    if not indices_to_process:
+        manifest.update_source(
+            source_name=source_name,
+            source_dir=output_path,
+            config_signature=config_signature,
+            active_samples=active_samples,
+            sample_fingerprints=sample_fingerprints,
+        )
+        manifest.save()
+        logger.info(f"All {len(dataset):,} captions are up to date")
+        return []
 
     # Load text encoder and embeddings processor
     with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
@@ -289,11 +367,12 @@ def compute_captions_embeddings(  # noqa: PLR0913
         batch_size = 1
 
     # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    dataloader = DataLoader(Subset(dataset, indices_to_process), batch_size=batch_size, shuffle=False, num_workers=2)
 
     # Process batches
     total_batches = len(dataloader)
     logger.info(f"Processing captions in {total_batches:,} batches...")
+    processed_files: list[Path] = []
 
     with Progress(
         SpinnerColumn(),
@@ -334,10 +413,21 @@ def compute_captions_embeddings(  # noqa: PLR0913
 
                     output_file = output_path / output_rel_path
                     torch.save(embedding_data, output_file)
+                    processed_files.append(output_file)
 
             progress.advance(task)
 
-    logger.info(f"Processed {len(dataset):,} captions. Embeddings saved to {output_path}")
+    manifest.update_source(
+        source_name=source_name,
+        source_dir=output_path,
+        config_signature=config_signature,
+        active_samples=active_samples,
+        sample_fingerprints=sample_fingerprints,
+    )
+    manifest.save()
+
+    logger.info(f"Processed {len(processed_files):,}/{len(dataset):,} captions. Embeddings saved to {output_path}")
+    return processed_files
 
 
 @app.command()
@@ -387,6 +477,10 @@ def main(  # noqa: PLR0913
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
     ),
+    override: bool = typer.Option(
+        default=False,
+        help="Recompute all caption embeddings even when cached outputs are unchanged",
+    ),
 ) -> None:
     """Process text captions and save embeddings for video generation training.
     This script processes captions from metadata files and saves text embeddings
@@ -428,6 +522,7 @@ def main(  # noqa: PLR0913
         batch_size=batch_size,
         device=device,
         load_in_8bit=load_text_encoder_in_8bit,
+        override=override,
     )
 
 

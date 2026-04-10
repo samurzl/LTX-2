@@ -21,6 +21,7 @@ from rich.console import Console
 
 from ltx_trainer import logger
 from ltx_trainer.gpu_utils import free_gpu_memory_context
+from ltx_trainer.preprocessing_manifest import PreprocessingManifest
 
 console = Console()
 
@@ -50,6 +51,7 @@ def preprocess_dataset(  # noqa: PLR0913
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
+    override: bool = False,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -62,6 +64,10 @@ def preprocess_dataset(  # noqa: PLR0913
 
     if lora_trigger:
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
+
+    processed_latent_files: list[Path] = []
+    processed_reference_files: list[Path] = []
+    processed_audio_files: list[Path] = []
 
     with free_gpu_memory_context():
         # Process captions using the dedicated function
@@ -77,6 +83,8 @@ def preprocess_dataset(  # noqa: PLR0913
             batch_size=batch_size,
             device=device,
             load_in_8bit=load_text_encoder_in_8bit,
+            override=override,
+            manifest_root=output_base,
         )
 
     # Process videos using the dedicated function
@@ -86,7 +94,7 @@ def preprocess_dataset(  # noqa: PLR0913
         audio_latents_dir = output_base / "audio_latents"
 
     with free_gpu_memory_context():
-        compute_latents(
+        latents_result = compute_latents(
             dataset_file=dataset_file,
             video_column=video_column,
             resolution_buckets=resolution_buckets,
@@ -97,7 +105,11 @@ def preprocess_dataset(  # noqa: PLR0913
             vae_tiling=vae_tiling,
             with_audio=with_audio,
             audio_output_dir=str(audio_latents_dir) if audio_latents_dir else None,
+            override=override,
+            manifest_root=output_base,
         )
+        processed_latent_files.extend(latents_result.processed_video_files)
+        processed_audio_files.extend(latents_result.processed_audio_files)
 
         # Process reference videos if reference_column is provided
         if reference_column:
@@ -123,7 +135,7 @@ def preprocess_dataset(  # noqa: PLR0913
 
             reference_latents_dir = output_base / "reference_latents"
 
-            compute_latents(
+            reference_result = compute_latents(
                 dataset_file=dataset_file,
                 main_media_column=video_column,
                 video_column=reference_column,
@@ -133,7 +145,19 @@ def preprocess_dataset(  # noqa: PLR0913
                 batch_size=batch_size,
                 device=device,
                 vae_tiling=vae_tiling,
+                override=override,
+                manifest_root=output_base,
+                source_name="reference_latents",
+                config_signature_extras={"reference_downscale_factor": reference_downscale_factor},
             )
+            processed_reference_files.extend(reference_result.processed_video_files)
+
+    manifest = PreprocessingManifest.load(output_base)
+    if not with_audio:
+        manifest.deactivate_source("audio_latents", output_base / "audio_latents")
+    if not reference_column:
+        manifest.deactivate_source("reference_latents", output_base / "reference_latents")
+    manifest.save()
 
     # Handle decoding if requested (for verification)
     if decode:
@@ -145,19 +169,30 @@ def preprocess_dataset(  # noqa: PLR0913
             vae_tiling=vae_tiling,
             with_audio=with_audio,
         )
-        decoder.decode(latents_dir, output_base / "decoded_videos")
+        if processed_latent_files:
+            decoder.decode_files(processed_latent_files, latents_dir, output_base / "decoded_videos")
+        else:
+            logger.info("Skipping video decoding because no target latents were updated")
 
         # Also decode reference videos if they exist
         if reference_column:
             reference_latents_dir = output_base / "reference_latents"
-            if reference_latents_dir.exists():
+            if reference_latents_dir.exists() and processed_reference_files:
                 logger.info("Decoding reference videos...")
-                decoder.decode(reference_latents_dir, output_base / "decoded_reference_videos")
+                decoder.decode_files(
+                    processed_reference_files,
+                    reference_latents_dir,
+                    output_base / "decoded_reference_videos",
+                )
+            else:
+                logger.info("Skipping reference video decoding because no reference latents were updated")
 
         # Decode audio latents if they exist
-        if with_audio and audio_latents_dir and audio_latents_dir.exists():
+        if with_audio and audio_latents_dir and audio_latents_dir.exists() and processed_audio_files:
             logger.info("Decoding audio latents...")
-            decoder.decode_audio(audio_latents_dir, output_base / "decoded_audio")
+            decoder.decode_audio_files(processed_audio_files, audio_latents_dir, output_base / "decoded_audio")
+        elif with_audio and audio_latents_dir and audio_latents_dir.exists():
+            logger.info("Skipping audio decoding because no audio latents were updated")
 
     # Print summary
     logger.info(f"Dataset preprocessing complete! Results saved to {output_base}")
@@ -252,6 +287,10 @@ def main(  # noqa: PLR0913
         help="Downscale factor for reference video resolution. When > 1, reference videos are processed at "
         "1/n resolution (e.g., 2 means half resolution). Used for efficient IC-LoRA training.",
     ),
+    override: bool = typer.Option(
+        default=False,
+        help="Recompute all outputs even when cached preprocessing results are unchanged",
+    ),
 ) -> None:
     """Preprocess a video dataset by computing and saving latents and text embeddings.
     The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
@@ -310,6 +349,7 @@ def main(  # noqa: PLR0913
         reference_downscale_factor=reference_downscale_factor,
         with_audio=with_audio,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+        override=override,
     )
 
 

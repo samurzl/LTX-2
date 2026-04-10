@@ -14,6 +14,7 @@ Can be used as a standalone script:
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import crop, resize, to_tensor
@@ -44,6 +45,14 @@ from ltx_core.model.audio_vae import AudioProcessor
 from ltx_core.types import Audio
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
+from ltx_trainer.preprocessing_manifest import (
+    PreprocessingManifest,
+    file_stat_payload,
+    infer_manifest_root,
+    normalize_rel_path,
+    resolved_path_string,
+    stable_hash,
+)
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
 
@@ -68,6 +77,12 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Process videos/images and save latent representations for video generation training.",
 )
+
+
+@dataclass
+class LatentProcessingResult:
+    processed_video_files: list[Path]
+    processed_audio_files: list[Path]
 
 
 class MediaDataset(Dataset):
@@ -102,6 +117,7 @@ class MediaDataset(Dataset):
         super().__init__()
 
         self.dataset_file = Path(dataset_file)
+        self.data_root = self.dataset_file.parent
         self.main_media_column = main_media_column
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
@@ -138,9 +154,8 @@ class MediaDataset(Dataset):
         video_path: Path = self.video_paths[index]
 
         # Compute relative path of the video
-        data_root = self.dataset_file.parent
-        relative_path = str(video_path.relative_to(data_root))
-        media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
+        relative_path = str(video_path.relative_to(self.data_root))
+        media_relative_path = str(self.main_media_paths[index].relative_to(self.data_root))
 
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             media_tensor = self._preprocess_image(video_path)
@@ -166,6 +181,7 @@ class MediaDataset(Dataset):
             "video": media_tensor,
             "relative_path": relative_path,
             "main_media_relative_path": media_relative_path,
+            "sample_index": index,
             "video_metadata": {
                 "num_frames": num_frames,
                 "height": height,
@@ -444,7 +460,12 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
-) -> None:
+    override: bool = False,
+    manifest_root: str | Path | None = None,
+    source_name: str = "latents",
+    audio_source_name: str = "audio_latents",
+    config_signature_extras: dict[str, Any] | None = None,
+) -> LatentProcessingResult:
     """
     Process videos and save latent representations.
     Args:
@@ -479,23 +500,125 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     )
     logger.info(f"Loaded {len(dataset)} valid media files")
 
-    output_path = Path(output_dir)
+    output_path = Path(output_dir).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Set up audio output directory if needed
     audio_output_path = None
     if with_audio:
-        audio_output_path = Path(audio_output_dir)
+        audio_output_path = Path(audio_output_dir).expanduser().resolve()
         audio_output_path.mkdir(parents=True, exist_ok=True)
 
+    manifest_root_path = (
+        Path(manifest_root).expanduser().resolve()
+        if manifest_root is not None
+        else infer_manifest_root(output_path, source_name)
+    )
+    manifest = PreprocessingManifest.load(manifest_root_path)
+
+    shared_config_signature = {
+        "model_path": resolved_path_string(model_path),
+        "resolution_buckets": resolution_buckets,
+        "vae_tiling": vae_tiling,
+        "reshape_mode": reshape_mode,
+        "script_version": "process_videos_v2",
+    }
+    if config_signature_extras:
+        shared_config_signature.update(config_signature_extras)
+
+    video_config_signature = stable_hash(
+        {
+            **shared_config_signature,
+            "source_name": source_name,
+        }
+    )
+    audio_config_signature = stable_hash(
+        {
+            **shared_config_signature,
+            "source_name": audio_source_name,
+        }
+    )
+
+    active_video_samples: list[str] = []
+    active_audio_samples: list[str] = []
+    video_fingerprints: dict[str, str] = {}
+    audio_fingerprints: dict[str, str] = {}
+    video_indices_to_process: list[int] = []
+    audio_indices_to_process: list[int] = []
+
+    for index, media_path in enumerate(dataset.video_paths):
+        output_rel_path = normalize_rel_path(
+            dataset.main_media_paths[index].relative_to(dataset.data_root).with_suffix(".pt")
+        )
+        source_media_path = normalize_rel_path(media_path.relative_to(dataset.data_root))
+        sample_fingerprint = stable_hash(
+            {
+                "output_rel_path": output_rel_path,
+                "source_media_path": source_media_path,
+                "source_media_stat": file_stat_payload(media_path),
+            }
+        )
+
+        active_video_samples.append(output_rel_path)
+        video_fingerprints[output_rel_path] = sample_fingerprint
+
+        if override or not manifest.is_sample_current(
+            source_name,
+            output_rel_path,
+            sample_fingerprint,
+            video_config_signature,
+            output_path / output_rel_path,
+        ):
+            video_indices_to_process.append(index)
+
+        if with_audio:
+            active_audio_samples.append(output_rel_path)
+            audio_fingerprints[output_rel_path] = sample_fingerprint
+            if override or not manifest.is_sample_current(
+                audio_source_name,
+                output_rel_path,
+                sample_fingerprint,
+                audio_config_signature,
+                audio_output_path / output_rel_path,
+            ):
+                audio_indices_to_process.append(index)
+
+    manifest.log_skip_summary(source_name, len(dataset), len(video_indices_to_process))
+    if with_audio:
+        manifest.log_skip_summary(audio_source_name, len(dataset), len(audio_indices_to_process))
+
+    indices_to_process = sorted(set(video_indices_to_process) | set(audio_indices_to_process))
+    if not indices_to_process:
+        manifest.update_source(
+            source_name=source_name,
+            source_dir=output_path,
+            config_signature=video_config_signature,
+            active_samples=active_video_samples,
+            sample_fingerprints=video_fingerprints,
+        )
+        if with_audio:
+            manifest.update_source(
+                source_name=audio_source_name,
+                source_dir=audio_output_path,
+                config_signature=audio_config_signature,
+                active_samples=active_audio_samples,
+                sample_fingerprints=audio_fingerprints,
+            )
+        manifest.save()
+        logger.info(f"All {len(dataset):,} media files are up to date")
+        return LatentProcessingResult(processed_video_files=[], processed_audio_files=[])
+
     # Load video VAE encoder
-    with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
-        vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
+    need_video_rebuild = bool(video_indices_to_process)
+    vae = None
+    if need_video_rebuild:
+        with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
+            vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
 
     # Load audio VAE encoder and audio processor if needed
     audio_vae_encoder = None
     audio_processor = None
-    if with_audio:
+    if with_audio and audio_indices_to_process:
         with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
             audio_vae_encoder = load_audio_vae_encoder(
                 checkpoint_path=model_path,
@@ -516,11 +639,15 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     if with_audio and batch_size > 1:
         logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
         batch_size = 1
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    dataloader = DataLoader(Subset(dataset, indices_to_process), batch_size=batch_size, shuffle=False, num_workers=4)
 
     # Track audio statistics
     audio_success_count = 0
     audio_skip_count = 0
+    processed_video_files: list[Path] = []
+    processed_audio_files: list[Path] = []
+    video_indices_to_process_set = set(video_indices_to_process)
+    audio_indices_to_process_set = set(audio_indices_to_process)
 
     # Process batches
     with Progress(
@@ -536,34 +663,53 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         task = progress.add_task("Processing videos", total=len(dataloader))
 
         for batch in dataloader:
-            # Get video tensor - shape is [B, F, C, H, W] from DataLoader
-            video = batch["video"]
+            sample_indices = batch["sample_index"]
+            if isinstance(sample_indices, torch.Tensor):
+                batch_sample_indices = [int(index) for index in sample_indices.tolist()]
+            else:
+                batch_sample_indices = [int(index) for index in sample_indices]
 
-            # Encode video
-            with torch.inference_mode():
-                video_latent_data = encode_video(vae=vae, video=video, use_tiling=vae_tiling)
+            video_batch_positions = [
+                batch_position
+                for batch_position, sample_index in enumerate(batch_sample_indices)
+                if sample_index in video_indices_to_process_set
+            ]
+
+            video_latent_data = None
+            if video_batch_positions:
+                video = batch["video"]
+                video_inputs = video if len(video_batch_positions) == len(batch_sample_indices) else video[video_batch_positions]
+                with torch.inference_mode():
+                    video_latent_data = encode_video(vae=vae, video=video_inputs, use_tiling=vae_tiling)
+                video_latent_lookup = {
+                    batch_sample_indices[batch_position]: encoded_position
+                    for encoded_position, batch_position in enumerate(video_batch_positions)
+                }
+            else:
+                video_latent_lookup = {}
 
             # Save latents for each item in batch
-            for i in range(len(batch["relative_path"])):
+            for i, sample_index in enumerate(batch_sample_indices):
                 output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
-                output_file = output_path / output_rel_path
 
-                # Create output directory maintaining structure
-                output_file.parent.mkdir(parents=True, exist_ok=True)
+                if sample_index in video_indices_to_process_set:
+                    output_file = output_path / output_rel_path
+                    output_file.parent.mkdir(parents=True, exist_ok=True)
 
-                # Index into batch to get this item's latents
-                latent_data = {
-                    "latents": video_latent_data["latents"][i].cpu().contiguous(),  # [C, F', H', W']
-                    "num_frames": video_latent_data["num_frames"],
-                    "height": video_latent_data["height"],
-                    "width": video_latent_data["width"],
-                    "fps": batch["video_metadata"]["fps"][i].item(),
-                }
+                    latent_index = video_latent_lookup[sample_index]
+                    latent_data = {
+                        "latents": video_latent_data["latents"][latent_index].cpu().contiguous(),  # [C, F', H', W']
+                        "num_frames": video_latent_data["num_frames"],
+                        "height": video_latent_data["height"],
+                        "width": video_latent_data["width"],
+                        "fps": batch["video_metadata"]["fps"][i].item(),
+                    }
 
-                torch.save(latent_data, output_file)
+                    torch.save(latent_data, output_file)
+                    processed_video_files.append(output_file)
 
                 # Process audio if enabled (audio is already extracted by the dataset)
-                if with_audio:
+                if with_audio and sample_index in audio_indices_to_process_set:
                     audio_batch = batch.get("audio")
                     if audio_batch is not None:
                         # Extract the i-th item from batched audio data
@@ -589,6 +735,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                         }
 
                         torch.save(audio_save_data, audio_output_file)
+                        processed_audio_files.append(audio_output_file)
                         audio_success_count += 1
                     else:
                         # Video has no audio track
@@ -597,12 +744,33 @@ def compute_latents(  # noqa: PLR0913, PLR0915
             progress.advance(task)
 
     # Log summary
-    logger.info(f"Processed {len(dataset)} videos. Latents saved to {output_path}")
+    manifest.update_source(
+        source_name=source_name,
+        source_dir=output_path,
+        config_signature=video_config_signature,
+        active_samples=active_video_samples,
+        sample_fingerprints=video_fingerprints,
+    )
     if with_audio:
+        manifest.update_source(
+            source_name=audio_source_name,
+            source_dir=audio_output_path,
+            config_signature=audio_config_signature,
+            active_samples=active_audio_samples,
+            sample_fingerprints=audio_fingerprints,
+        )
+    manifest.save()
+
+    logger.info(f"Processed {len(processed_video_files):,}/{len(dataset):,} videos. Latents saved to {output_path}")
+    if with_audio and audio_indices_to_process:
         logger.info(
             f"Audio processing: {audio_success_count} videos with audio, "
             f"{audio_skip_count} videos without audio (skipped)"
         )
+    return LatentProcessingResult(
+        processed_video_files=processed_video_files,
+        processed_audio_files=processed_audio_files,
+    )
 
 
 def encode_video(
@@ -981,6 +1149,10 @@ def main(  # noqa: PLR0913
         default=None,
         help="Output directory for audio latents (required if --with-audio is set)",
     ),
+    override: bool = typer.Option(
+        default=False,
+        help="Recompute all latents even when cached outputs are unchanged",
+    ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
     This script processes videos and images from metadata files and saves latent representations
@@ -1032,6 +1204,7 @@ def main(  # noqa: PLR0913
         vae_tiling=vae_tiling,
         with_audio=with_audio,
         audio_output_dir=audio_output_dir,
+        override=override,
     )
 
 

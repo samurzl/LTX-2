@@ -93,6 +93,17 @@ class LatentsDecoder:
         """
         # Find all .pt files recursively
         latent_files = list(latents_dir.rglob("*.pt"))
+        self.decode_files(latent_files, latents_dir, output_dir, seed=seed)
+
+    @torch.inference_mode()
+    def decode_files(
+        self,
+        latent_files: list[Path],
+        latents_dir: Path,
+        output_dir: Path,
+        seed: int | None = None,
+    ) -> None:
+        """Decode a specific list of latent files."""
 
         if not latent_files:
             logger.warning(f"No .pt files found in {latents_dir}")
@@ -142,6 +153,19 @@ class LatentsDecoder:
 
         # Find all .pt files recursively
         latent_files = list(latents_dir.rglob("*.pt"))
+        self.decode_audio_files(latent_files, latents_dir, output_dir)
+
+    @torch.inference_mode()
+    def decode_audio_files(
+        self,
+        latent_files: list[Path],
+        latents_dir: Path,
+        output_dir: Path,
+    ) -> None:
+        """Decode a specific list of audio latent files."""
+        if self.audio_vae is None or self.vocoder is None:
+            logger.warning("Audio VAE or vocoder not loaded. Skipping audio decoding.")
+            return
 
         if not latent_files:
             logger.warning(f"No .pt files found in {latents_dir}")
