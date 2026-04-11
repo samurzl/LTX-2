@@ -7,7 +7,13 @@ class TimestepSampler:
     They should implement both sample() and sample_for() methods.
     """
 
-    def sample(self, batch_size: int, seq_length: int | None = None, device: torch.device = None) -> torch.Tensor:
+    def sample(
+        self,
+        batch_size: int,
+        seq_length: int | None = None,
+        device: torch.device = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         """Sample timesteps for a batch.
         Args:
             batch_size: Number of timesteps to sample
@@ -18,7 +24,11 @@ class TimestepSampler:
         """
         raise NotImplementedError
 
-    def sample_for(self, batch: torch.Tensor) -> torch.Tensor:
+    def sample_for(
+        self,
+        batch: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         """Sample timesteps for a specific batch tensor.
         Args:
             batch: Input tensor of shape (batch_size, seq_length, ...)
@@ -35,14 +45,28 @@ class UniformTimestepSampler(TimestepSampler):
         self.min_value = min_value
         self.max_value = max_value
 
-    def sample(self, batch_size: int, seq_length: int | None = None, device: torch.device = None) -> torch.Tensor:  # noqa: ARG002
-        return torch.rand(batch_size, device=device) * (self.max_value - self.min_value) + self.min_value
+    def sample(
+        self,
+        batch_size: int,
+        seq_length: int | None = None,
+        device: torch.device = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:  # noqa: ARG002
+        return (
+            torch.rand(batch_size, device=device, generator=generator)
+            * (self.max_value - self.min_value)
+            + self.min_value
+        )
 
-    def sample_for(self, batch: torch.Tensor) -> torch.Tensor:
+    def sample_for(
+        self,
+        batch: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         if batch.ndim != 3:
             raise ValueError(f"Batch should have 3 dimensions, got {batch.ndim}")
 
-        return self.sample(batch.shape[0], device=batch.device)
+        return self.sample(batch.shape[0], device=batch.device, generator=generator)
 
 
 class ShiftedLogitNormalTimestepSampler(TimestepSampler):
@@ -64,7 +88,13 @@ class ShiftedLogitNormalTimestepSampler(TimestepSampler):
         self.normal_999_percentile = 3.0902 * std
         self.normal_005_percentile = -2.5758 * std
 
-    def sample(self, batch_size: int, seq_length: int, device: torch.device = None) -> torch.Tensor:
+    def sample(
+        self,
+        batch_size: int,
+        seq_length: int,
+        device: torch.device = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         """Sample timesteps for a batch from a stretched shifted logit-normal distribution.
         Args:
             batch_size: Number of timesteps to sample
@@ -77,7 +107,10 @@ class ShiftedLogitNormalTimestepSampler(TimestepSampler):
         mu = self._get_shift_for_sequence_length(seq_length)
 
         # Sample from shifted logit-normal
-        normal_samples = torch.randn((batch_size,), device=device) * self.std + mu
+        normal_samples = (
+            torch.randn((batch_size,), device=device, generator=generator) * self.std
+            + mu
+        )
         logitnormal_samples = torch.sigmoid(normal_samples)
 
         # Compute percentile bounds for stretching
@@ -96,12 +129,20 @@ class ShiftedLogitNormalTimestepSampler(TimestepSampler):
         stretched_logit = torch.clamp(stretched_logit, 0, 1)
 
         # Mix with uniform samples (uniform_prob of the time)
-        uniform = (1 - self.eps) * torch.rand((batch_size,), device=device) + self.eps
-        prob = torch.rand((batch_size,), device=device)
+        uniform = (
+            (1 - self.eps)
+            * torch.rand((batch_size,), device=device, generator=generator)
+            + self.eps
+        )
+        prob = torch.rand((batch_size,), device=device, generator=generator)
 
         return torch.where(prob > self.uniform_prob, stretched_logit, uniform)
 
-    def sample_for(self, batch: torch.Tensor) -> torch.Tensor:
+    def sample_for(
+        self,
+        batch: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         """Sample timesteps for a specific batch tensor.
         Args:
             batch: Input tensor of shape (batch_size, seq_length, ...)
@@ -116,7 +157,12 @@ class ShiftedLogitNormalTimestepSampler(TimestepSampler):
             raise ValueError(f"Batch should have 3 dimensions, got {batch.ndim}")
 
         batch_size, seq_length, _ = batch.shape
-        return self.sample(batch_size, seq_length, device=batch.device)
+        return self.sample(
+            batch_size,
+            seq_length,
+            device=batch.device,
+            generator=generator,
+        )
 
     @staticmethod
     def _get_shift_for_sequence_length(

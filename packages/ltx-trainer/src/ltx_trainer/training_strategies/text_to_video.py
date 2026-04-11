@@ -16,6 +16,7 @@ from ltx_core.model.transformer.modality import Modality
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
+    BatchPreparationConfig,
     DEFAULT_FPS,
     ModelInputs,
     TrainingStrategy,
@@ -88,6 +89,7 @@ class TextToVideoStrategy(TrainingStrategy):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        batch_config: BatchPreparationConfig | None = None,
     ) -> ModelInputs:
         """Prepare inputs for text-to-video training."""
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
@@ -120,6 +122,14 @@ class TextToVideoStrategy(TrainingStrategy):
         video_seq_len = video_latents.shape[1]
         device = video_latents.device
         dtype = video_latents.dtype
+        conditioning_p = self._resolve_first_frame_conditioning_probability(
+            self.config.first_frame_conditioning_p,
+            batch_config,
+        )
+        python_rng, torch_generator = self._create_batch_random_sources(
+            device,
+            batch_config,
+        )
 
         # Create conditioning mask (first frame conditioning)
         video_conditioning_mask = self._create_first_frame_conditioning_mask(
@@ -128,12 +138,21 @@ class TextToVideoStrategy(TrainingStrategy):
             height=height,
             width=width,
             device=device,
-            first_frame_conditioning_p=self.config.first_frame_conditioning_p,
+            first_frame_conditioning_p=conditioning_p,
+            random_source=python_rng,
         )
 
         # Sample noise and sigmas
-        sigmas = timestep_sampler.sample_for(video_latents)
-        video_noise = torch.randn_like(video_latents)
+        sigmas = timestep_sampler.sample_for(
+            video_latents,
+            generator=torch_generator,
+        )
+        video_noise = torch.randn(
+            video_latents.shape,
+            device=device,
+            dtype=dtype,
+            generator=torch_generator,
+        )
 
         # Apply noise: noisy = (1 - sigma) * clean + sigma * noise
         sigmas_expanded = sigmas.view(-1, 1, 1)
@@ -188,6 +207,7 @@ class TextToVideoStrategy(TrainingStrategy):
                 batch_size=batch_size,
                 device=device,
                 dtype=dtype,
+                torch_generator=torch_generator,
             )
 
         return ModelInputs(
@@ -208,6 +228,7 @@ class TextToVideoStrategy(TrainingStrategy):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        torch_generator: torch.Generator | None,
     ) -> tuple[Modality, Tensor, Tensor]:
         """Prepare audio inputs for joint audio-video training.
         Args:
@@ -231,7 +252,12 @@ class TextToVideoStrategy(TrainingStrategy):
         audio_seq_len = audio_latents.shape[1]
 
         # Sample audio noise
-        audio_noise = torch.randn_like(audio_latents)
+        audio_noise = torch.randn(
+            audio_latents.shape,
+            device=device,
+            dtype=audio_latents.dtype,
+            generator=torch_generator,
+        )
 
         # Apply noise to audio (same sigma as video)
         sigmas_expanded = sigmas.view(-1, 1, 1)

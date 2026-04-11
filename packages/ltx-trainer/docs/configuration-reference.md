@@ -259,6 +259,8 @@ validation:
   reference_videos: null              # Reference video paths (IC-LoRA only)
   preprocessed_data_root: null        # Separate preprocessed holdout dataset for validation loss
   loss_interval: null                 # Steps between holdout validation-loss runs
+  loss_conditioning_mode: "match_training" # "match_training", "t2v", or "i2v"
+  loss_seed: 42                       # Base seed for deterministic holdout validation loss
   video_dims: [ 576, 576, 89 ]        # Video dimensions [width, height, frames]
   frame_rate: 25.0                    # Frame rate for generated videos
   seed: 42                            # Random seed for reproducibility
@@ -283,6 +285,8 @@ validation:
 | `reference_videos`            | List of reference video paths for IC-LoRA validation (must match number of prompts)                                      |
 | `preprocessed_data_root`      | Path to a separate preprocessed holdout dataset used for validation loss                                                 |
 | `loss_interval`               | Steps between holdout validation-loss runs (requires `preprocessed_data_root`)                                           |
+| `loss_conditioning_mode`      | Holdout loss conditioning mode: `"match_training"`, `"t2v"`, or `"i2v"`                                                  |
+| `loss_seed`                   | Base seed used to make holdout validation loss deterministic across runs                                                  |
 | `video_dims`                  | Output dimensions `[width, height, frames]`. Width/height must be divisible by 32, frames must satisfy `frames % 8 == 1` |
 | `interval`                    | Steps between validation runs (set to `null` to disable)                                                                 |
 | `guidance_scale`              | CFG (Classifier-Free Guidance) scale. Recommended: 4.0                                                                   |
@@ -292,6 +296,10 @@ validation:
 | `generate_audio`              | Whether to generate audio in validation samples                                                                          |
 | `skip_initial_validation`     | Skip both step-0 validation loss and step-0 validation sample generation                                                 |
 | `include_reference_in_output` | For IC-LoRA: concatenate reference video side-by-side with output                                                        |
+
+`loss_conditioning_mode` controls only holdout validation loss. It does not affect validation sample generation.
+For `video_to_video` training, `"t2v"` and `"i2v"` only toggle the additional first-frame conditioning on the target
+video; reference-video conditioning remains active in all modes.
 
 ### CheckpointsConfig
 

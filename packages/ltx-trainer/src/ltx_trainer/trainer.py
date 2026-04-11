@@ -51,7 +51,7 @@ from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
-from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies import BatchPreparationConfig, get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import (
     CachedPromptEmbeddings,
@@ -81,6 +81,7 @@ StepCallback = Callable[
 ]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+UINT64_MASK = (1 << 64) - 1
 
 
 class TrainingStats(BaseModel):
@@ -403,7 +404,11 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _compute_batch_loss(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
+    def _compute_batch_loss(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+        batch_config: BatchPreparationConfig | None = None,
+    ) -> Tensor:
         """Compute the training objective for a batch."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
@@ -431,7 +436,9 @@ class LtxvTrainer:
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(
-            batch, self._timestep_sampler
+            batch,
+            self._timestep_sampler,
+            batch_config=batch_config,
         )
 
         # Run transformer forward pass with Modality-based interface
@@ -1169,6 +1176,47 @@ class LtxvTrainer:
 
         raise ValueError("Could not infer batch size from validation batch")
 
+    @staticmethod
+    def _extract_batch_indices(batch: dict[str, object]) -> list[int]:
+        """Extract dataset indices from a collated batch when available."""
+        idx = batch.get("idx")
+        if isinstance(idx, Tensor):
+            return [int(value) for value in idx.detach().cpu().reshape(-1).tolist()]
+        if isinstance(idx, list):
+            return [int(value) for value in idx]
+        if idx is None:
+            return []
+        return [int(idx)]
+
+    @staticmethod
+    def _mix_validation_seed(seed: int, value: int) -> int:
+        """Mix a value into a 64-bit seed using a stable integer hash."""
+        mixed = (
+            seed * 6364136223846793005 + value + 1442695040888963407
+        ) & UINT64_MASK
+        return mixed
+
+    def _make_validation_batch_config(
+        self,
+        batch: dict[str, object],
+        batch_ordinal: int,
+    ) -> BatchPreparationConfig:
+        """Build deterministic batch-preparation settings for validation loss."""
+        validation_cfg = self._config.validation
+        seed = int(getattr(validation_cfg, "loss_seed", 42)) & UINT64_MASK
+        seed = self._mix_validation_seed(seed, batch_ordinal)
+        for index in self._extract_batch_indices(batch):
+            seed = self._mix_validation_seed(seed, index)
+
+        return BatchPreparationConfig(
+            conditioning_mode=getattr(
+                validation_cfg,
+                "loss_conditioning_mode",
+                "match_training",
+            ),
+            seed=seed,
+        )
+
     def _run_validation_loss(self) -> float | None:
         """Run holdout validation loss over the configured validation dataset."""
         if self._validation_dataloader is None:
@@ -1182,8 +1230,12 @@ class LtxvTrainer:
         try:
             self._transformer.eval()
             with torch.no_grad():
-                for batch in self._validation_dataloader:
-                    loss = self._compute_batch_loss(batch)
+                for batch_ordinal, batch in enumerate(self._validation_dataloader):
+                    batch_config = self._make_validation_batch_config(
+                        batch,
+                        batch_ordinal,
+                    )
+                    loss = self._compute_batch_loss(batch, batch_config=batch_config)
                     batch_size = self._get_batch_size(batch)
                     total_weighted_loss += loss.item() * batch_size
                     total_samples += batch_size

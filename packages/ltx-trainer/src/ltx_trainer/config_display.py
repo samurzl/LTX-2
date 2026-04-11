@@ -97,6 +97,12 @@ def print_config(config: LtxTrainerConfig) -> None:
                     ("Inference Steps", str(val.inference_steps)),
                     ("CFG Scale", str(val.guidance_scale)),
                     (
+                        "Holdout Loss",
+                        f"Every {val.loss_interval} steps ({val.loss_conditioning_mode}, seed {val.loss_seed})"
+                        if val.loss_interval
+                        else "[dim]Disabled[/]",
+                    ),
+                    (
                         "STG",
                         f"scale={val.stg_scale}; blocks={fmt(val.stg_blocks)}; mode={val.stg_mode}"
                         if val.stg_scale > 0

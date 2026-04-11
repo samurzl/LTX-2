@@ -284,6 +284,21 @@ class ValidationConfig(ConfigBaseModel):
         gt=0,
     )
 
+    loss_conditioning_mode: Literal["match_training", "t2v", "i2v"] = Field(
+        default="match_training",
+        description="How holdout validation loss handles first-frame conditioning. "
+        "'match_training' follows training_strategy.first_frame_conditioning_p deterministically, "
+        "'t2v' disables first-frame conditioning, and 'i2v' always enables it. "
+        "For video_to_video training, this controls only the extra first-frame conditioning on the target video; "
+        "reference-video conditioning is still always enabled.",
+    )
+
+    loss_seed: int = Field(
+        default=42,
+        description="Base seed for deterministic holdout validation loss. "
+        "Each validation batch derives a fixed per-batch seed from this value and its sample indices.",
+    )
+
     videos_per_prompt: int = Field(
         default=1,
         description="Number of videos to generate per validation prompt",

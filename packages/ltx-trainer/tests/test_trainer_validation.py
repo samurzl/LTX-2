@@ -6,7 +6,13 @@ import pytest
 import torch
 
 import ltx_trainer.trainer as trainer_module
+from ltx_trainer.timestep_samplers import UniformTimestepSampler
 from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.training_strategies import BatchPreparationConfig
+from ltx_trainer.training_strategies.text_to_video import (
+    TextToVideoConfig,
+    TextToVideoStrategy,
+)
 
 
 class FakeAccelerator:
@@ -67,6 +73,8 @@ def make_validation_trainer() -> LtxvTrainer:
             skip_initial_validation=False,
             interval=10,
             loss_interval=5,
+            loss_conditioning_mode="match_training",
+            loss_seed=42,
             preprocessed_data_root="/tmp/validation",
             prompts=["prompt"],
         ),
@@ -241,7 +249,8 @@ def test_run_validation_loss_preserves_rng(monkeypatch: pytest.MonkeyPatch):
     trainer._global_step = 7
     trainer._log_metrics = lambda metrics, step=None: None
 
-    def consume_rng(_batch):
+    def consume_rng(_batch, batch_config=None):
+        assert batch_config is not None
         random.random()
         torch.rand(1)
         return torch.tensor(0.5)
@@ -276,7 +285,7 @@ def test_run_validation_loss_uses_reduced_totals_and_logs_only_on_main_process(
     trainer._global_step = 15
     logged: list[tuple[dict[str, float], int | None]] = []
     trainer._log_metrics = lambda metrics, step=None: logged.append((metrics, step))
-    trainer._compute_batch_loss = lambda _batch: torch.tensor(1.0)
+    trainer._compute_batch_loss = lambda _batch, batch_config=None: torch.tensor(1.0)
 
     monkeypatch.setattr(trainer_module, "IS_MAIN_PROCESS", False)
     validation_loss = trainer._run_validation_loss()
@@ -288,3 +297,76 @@ def test_run_validation_loss_uses_reduced_totals_and_logs_only_on_main_process(
     assert validation_loss == pytest.approx(3.0)
     assert logged == [({"validation/loss": 3.0}, 15)]
     assert trainer._accelerator.reduction_calls[-1][1] == "sum"
+
+
+def test_run_validation_loss_uses_deterministic_batch_configs():
+    trainer = make_validation_trainer()
+    trainer._validation_dataloader = [{"idx": [0, 1]}, {"idx": [2]}]
+    trainer._global_step = 10
+    trainer._config.validation.loss_seed = 123
+    trainer._config.validation.loss_conditioning_mode = "i2v"
+
+    recorded: list[tuple[str, int]] = []
+
+    def record_loss(_batch, batch_config=None):
+        assert batch_config is not None
+        recorded.append((batch_config.conditioning_mode, batch_config.seed))
+        return torch.tensor(1.0)
+
+    trainer._compute_batch_loss = record_loss
+
+    trainer._run_validation_loss()
+    first_run = recorded.copy()
+
+    recorded.clear()
+    trainer._run_validation_loss()
+    second_run = recorded.copy()
+
+    assert first_run == second_run
+    assert [mode for mode, _seed in first_run] == ["i2v", "i2v"]
+    assert first_run[0][1] != first_run[1][1]
+
+
+def test_text_to_video_batch_config_can_force_i2v_or_t2v_deterministically():
+    strategy = TextToVideoStrategy(
+        TextToVideoConfig(
+            name="text_to_video",
+            first_frame_conditioning_p=0.37,
+            with_audio=False,
+        )
+    )
+    sampler = UniformTimestepSampler()
+    batch = {
+        "latents": {
+            "latents": torch.zeros((1, 2, 2, 2, 2), dtype=torch.float32),
+            "num_frames": torch.tensor([2]),
+            "height": torch.tensor([2]),
+            "width": torch.tensor([2]),
+            "fps": torch.tensor([24.0]),
+        },
+        "conditions": {
+            "video_prompt_embeds": torch.zeros((1, 3, 4), dtype=torch.float32),
+            "audio_prompt_embeds": torch.zeros((1, 3, 4), dtype=torch.float32),
+            "prompt_attention_mask": torch.ones((1, 3), dtype=torch.bool),
+        },
+    }
+
+    i2v_config = BatchPreparationConfig(conditioning_mode="i2v", seed=99)
+    t2v_config = BatchPreparationConfig(conditioning_mode="t2v", seed=99)
+
+    first_i2v = strategy.prepare_training_inputs(batch, sampler, batch_config=i2v_config)
+    second_i2v = strategy.prepare_training_inputs(batch, sampler, batch_config=i2v_config)
+    t2v = strategy.prepare_training_inputs(batch, sampler, batch_config=t2v_config)
+
+    assert torch.equal(first_i2v.video.latent, second_i2v.video.latent)
+    assert torch.equal(first_i2v.video.sigma, second_i2v.video.sigma)
+    assert torch.equal(first_i2v.video_targets, second_i2v.video_targets)
+    assert torch.equal(first_i2v.video_loss_mask, second_i2v.video_loss_mask)
+
+    expected_i2v_mask = torch.tensor(
+        [[False, False, False, False, True, True, True, True]],
+        dtype=torch.bool,
+    )
+    expected_t2v_mask = torch.ones((1, 8), dtype=torch.bool)
+    assert torch.equal(first_i2v.video_loss_mask, expected_i2v_mask)
+    assert torch.equal(t2v.video_loss_mask, expected_t2v_mask)

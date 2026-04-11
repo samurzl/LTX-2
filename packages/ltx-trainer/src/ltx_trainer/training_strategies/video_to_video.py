@@ -15,6 +15,7 @@ from ltx_core.model.transformer.modality import Modality
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
+    BatchPreparationConfig,
     DEFAULT_FPS,
     ModelInputs,
     TrainingStrategy,
@@ -74,6 +75,7 @@ class VideoToVideoStrategy(TrainingStrategy):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        batch_config: BatchPreparationConfig | None = None,
     ) -> ModelInputs:
         """Prepare inputs for IC-LoRA training with reference videos."""
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
@@ -134,6 +136,14 @@ class VideoToVideoStrategy(TrainingStrategy):
         target_seq_len = target_latents.shape[1]
         device = target_latents.device
         dtype = target_latents.dtype
+        conditioning_p = self._resolve_first_frame_conditioning_probability(
+            self.config.first_frame_conditioning_p,
+            batch_config,
+        )
+        python_rng, torch_generator = self._create_batch_random_sources(
+            device,
+            batch_config,
+        )
 
         # Create conditioning mask
         # Reference tokens are always conditioning (timestep=0)
@@ -146,15 +156,24 @@ class VideoToVideoStrategy(TrainingStrategy):
             height=height,
             width=width,
             device=device,
-            first_frame_conditioning_p=self.config.first_frame_conditioning_p,
+            first_frame_conditioning_p=conditioning_p,
+            random_source=python_rng,
         )
 
         # Combined conditioning mask
         conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
         # Sample noise and sigmas for target
-        sigmas = timestep_sampler.sample_for(target_latents)
-        noise = torch.randn_like(target_latents)
+        sigmas = timestep_sampler.sample_for(
+            target_latents,
+            generator=torch_generator,
+        )
+        noise = torch.randn(
+            target_latents.shape,
+            device=device,
+            dtype=dtype,
+            generator=torch_generator,
+        )
         sigmas_expanded = sigmas.view(-1, 1, 1)
 
         # Apply noise to target

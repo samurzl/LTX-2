@@ -59,6 +59,18 @@ class ModelInputs:
     ref_seq_len: int | None = None  # For IC-LoRA: length of reference sequence
 
 
+@dataclass
+class BatchPreparationConfig:
+    """Optional overrides for preparing a specific batch.
+
+    Used by holdout validation loss to make timestep/noise sampling deterministic
+    and to decouple first-frame conditioning from the training-time probability.
+    """
+
+    conditioning_mode: Literal["match_training", "t2v", "i2v"] = "match_training"
+    seed: int | None = None
+
+
 class TrainingStrategy(ABC):
     """Abstract base class for training strategies.
     Each strategy encapsulates the logic for a specific training mode,
@@ -97,6 +109,7 @@ class TrainingStrategy(ABC):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        batch_config: BatchPreparationConfig | None = None,
     ) -> ModelInputs:
         """Prepare training inputs from a raw data batch.
         Args:
@@ -108,6 +121,7 @@ class TrainingStrategy(ABC):
                     - "prompt_attention_mask": Attention mask
                 - Additional keys depending on strategy (e.g., "ref_latents" for IC-LoRA)
             timestep_sampler: Sampler for generating timesteps and noise
+            batch_config: Optional per-batch overrides used by validation loss
         Returns:
             ModelInputs containing Modality objects and training targets
         """
@@ -240,6 +254,7 @@ class TrainingStrategy(ABC):
         width: int,
         device: torch.device,
         first_frame_conditioning_p: float = 0.0,
+        random_source: random.Random | None = None,
     ) -> Tensor:
         """Create conditioning mask for first frame conditioning.
         Args:
@@ -249,14 +264,54 @@ class TrainingStrategy(ABC):
             width: Latent width
             device: Target device
             first_frame_conditioning_p: Probability of conditioning on the first frame
+            random_source: Optional RNG used for deterministic validation loss
         Returns:
             Boolean mask where True indicates first frame tokens (if conditioning is enabled)
         """
         conditioning_mask = torch.zeros(batch_size, sequence_length, dtype=torch.bool, device=device)
 
-        if first_frame_conditioning_p > 0 and random.random() < first_frame_conditioning_p:
+        rng = random_source if random_source is not None else random
+        if first_frame_conditioning_p > 0 and rng.random() < first_frame_conditioning_p:
             first_frame_end_idx = height * width
             if first_frame_end_idx < sequence_length:
                 conditioning_mask[:, :first_frame_end_idx] = True
 
         return conditioning_mask
+
+    @staticmethod
+    def _resolve_first_frame_conditioning_probability(
+        training_probability: float,
+        batch_config: BatchPreparationConfig | None,
+    ) -> float:
+        """Resolve first-frame conditioning mode for the current batch."""
+        if batch_config is None:
+            return training_probability
+
+        match batch_config.conditioning_mode:
+            case "match_training":
+                return training_probability
+            case "t2v":
+                return 0.0
+            case "i2v":
+                return 1.0
+            case _:
+                raise ValueError(
+                    f"Unknown conditioning mode: {batch_config.conditioning_mode}"
+                )
+
+    @staticmethod
+    def _create_batch_random_sources(
+        device: torch.device,
+        batch_config: BatchPreparationConfig | None,
+    ) -> tuple[random.Random | None, torch.Generator | None]:
+        """Create optional deterministic RNGs for batch preparation."""
+        if batch_config is None or batch_config.seed is None:
+            return None, None
+
+        python_rng = random.Random(batch_config.seed)
+        generator_device: str | torch.device = (
+            device if device.type == "cpu" else device.type
+        )
+        generator = torch.Generator(device=generator_device)
+        generator.manual_seed(batch_config.seed)
+        return python_rng, generator

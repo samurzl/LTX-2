@@ -226,6 +226,16 @@ validation:
   # Requires preprocessed_data_root to also be set
   loss_interval: null
 
+  # How holdout validation loss handles first-frame conditioning:
+  # - "match_training": follow training_strategy.first_frame_conditioning_p deterministically
+  # - "t2v": disable first-frame conditioning
+  # - "i2v": always condition on the first frame
+  loss_conditioning_mode: "match_training"
+
+  # Base seed for deterministic holdout validation loss
+  # Each batch derives a fixed seed from this value and its sample indices
+  loss_seed: 42
+
   # Number of videos to generate per prompt
   videos_per_prompt: 1
 
