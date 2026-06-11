@@ -11,11 +11,12 @@ Basic usage:
 The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
 """
 
+import json
 from pathlib import Path
 
 import typer
 from decode_latents import LatentsDecoder
-from process_captions import compute_captions_embeddings
+from process_captions import CaptionsDataset, compute_captions_embeddings
 from process_videos import compute_latents, compute_scaled_resolution_buckets, parse_resolution_buckets
 from rich.console import Console
 
@@ -32,7 +33,7 @@ app = typer.Typer(
 )
 
 
-def preprocess_dataset(  # noqa: PLR0913
+def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
     dataset_file: str,
     caption_column: str,
     video_column: str,
@@ -49,6 +50,17 @@ def preprocess_dataset(  # noqa: PLR0913
     reference_column: str | None = None,
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
+    mixed_audio: bool = False,
+    audio_min_rms_db: float = -60.0,
+    audio_min_active_ratio: float = 0.01,
+    audio_activity_window_ms: float = 100.0,
+    generate_negatives: bool = False,
+    negative_videos_dir: str | None = None,
+    negative_latents_dir: str = "negative_latents",
+    negative_prompt: str = "",
+    negative_inference_steps: int = 30,
+    negative_guidance_scale: float = 4.0,
+    negative_seed: int = 42,
     load_text_encoder_in_8bit: bool = False,
     overwrite: bool = False,
 ) -> None:
@@ -99,8 +111,43 @@ def preprocess_dataset(  # noqa: PLR0913
             vae_tiling=vae_tiling,
             with_audio=with_audio,
             audio_output_dir=str(audio_latents_dir) if audio_latents_dir else None,
+            audio_min_rms_db=audio_min_rms_db,
+            audio_min_active_ratio=audio_min_active_ratio,
+            audio_activity_window_ms=audio_activity_window_ms,
+            allow_missing_audio=mixed_audio,
             overwrite=overwrite,
         )
+
+        if generate_negatives:
+            logger.info("Generating synthetic negative videos with the base model...")
+            negative_videos_base = Path(negative_videos_dir) if negative_videos_dir else output_base / "negative_videos"
+            negative_dataset = generate_negative_videos(
+                dataset_file=dataset_file,
+                caption_column=caption_column,
+                media_column=video_column,
+                output_dir=negative_videos_base,
+                model_path=model_path,
+                text_encoder_path=text_encoder_path,
+                resolution_buckets=resolution_buckets,
+                device=device,
+                negative_prompt=negative_prompt,
+                num_inference_steps=negative_inference_steps,
+                guidance_scale=negative_guidance_scale,
+                seed=negative_seed,
+                overwrite=overwrite,
+            )
+
+            compute_latents(
+                dataset_file=negative_dataset,
+                video_column="media_path",
+                resolution_buckets=resolution_buckets,
+                output_dir=str(output_base / negative_latents_dir),
+                model_path=model_path,
+                batch_size=batch_size,
+                device=device,
+                vae_tiling=vae_tiling,
+                overwrite=overwrite,
+            )
 
         # Process reference videos if reference_column is provided
         if reference_column:
@@ -169,6 +216,10 @@ def preprocess_dataset(  # noqa: PLR0913
         logger.info("Reference videos processed and saved to reference_latents/ directory for IC-LoRA training")
     if with_audio:
         logger.info("Audio latents saved to audio_latents/ directory for audio-video training")
+        if mixed_audio:
+            logger.info("Mixed-audio training enabled: samples without usable audio latents are kept as video-only")
+    if generate_negatives:
+        logger.info(f"Synthetic negative latents saved to {negative_latents_dir}/ directory for NSYNC training")
 
 
 def _validate_dataset_file(dataset_path: str) -> None:
@@ -183,6 +234,92 @@ def _validate_dataset_file(dataset_path: str) -> None:
 
     if dataset_file.suffix.lower() not in [".csv", ".json", ".jsonl"]:
         raise ValueError(f"Dataset file must be CSV, JSON, or JSONL format: {dataset_file}")
+
+
+def generate_negative_videos(  # noqa: PLR0913
+    dataset_file: str,
+    caption_column: str,
+    media_column: str,
+    output_dir: Path,
+    model_path: str,
+    text_encoder_path: str,
+    resolution_buckets: list[tuple[int, int, int]],
+    device: str,
+    negative_prompt: str,
+    num_inference_steps: int,
+    guidance_scale: float,
+    seed: int,
+    overwrite: bool,
+) -> str:
+    """Generate one synthetic negative video per caption using ltx-pipelines."""
+    import torch  # noqa: PLC0415
+
+    from ltx_core.components.guiders import MultiModalGuiderParams  # noqa: PLC0415
+    from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline  # noqa: PLC0415
+    from ltx_pipelines.utils.media_io import encode_video  # noqa: PLC0415
+
+    if len(resolution_buckets) > 1:
+        logger.warning(
+            "Negative generation uses the first resolution bucket. "
+            "Use a single bucket when generated negatives must exactly mirror mixed-bucket training data."
+        )
+
+    frames, height, width = resolution_buckets[0]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    captions = CaptionsDataset(
+        dataset_file=dataset_file,
+        caption_column=caption_column,
+        media_column=media_column,
+        lora_trigger=None,
+        remove_llm_prefixes=False,
+    )
+
+    pipeline = TI2VidOneStagePipeline(
+        checkpoint_path=model_path,
+        gemma_root=text_encoder_path,
+        loras=[],
+        device=torch.device(device),
+    )
+
+    metadata = []
+    for idx in range(len(captions)):
+        item = captions[idx]
+        rel_output = Path(item["output_path"]).with_suffix(".mp4")
+        output_path = output_dir / rel_output
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if output_path.exists() and not overwrite:
+            metadata.append({"caption": item["prompt"], "media_path": str(rel_output)})
+            continue
+
+        video, audio = pipeline(
+            prompt=item["prompt"],
+            negative_prompt=negative_prompt,
+            seed=seed + idx,
+            height=height,
+            width=width,
+            num_frames=frames,
+            frame_rate=24.0,
+            num_inference_steps=num_inference_steps,
+            video_guider_params=MultiModalGuiderParams(cfg_scale=guidance_scale),
+            audio_guider_params=MultiModalGuiderParams(cfg_scale=guidance_scale),
+            images=[],
+        )
+        encode_video(
+            video=video,
+            fps=24.0,
+            audio=audio,
+            output_path=str(output_path),
+            video_chunks_number=1,
+        )
+        metadata.append({"caption": item["prompt"], "media_path": str(rel_output)})
+
+    negative_dataset = output_dir / "negative_dataset.json"
+    with open(negative_dataset, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    return str(negative_dataset)
 
 
 @app.command()
@@ -247,6 +384,50 @@ def main(  # noqa: PLR0913
         default=False,
         help="Extract and encode audio from video files",
     ),
+    mixed_audio: bool = typer.Option(
+        default=False,
+        help="Keep videos whose audio is missing or silent as video-only samples for mixed-audio training",
+    ),
+    audio_min_rms_db: float = typer.Option(
+        default=-60.0,
+        help="Minimum RMS level in dBFS for an audio track to count as non-silent",
+    ),
+    audio_min_active_ratio: float = typer.Option(
+        default=0.01,
+        help="Minimum ratio of audio windows above --audio-min-rms-db required to save audio latents",
+    ),
+    audio_activity_window_ms: float = typer.Option(
+        default=100.0,
+        help="Audio activity analysis window size in milliseconds",
+    ),
+    generate_negatives: bool = typer.Option(
+        default=False,
+        help="Generate one base-model synthetic negative video per caption and encode it for NSYNC",
+    ),
+    negative_videos_dir: str | None = typer.Option(
+        default=None,
+        help="Directory for generated negative videos (defaults to .precomputed/negative_videos)",
+    ),
+    negative_latents_dir: str = typer.Option(
+        default="negative_latents",
+        help="Directory name under the precomputed root for generated negative latents",
+    ),
+    negative_prompt: str = typer.Option(
+        default="",
+        help="Negative prompt used while generating synthetic negative videos",
+    ),
+    negative_inference_steps: int = typer.Option(
+        default=30,
+        help="Number of inference steps for synthetic negative video generation",
+    ),
+    negative_guidance_scale: float = typer.Option(
+        default=4.0,
+        help="CFG scale for synthetic negative video generation",
+    ),
+    negative_seed: int = typer.Option(
+        default=42,
+        help="Base random seed for synthetic negative video generation",
+    ),
     load_text_encoder_in_8bit: bool = typer.Option(
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
@@ -302,6 +483,8 @@ def main(  # noqa: PLR0913
 
     if reference_downscale_factor > 1 and not reference_column:
         logger.warning("--reference-downscale-factor specified but no --reference-column provided. Ignoring.")
+    if mixed_audio and not with_audio:
+        raise typer.BadParameter("--mixed-audio requires --with-audio")
 
     preprocess_dataset(
         dataset_file=dataset_path,
@@ -320,6 +503,17 @@ def main(  # noqa: PLR0913
         reference_column=reference_column,
         reference_downscale_factor=reference_downscale_factor,
         with_audio=with_audio,
+        mixed_audio=mixed_audio,
+        audio_min_rms_db=audio_min_rms_db,
+        audio_min_active_ratio=audio_min_active_ratio,
+        audio_activity_window_ms=audio_activity_window_ms,
+        generate_negatives=generate_negatives,
+        negative_videos_dir=negative_videos_dir,
+        negative_latents_dir=negative_latents_dir,
+        negative_prompt=negative_prompt,
+        negative_inference_steps=negative_inference_steps,
+        negative_guidance_scale=negative_guidance_scale,
+        negative_seed=negative_seed,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
         overwrite=overwrite,
     )

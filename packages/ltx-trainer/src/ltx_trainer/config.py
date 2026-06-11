@@ -1,3 +1,4 @@
+from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -13,12 +14,75 @@ class ConfigBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ModelComponentPaths(ConfigBaseModel):
+    """Optional per-component checkpoint paths.
+
+    These paths are useful for Comfy-style layouts where the transformer, VAEs,
+    vocoder, and text components are stored in separate files/directories. Any
+    field left unset falls back to ``model.model_path`` or ``model.text_encoder_path``
+    when those top-level paths are provided.
+    """
+
+    transformer: str | Path | None = Field(
+        default=None,
+        description="Optional checkpoint path for the LTX transformer weights",
+    )
+
+    embeddings_processor: str | Path | None = Field(
+        default=None,
+        description="Optional checkpoint path for text feature extractor and embedding connector weights",
+    )
+
+    video_vae: str | Path | None = Field(
+        default=None,
+        description="Optional shared checkpoint path for video VAE encoder and decoder weights",
+    )
+
+    video_vae_encoder: str | Path | None = Field(
+        default=None,
+        description="Optional checkpoint path for video VAE encoder weights",
+    )
+
+    video_vae_decoder: str | Path | None = Field(
+        default=None,
+        description="Optional checkpoint path for video VAE decoder weights",
+    )
+
+    audio_vae: str | Path | None = Field(
+        default=None,
+        description="Optional shared checkpoint path for audio VAE encoder and decoder weights",
+    )
+
+    audio_vae_encoder: str | Path | None = Field(
+        default=None,
+        description="Optional checkpoint path for audio VAE encoder weights",
+    )
+
+    audio_vae_decoder: str | Path | None = Field(
+        default=None,
+        description="Optional checkpoint path for audio VAE decoder weights",
+    )
+
+    vocoder: str | Path | None = Field(
+        default=None,
+        description="Optional checkpoint path for vocoder weights",
+    )
+
+    text_encoder: str | Path | None = Field(
+        default=None,
+        description="Optional Gemma text encoder root directory",
+    )
+
+
 class ModelConfig(ConfigBaseModel):
     """Configuration for the base model and training mode"""
 
-    model_path: str | Path = Field(
-        ...,
-        description="Model path - local path to safetensors checkpoint file",
+    model_path: str | Path | None = Field(
+        default=None,
+        description=(
+            "Model path - local path to safetensors checkpoint file. May be null when required "
+            "model.component_paths entries are provided."
+        ),
     )
 
     text_encoder_path: str | Path | None = Field(
@@ -37,10 +101,18 @@ class ModelConfig(ConfigBaseModel):
         "If a directory is provided, the latest checkpoint will be used.",
     )
 
+    component_paths: ModelComponentPaths = Field(
+        default_factory=ModelComponentPaths,
+        description="Optional per-component checkpoint paths for Comfy-style model layouts",
+    )
+
     @field_validator("model_path")
     @classmethod
-    def validate_model_path(cls, v: str | Path) -> str | Path:
+    def validate_model_path(cls, v: str | Path | None) -> str | Path | None:
         """Validate that model_path is either a valid URL or an existing local path."""
+        if v is None:
+            return v
+
         is_url = str(v).startswith(("http://", "https://"))
 
         if is_url:
@@ -50,6 +122,48 @@ class ModelConfig(ConfigBaseModel):
             raise ValueError(f"Model path does not exist: {v}")
 
         return v
+
+    @model_validator(mode="after")
+    def validate_model_source(self) -> "ModelConfig":
+        if self.model_path is not None:
+            return self
+
+        required_component_paths = {
+            "transformer": self.component_paths.transformer,
+            "embeddings_processor": self.component_paths.embeddings_processor,
+            "video_vae_decoder": self.component_paths.video_vae_decoder or self.component_paths.video_vae,
+        }
+        missing = [name for name, path in required_component_paths.items() if path is None]
+        if missing:
+            missing_list = ", ".join(f"model.component_paths.{name}" for name in missing)
+            raise ValueError(f"model_path is null, so these component paths must be provided: {missing_list}")
+
+        return self
+
+
+class NsyncConfig(ConfigBaseModel):
+    """Configuration for NSYNC contrastive LoRA training."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable NSYNC training with synthetic negative latents",
+    )
+
+    negative_latents_dir: str = Field(
+        default="negative_latents",
+        description="Directory name containing generated negative video latents",
+    )
+
+    projection_scope: Literal["layer", "parameter"] = Field(
+        default="layer",
+        description="Gradient projection granularity. 'layer' groups by transformer block.",
+    )
+
+    eps: float = Field(
+        default=1e-12,
+        description="Numerical epsilon used in gradient projection denominators",
+        gt=0.0,
+    )
 
 
 class LoraConfig(ConfigBaseModel):
@@ -78,6 +192,49 @@ class LoraConfig(ConfigBaseModel):
         default=["to_k", "to_q", "to_v", "to_out.0"],
         description="List of modules to target with LoRA",
     )
+
+    noise_experts: dict[str, tuple[float, float]] | None = Field(
+        default=None,
+        description="Optional named sigma ranges for training separate LoRA experts",
+    )
+
+    nsync: NsyncConfig = Field(
+        default_factory=NsyncConfig,
+        description="NSYNC synthetic-negative contrastive training options",
+    )
+
+    @field_validator("noise_experts")
+    @classmethod
+    def validate_noise_experts(
+        cls,
+        v: dict[str, tuple[float, float]] | None,
+    ) -> dict[str, tuple[float, float]] | None:
+        """Validate named noise-expert ranges."""
+        if v is None:
+            return v
+
+        for name, (min_sigma, max_sigma) in v.items():
+            if not name:
+                raise ValueError("Noise expert names must be non-empty")
+            if not name.replace("_", "").replace("-", "").isalnum():
+                raise ValueError(
+                    f"Noise expert name '{name}' may only contain letters, numbers, underscores, and hyphens"
+                )
+            if not 0.0 <= min_sigma < max_sigma <= 1.0:
+                raise ValueError(
+                    f"Noise expert '{name}' must satisfy 0.0 <= min_sigma < max_sigma <= 1.0, "
+                    f"got ({min_sigma}, {max_sigma})"
+                )
+
+        ranges = sorted(v.items(), key=lambda item: item[1][0])
+        for (left_name, (_, left_max)), (right_name, (right_min, _)) in pairwise(ranges):
+            if left_max > right_min:
+                raise ValueError(
+                    f"Noise expert ranges must not overlap: '{left_name}' ends at {left_max}, "
+                    f"but '{right_name}' starts at {right_min}"
+                )
+
+        return v
 
 
 def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
@@ -531,6 +688,12 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when training mode is lora
         if self.model.training_mode == "lora" and self.lora is None:
             raise ValueError("LoRA configuration must be provided when training_mode is 'lora'")
+
+        if self.lora is not None and self.lora.nsync.enabled:
+            if self.model.training_mode != "lora":
+                raise ValueError("NSYNC training is only supported when training_mode is 'lora'")
+            if self.training_strategy.name != "text_to_video":
+                raise ValueError("NSYNC training is currently supported only with the text_to_video strategy")
 
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":

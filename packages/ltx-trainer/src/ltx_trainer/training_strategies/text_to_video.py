@@ -9,7 +9,7 @@ This strategy implements standard text-to-video generation training where:
 from typing import Any, Literal
 
 import torch
-from pydantic import Field
+from pydantic import Field, model_validator
 from torch import Tensor
 
 from ltx_core.model.transformer.modality import Modality
@@ -44,6 +44,21 @@ class TextToVideoConfig(TrainingStrategyConfigBase):
         default="audio_latents",
         description="Directory name for audio latents when with_audio is True",
     )
+
+    mixed_audio: bool = Field(
+        default=False,
+        description=(
+            "Allow datasets that mix samples with and without usable audio latents. "
+            "Audio loss is computed only for batches with audio."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_mixed_audio(self) -> "TextToVideoConfig":
+        """Mixed-audio mode only makes sense when audio training is enabled."""
+        if self.mixed_audio and not self.with_audio:
+            raise ValueError("mixed_audio requires with_audio=true")
+        return self
 
 
 class TextToVideoStrategy(TrainingStrategy):
@@ -83,6 +98,12 @@ class TextToVideoStrategy(TrainingStrategy):
             sources[self.config.audio_latents_dir] = "audio_latents"
 
         return sources
+
+    def get_optional_data_sources(self) -> set[str]:
+        """Return optional data-source directories for mixed-audio datasets."""
+        if self.config.with_audio and self.config.mixed_audio:
+            return {self.config.audio_latents_dir}
+        return set()
 
     def prepare_training_inputs(
         self,
@@ -179,7 +200,13 @@ class TextToVideoStrategy(TrainingStrategy):
         audio_targets = None
         audio_loss_mask = None
 
-        if self.config.with_audio:
+        use_audio = (
+            self.config.with_audio
+            and not batch.get("_force_video_only", False)
+            and batch.get("audio_latents") is not None
+        )
+
+        if use_audio:
             audio_modality, audio_targets, audio_loss_mask = self._prepare_audio_inputs(
                 batch=batch,
                 sigmas=sigmas,
@@ -281,7 +308,7 @@ class TextToVideoStrategy(TrainingStrategy):
         video_loss = masked.mean(dim=[-2, -1]) / video_loss_mask.mean(dim=[-2, -1]).clamp(min=1e-8)
 
         # If no audio, return video loss only
-        if not self.config.with_audio or audio_pred is None or inputs.audio_targets is None:
+        if audio_pred is None or inputs.audio_targets is None:
             return video_loss
 
         # Audio loss: per-element mean over (seq, channels), [B,]

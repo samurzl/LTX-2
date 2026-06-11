@@ -91,6 +91,10 @@ class TrainingStrategy(ABC):
             or a dictionary mapping data directory names to custom output keys for the dataset
         """
 
+    def get_optional_data_sources(self) -> set[str]:
+        """Get data-source directory names that may be missing for individual samples."""
+        return set()
+
     @abstractmethod
     def prepare_training_inputs(
         self,

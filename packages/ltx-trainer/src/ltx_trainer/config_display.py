@@ -29,6 +29,9 @@ def print_config(config: LtxTrainerConfig) -> None:
     opt = cfg.optimization
     val = cfg.validation
     accel = cfg.acceleration
+    component_overrides = {
+        key: value for key, value in cfg.model.component_paths.model_dump().items() if value is not None
+    }
 
     # Build sections: list of (section_title, [(key, value), ...])
     sections: list[tuple[str, list[tuple[str, str]]]] = [
@@ -39,6 +42,7 @@ def print_config(config: LtxTrainerConfig) -> None:
                 ("Text Encoder", fmt(cfg.model.text_encoder_path) or "[dim]Built-in[/]"),
                 ("Training Mode", f"[bold green]{cfg.model.training_mode.upper()}[/]"),
                 ("Load Checkpoint", fmt(cfg.model.load_checkpoint) if cfg.model.load_checkpoint else "[dim]—[/]"),
+                ("Component Overrides", f"{len(component_overrides)} set" if component_overrides else "[dim]—[/]"),
             ],
         ),
     ]
@@ -51,6 +55,8 @@ def print_config(config: LtxTrainerConfig) -> None:
                     ("Rank / Alpha", f"{cfg.lora.rank} / {cfg.lora.alpha}"),
                     ("Dropout", str(cfg.lora.dropout)),
                     ("Target Modules", fmt(cfg.lora.target_modules)),
+                    ("Noise Experts", fmt(list((cfg.lora.noise_experts or {"default": (0.0, 1.0)}).keys()))),
+                    ("NSYNC", fmt(cfg.lora.nsync.enabled)),
                 ],
             )
         )
@@ -59,6 +65,8 @@ def print_config(config: LtxTrainerConfig) -> None:
     strategy_items: list[tuple[str, str]] = [("Name", cfg.training_strategy.name)]
     if hasattr(cfg.training_strategy, "with_audio"):
         strategy_items.append(("Audio", fmt(cfg.training_strategy.with_audio)))
+    if hasattr(cfg.training_strategy, "mixed_audio"):
+        strategy_items.append(("Mixed Audio", fmt(cfg.training_strategy.mixed_audio)))
     if hasattr(cfg.training_strategy, "first_frame_conditioning_p"):
         strategy_items.append(("First Frame Cond P", str(cfg.training_strategy.first_frame_conditioning_p)))
 

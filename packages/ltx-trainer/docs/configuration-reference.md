@@ -28,6 +28,8 @@ Check out our example configurations in the `configs` directory:
 - 📄 [Audio-Video LoRA Training (Low VRAM)](../configs/ltx2_av_lora_low_vram.yaml) - Memory-optimized config for 32GB
   GPUs (uses 8-bit optimizer, INT8 quantization, and reduced LoRA rank)
 - 📄 [IC-LoRA Training](../configs/ltx2_v2v_ic_lora.yaml) - Video-to-video transformation training
+- 📄 [NSYNC + Noise Experts + Mixed Audio](../configs/ltx2_av_lora_nsync_noise_experts_mixed_audio.yaml) -
+  Advanced LoRA training with generated negatives, sigma-range experts, and mixed audio availability
 
 ## ⚙️ Configuration Sections
 
@@ -37,23 +39,42 @@ Controls the base model and training mode settings.
 
 ```yaml
 model:
-  model_path: "/path/to/ltx-2-model.safetensors"  # Local path to model checkpoint
+  model_path: "/path/to/ltx-2-model.safetensors"  # Local checkpoint, or null for full component_paths
   text_encoder_path: "/path/to/gemma-model"       # Path to Gemma text encoder directory
   training_mode: "lora"                           # "lora" or "full"
   load_checkpoint: null                           # Path to checkpoint to resume from
+  component_paths: { }                            # Optional split Comfy-style component paths
 ```
 
 **Key parameters:**
 
 | Parameter           | Description                                                                                                                                                    |
 |---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `model_path`        | **Required.** Local path to the LTX-2 model checkpoint (`.safetensors` file). URLs are not supported.                                                          |
+| `model_path`        | Local path to the LTX-2 model checkpoint (`.safetensors` file). Required unless the required split component paths are provided. URLs are not supported.       |
 | `text_encoder_path` | **Required.** Path to the Gemma text encoder model directory. Download from [HuggingFace](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized/). |
 | `training_mode`     | Training approach - `"lora"` for LoRA training or `"full"` for full-rank fine-tuning.                                                                          |
 | `load_checkpoint`   | Optional path to resume training from a checkpoint file or directory.                                                                                          |
+| `component_paths`   | Optional per-component checkpoint overrides for Comfy-style layouts. Unset fields fall back to `model_path` or `text_encoder_path`.                            |
 
 > [!NOTE]
-> LTX-2 requires both a model checkpoint and a Gemma text encoder. Both must be local paths.
+> LTX-2 requires local paths for the model weights/components and a Gemma text encoder.
+
+#### Split Component Paths
+
+Use `component_paths` when the base model is stored as separate Comfy files:
+
+```yaml
+model:
+  model_path: null
+  text_encoder_path: "/path/to/gemma"
+  component_paths:
+    transformer: "/path/to/diffusion_model.safetensors"
+    embeddings_processor: "/path/to/text_embedding_projection.safetensors"
+    video_vae: "/path/to/video_vae.safetensors"
+    audio_vae: "/path/to/audio_vae.safetensors"
+    vocoder: "/path/to/vocoder.safetensors"
+    text_encoder: "/path/to/gemma"
+```
 
 ### LoraConfig
 
@@ -69,6 +90,9 @@ lora:
     - "to_q"
     - "to_v"
     - "to_out.0"
+  noise_experts: null
+  nsync:
+    enabled: false
 ```
 
 **Key parameters:**
@@ -79,6 +103,39 @@ lora:
 | `alpha`          | Alpha scaling factor - typically set equal to rank                              |
 | `dropout`        | Dropout probability for regularization                                          |
 | `target_modules` | List of transformer modules to apply LoRA adapters to (see below)               |
+| `noise_experts`  | Optional mapping of adapter names to sigma ranges. Each expert is saved as a separate LoRA. |
+| `nsync`          | Optional NSYNC synthetic-negative training settings.                            |
+
+#### Noise-Level Experts
+
+Noise experts split LoRA training across sigma ranges while keeping one base transformer in memory:
+
+```yaml
+lora:
+  noise_experts:
+    low_noise: [0.0, 0.5]
+    high_noise: [0.5, 1.0]
+```
+
+The trainer activates one PEFT adapter per micro-batch, samples timesteps inside that expert's sigma range, and saves
+one Comfy-compatible LoRA per expert, for example `lora_weights_low_noise_step_02000.safetensors` and
+`lora_weights_high_noise_step_02000.safetensors`.
+
+#### NSYNC
+
+NSYNC trains with paired positive and synthetic negative latents. The trainer computes positive and negative gradients
+separately, then projects the positive gradient away from the negative gradient before the optimizer step. Projection is
+layer-wise by default, grouped by transformer block.
+
+```yaml
+lora:
+  nsync:
+    enabled: true
+    negative_latents_dir: "negative_latents"
+    projection_scope: "layer"
+```
+
+NSYNC currently supports `training_mode: "lora"` with the `text_to_video` strategy.
 
 #### Understanding Target Modules
 
@@ -159,6 +216,7 @@ training_strategy:
   name: "text_to_video"
   first_frame_conditioning_p: 0.1     # Probability of first-frame conditioning
   with_audio: false                   # Enable joint audio-video training
+  mixed_audio: false                  # Allow individual samples without usable audio
   audio_latents_dir: "audio_latents"  # Directory for audio latents (when with_audio: true)
 ```
 
@@ -178,6 +236,7 @@ training_strategy:
 | `name`                       | Strategy type: `"text_to_video"` or `"video_to_video"`           |
 | `first_frame_conditioning_p` | Probability of using first frame as conditioning (0.0-1.0)       |
 | `with_audio`                 | (text_to_video only) Enable joint audio-video training           |
+| `mixed_audio`                | (text_to_video only) Keep samples without usable audio and train them video-only |
 | `audio_latents_dir`          | (text_to_video only) Directory name for audio latents            |
 | `reference_latents_dir`      | (video_to_video only) Directory name for reference video latents |
 

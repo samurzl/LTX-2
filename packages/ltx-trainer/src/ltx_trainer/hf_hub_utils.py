@@ -118,7 +118,7 @@ def _create_model_card(
     """Generate and save a model card for the trained model."""
 
     repo_id = config.hub.hub_model_id
-    pretrained_model_name_or_path = config.model.model_path
+    pretrained_model_name_or_path = config.model.model_path or config.model.component_paths.transformer
     validation_prompts = config.validation.prompts
     output_dir = Path(output_dir)
     template_path = Path(__file__).parent.parent.parent / "templates" / "model_card.md"
@@ -130,12 +130,12 @@ def _create_model_card(
     model_name = repo_id.split("/")[-1]
 
     # Get base model information
-    base_model_link = str(pretrained_model_name_or_path)
-    model_path_str = str(pretrained_model_name_or_path)
+    base_model_link = str(pretrained_model_name_or_path or "split-component model")
+    model_path_str = str(pretrained_model_name_or_path or "split-component-model")
     is_url = model_path_str.startswith(("http://", "https://"))
 
     # For URLs, extract the filename from the URL. For local paths, use the filename stem
-    base_model_name = model_path_str.split("/")[-1] if is_url else Path(pretrained_model_name_or_path).name
+    base_model_name = model_path_str.split("/")[-1] if is_url else Path(model_path_str).name
 
     # Format validation prompts and create grid layout
     prompts_text = ""

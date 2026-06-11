@@ -11,6 +11,8 @@ class ConfigFingerprint(BaseModel):
     scheduler_type: str
     training_mode: str
     lora_rank: int | None = None
+    lora_noise_experts: dict[str, tuple[float, float]] | None = None
+    nsync_enabled: bool = False
 
 
 class RngStates(BaseModel):

@@ -1,10 +1,12 @@
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 from einops import rearrange
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
+from torch.utils.data._utils.collate import default_collate
 
 from ltx_trainer import logger
 
@@ -85,7 +87,12 @@ class DummyDataset(Dataset):
 
 
 class PrecomputedDataset(Dataset):
-    def __init__(self, data_root: str, data_sources: dict[str, str] | list[str] | None = None) -> None:
+    def __init__(
+        self,
+        data_root: str,
+        data_sources: dict[str, str] | list[str] | None = None,
+        optional_data_sources: set[str] | None = None,
+    ) -> None:
         """
         Generic dataset for loading precomputed data from multiple sources.
         Args:
@@ -94,6 +101,8 @@ class PrecomputedDataset(Dataset):
               - Dict mapping directory names to output keys
               - List of directory names (keys will equal values)
               - None (defaults to ["latents", "conditions"])
+            optional_data_sources: Directory names from ``data_sources`` that may be
+              absent for individual samples. Missing optional files are returned as None.
         Example:
             # Standard mode (list)
             dataset = PrecomputedDataset("data/", ["latents", "conditions"])
@@ -109,6 +118,7 @@ class PrecomputedDataset(Dataset):
 
         self.data_root = self._setup_data_root(data_root)
         self.data_sources = self._normalize_data_sources(data_sources)
+        self.optional_data_sources = optional_data_sources or set()
         self.source_paths = self._setup_source_paths()
         self.sample_files = self._discover_samples()
         self._validate_setup()
@@ -149,8 +159,8 @@ class PrecomputedDataset(Dataset):
             source_path = self.data_root / dir_name
             source_paths[dir_name] = source_path
 
-            # Check that all sources exist.
-            if not source_path.exists():
+            # Check that all required sources exist. Optional sources may be absent.
+            if not source_path.exists() and dir_name not in self.optional_data_sources:
                 raise FileNotFoundError(f"Required {dir_name} directory does not exist: {source_path}")
 
         return source_paths
@@ -171,6 +181,8 @@ class PrecomputedDataset(Dataset):
         # Pass 1: Glob all sources in parallel, build full-path sets
         def _glob_source(dir_name: str) -> tuple[list[Path], set[str]]:
             source_path = self.source_paths[dir_name]
+            if not source_path.exists():
+                return [], set()
             paths = list(source_path.glob("**/*.pt"))
             path_set = {str(p) for p in paths}
             return paths, path_set
@@ -200,7 +212,7 @@ class PrecomputedDataset(Dataset):
         }
 
         # Pass 2: For each primary file, check if expected paths exist in other sources' sets
-        sample_files: dict[str, list[Path]] = {output_key: [] for output_key in self.data_sources.values()}
+        sample_files: dict[str, list[Path | None]] = {output_key: [] for output_key in self.data_sources.values()}
         valid_count = 0
 
         for data_file in data_files:
@@ -211,6 +223,8 @@ class PrecomputedDataset(Dataset):
             for dir_name, path_set in other_path_sets.items():
                 expected = self._get_expected_file_path(dir_name, data_file, rel_path)
                 if str(expected) not in path_set:
+                    if dir_name in self.optional_data_sources:
+                        continue
                     logger.debug(f"Skipping {data_file.name}: no matching {dir_name} file at {expected}")
                     all_exist = False
                     break
@@ -237,11 +251,19 @@ class PrecomputedDataset(Dataset):
 
         return source_path / rel_path
 
-    def _fill_sample_data_files(self, data_file: Path, rel_path: Path, sample_files: dict[str, list[Path]]) -> None:
+    def _fill_sample_data_files(
+        self,
+        data_file: Path,
+        rel_path: Path,
+        sample_files: dict[str, list[Path | None]],
+    ) -> None:
         """Add a valid sample to the sample_files tracking."""
         for dir_name, output_key in self.data_sources.items():
             expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
-            sample_files[output_key].append(expected_path.relative_to(self.source_paths[dir_name]))
+            if dir_name in self.optional_data_sources and not expected_path.exists():
+                sample_files[output_key].append(None)
+            else:
+                sample_files[output_key].append(expected_path.relative_to(self.source_paths[dir_name]))
 
     def _validate_setup(self) -> None:
         """Validate that the dataset setup is correct."""
@@ -267,6 +289,9 @@ class PrecomputedDataset(Dataset):
         for dir_name, output_key in self.data_sources.items():
             source_path = self.source_paths[dir_name]
             file_rel_path = self.sample_files[output_key][index]
+            if file_rel_path is None:
+                result[output_key] = None
+                continue
             file_path = source_path / file_rel_path
 
             try:
@@ -283,6 +308,10 @@ class PrecomputedDataset(Dataset):
         # Add index for debugging
         result["idx"] = index
         return result
+
+    def has_source(self, output_key: str, index: int) -> bool:
+        """Return whether an optional/required output key is present for a sample."""
+        return self.sample_files[output_key][index] is not None
 
     @staticmethod
     def _normalize_video_latents(data: dict) -> dict:
@@ -313,3 +342,75 @@ class PrecomputedDataset(Dataset):
             data["latents"] = latents
 
         return data
+
+
+def collate_precomputed_samples(samples: list[dict]) -> dict:
+    """Collate precomputed samples while allowing homogeneous None values."""
+    result = {}
+    for key in samples[0]:
+        values = [sample[key] for sample in samples]
+        any_missing = any(value is None for value in values)
+        if any_missing:
+            if not all(value is None for value in values):
+                raise ValueError(
+                    f"Batch mixes samples with and without '{key}'. Enable grouped batching or use batch_size=1."
+                )
+            result[key] = None
+        else:
+            result[key] = default_collate(values)
+    return result
+
+
+class OptionalSourceGroupedBatchSampler(Sampler[list[int]]):
+    """Batch sampler that keeps samples grouped by optional source availability."""
+
+    def __init__(
+        self,
+        dataset: PrecomputedDataset,
+        output_key: str,
+        batch_size: int,
+        drop_last: bool = True,
+        shuffle: bool = True,
+    ) -> None:
+        self.dataset = dataset
+        self.output_key = output_key
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+
+    def __iter__(self) -> Iterator[list[int]]:
+        present = [idx for idx in range(len(self.dataset)) if self.dataset.has_source(self.output_key, idx)]
+        missing = [idx for idx in range(len(self.dataset)) if not self.dataset.has_source(self.output_key, idx)]
+
+        if self.shuffle:
+            present = _shuffle_indices(present)
+            missing = _shuffle_indices(missing)
+
+        batches = [*self._make_batches(present), *self._make_batches(missing)]
+        if self.shuffle:
+            order = torch.randperm(len(batches)).tolist()
+            batches = [batches[i] for i in order]
+
+        yield from batches
+
+    def __len__(self) -> int:
+        present_count = sum(1 for idx in range(len(self.dataset)) if self.dataset.has_source(self.output_key, idx))
+        missing_count = len(self.dataset) - present_count
+        if self.drop_last:
+            return present_count // self.batch_size + missing_count // self.batch_size
+        return (present_count + self.batch_size - 1) // self.batch_size + (
+            missing_count + self.batch_size - 1
+        ) // self.batch_size
+
+    def _make_batches(self, indices: list[int]) -> list[list[int]]:
+        batches = [indices[i : i + self.batch_size] for i in range(0, len(indices), self.batch_size)]
+        if self.drop_last:
+            batches = [batch for batch in batches if len(batch) == self.batch_size]
+        return batches
+
+
+def _shuffle_indices(indices: list[int]) -> list[int]:
+    if not indices:
+        return indices
+    order = torch.randperm(len(indices)).tolist()
+    return [indices[i] for i in order]

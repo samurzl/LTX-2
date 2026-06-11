@@ -109,6 +109,38 @@ uv run python scripts/process_dataset.py dataset.json \
     --with-audio
 ```
 
+If your dataset mixes clips with real audio and clips that are silent or have no usable audio, add `--mixed-audio`.
+The preprocessor checks waveform activity, not only whether an audio stream exists. Silent tracks are skipped and the
+video sample remains available for video-only loss during training.
+
+```bash
+uv run python scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model \
+    --with-audio \
+    --mixed-audio \
+    --audio-min-rms-db -60 \
+    --audio-min-active-ratio 0.01
+```
+
+### With NSYNC Synthetic Negatives
+
+For NSYNC training, the trainer expects a generated negative video latent for each positive caption. The full
+preprocessing script can generate those videos with the base model, then encode them into `negative_latents/`:
+
+```bash
+uv run python scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model \
+    --generate-negatives \
+    --negative-latents-dir negative_latents
+```
+
+Generated negative videos are written under `.precomputed/negative_videos/` by default. Their latents are paired with
+the positive samples by relative path and reuse the same caption embeddings during training.
+
 ### 🚀 Multi-GPU Preprocessing
 
 Preprocessing large datasets can take a while. To run it across multiple GPUs in parallel, wrap the command with

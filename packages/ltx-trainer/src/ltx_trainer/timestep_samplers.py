@@ -28,6 +28,27 @@ class TimestepSampler:
         raise NotImplementedError
 
 
+class RangeScaledTimestepSampler(TimestepSampler):
+    """Scale another sampler's [0, 1] outputs into a fixed sigma range."""
+
+    def __init__(self, base_sampler: TimestepSampler, min_value: float, max_value: float) -> None:
+        if not 0.0 <= min_value < max_value <= 1.0:
+            raise ValueError(f"Expected 0.0 <= min_value < max_value <= 1.0, got {min_value=} {max_value=}")
+        self.base_sampler = base_sampler
+        self.min_value = min_value
+        self.max_value = max_value
+
+    def sample(self, batch_size: int, seq_length: int | None = None, device: torch.device = None) -> torch.Tensor:
+        samples = self.base_sampler.sample(batch_size=batch_size, seq_length=seq_length, device=device)
+        return self._scale(samples)
+
+    def sample_for(self, batch: torch.Tensor) -> torch.Tensor:
+        return self._scale(self.base_sampler.sample_for(batch))
+
+    def _scale(self, samples: torch.Tensor) -> torch.Tensor:
+        return samples * (self.max_value - self.min_value) + self.min_value
+
+
 class UniformTimestepSampler(TimestepSampler):
     """Samples timesteps uniformly between min_value and max_value (default 0 and 1)."""
 

@@ -92,6 +92,9 @@ class MediaDataset(Dataset):
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
         with_audio: bool = False,
+        audio_min_rms_db: float = -60.0,
+        audio_min_active_ratio: float = 0.01,
+        audio_activity_window_ms: float = 100.0,
     ) -> None:
         """
         Initialize the media dataset.
@@ -101,6 +104,9 @@ class MediaDataset(Dataset):
             resolution_buckets: List of (frames, height, width) tuples
             reshape_mode: How to crop videos ("center", "random")
             with_audio: Whether to extract audio from video files
+            audio_min_rms_db: Minimum RMS level, in dBFS, for a track to count as usable audio
+            audio_min_active_ratio: Minimum ratio of active analysis windows above the RMS threshold
+            audio_activity_window_ms: Audio activity analysis window size in milliseconds
         """
         super().__init__()
 
@@ -109,6 +115,9 @@ class MediaDataset(Dataset):
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
         self.with_audio = with_audio
+        self.audio_min_rms_db = audio_min_rms_db
+        self.audio_min_active_ratio = audio_min_active_ratio
+        self.audio_activity_window_ms = audio_activity_window_ms
 
         # First load main media paths
         self.main_media_paths = self._load_video_paths(main_media_column)
@@ -158,7 +167,13 @@ class MediaDataset(Dataset):
                 # This ensures audio is trimmed to match the exact video duration
                 # media_tensor is [C, F, H, W] so shape[1] is num_frames
                 target_duration = media_tensor.shape[1] / fps
-                audio_data = self._extract_audio(video_path, target_duration)
+                audio_data = self._extract_audio(
+                    video_path,
+                    target_duration,
+                    min_rms_db=self.audio_min_rms_db,
+                    min_active_ratio=self.audio_min_active_ratio,
+                    activity_window_ms=self.audio_activity_window_ms,
+                )
             else:
                 audio_data = None
 
@@ -184,7 +199,13 @@ class MediaDataset(Dataset):
         return result
 
     @staticmethod
-    def _extract_audio(video_path: Path, target_duration: float) -> dict[str, torch.Tensor | int] | None:
+    def _extract_audio(
+        video_path: Path,
+        target_duration: float,
+        min_rms_db: float,
+        min_active_ratio: float,
+        activity_window_ms: float,
+    ) -> dict[str, torch.Tensor | int] | None:
         """Extract audio track from a video file, trimmed to match video duration."""
         try:
             # torchaudio can extract audio from video files directly
@@ -203,6 +224,16 @@ class MediaDataset(Dataset):
                 padding = target_samples - current_samples
                 waveform = torch.nn.functional.pad(waveform, (0, padding))
                 logger.warning(f"Padded audio to {target_duration:.2f} seconds for {video_path}")
+
+            if not _audio_has_activity(
+                waveform,
+                sample_rate,
+                min_rms_db=min_rms_db,
+                min_active_ratio=min_active_ratio,
+                activity_window_ms=activity_window_ms,
+            ):
+                logger.debug(f"Skipping silent audio track in {video_path}")
+                return None
 
             return {"waveform": waveform, "sample_rate": sample_rate}
 
@@ -447,6 +478,10 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
+    audio_min_rms_db: float = -60.0,
+    audio_min_active_ratio: float = 0.01,
+    audio_activity_window_ms: float = 100.0,
+    allow_missing_audio: bool = False,
     overwrite: bool = False,
 ) -> None:
     """
@@ -468,6 +503,10 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae_tiling: Whether to enable VAE tiling
         with_audio: Whether to extract and encode audio from videos
         audio_output_dir: Directory to save audio latents (required if with_audio=True)
+        audio_min_rms_db: Minimum RMS level, in dBFS, for a track to count as usable audio
+        audio_min_active_ratio: Minimum ratio of active analysis windows above the RMS threshold
+        audio_activity_window_ms: Audio activity analysis window size in milliseconds
+        allow_missing_audio: Treat missing/silent audio as complete once video latents exist
         overwrite: Re-process every item even if its output exists. Use when rerunning with
             changed parameters (different model, resolution, etc.) so stale outputs are replaced.
     """
@@ -484,6 +523,9 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         resolution_buckets=resolution_buckets,
         reshape_mode=reshape_mode,
         with_audio=with_audio,
+        audio_min_rms_db=audio_min_rms_db,
+        audio_min_active_ratio=audio_min_active_ratio,
+        audio_activity_window_ms=audio_activity_window_ms,
     )
     logger.info(f"Loaded {len(dataset)} valid media files")
 
@@ -505,6 +547,8 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         rel = dataset.main_media_paths[idx].relative_to(data_root).with_suffix(".pt")
         if not (output_path / rel).is_file():
             return False
+        if allow_missing_audio:
+            return True
         return audio_output_path is None or (audio_output_path / rel).is_file()
 
     dataloader = _build_sharded_dataloader(
@@ -889,6 +933,38 @@ def encode_audio(
     }
 
 
+def _audio_has_activity(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    min_rms_db: float,
+    min_active_ratio: float,
+    activity_window_ms: float,
+) -> bool:
+    """Return whether a waveform contains enough non-silent audio."""
+    if waveform.numel() == 0:
+        return False
+
+    audio = waveform.float()
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+
+    rms = torch.sqrt(torch.mean(audio.square()).clamp_min(1e-12))
+    rms_db = 20.0 * torch.log10(rms).item()
+    if rms_db < min_rms_db:
+        return False
+
+    window_size = max(1, int(sample_rate * activity_window_ms / 1000.0))
+    if audio.shape[-1] < window_size:
+        return True
+
+    usable_samples = audio.shape[-1] // window_size * window_size
+    windows = audio[..., :usable_samples].reshape(audio.shape[0], -1, window_size)
+    window_rms = torch.sqrt(torch.mean(windows.square(), dim=(0, 2)).clamp_min(1e-12))
+    window_db = 20.0 * torch.log10(window_rms)
+    active_ratio = (window_db >= min_rms_db).float().mean().item()
+    return active_ratio >= min_active_ratio
+
+
 def parse_resolution_buckets(resolution_buckets_str: str) -> list[tuple[int, int, int]]:
     """Parse resolution buckets from string format to list of tuples (frames, height, width)"""
     resolution_buckets = []
@@ -1034,6 +1110,22 @@ def main(  # noqa: PLR0913
         default=None,
         help="Output directory for audio latents (required if --with-audio is set)",
     ),
+    audio_min_rms_db: float = typer.Option(
+        default=-60.0,
+        help="Minimum RMS level in dBFS for an audio track to count as non-silent",
+    ),
+    audio_min_active_ratio: float = typer.Option(
+        default=0.01,
+        help="Minimum ratio of audio windows above --audio-min-rms-db required to save audio latents",
+    ),
+    audio_activity_window_ms: float = typer.Option(
+        default=100.0,
+        help="Audio activity analysis window size in milliseconds",
+    ),
+    allow_missing_audio: bool = typer.Option(
+        default=False,
+        help="When processing audio, allow missing/silent audio and skip completed video latents on rerun",
+    ),
     overwrite: bool = typer.Option(
         default=False,
         help="Re-encode every item even if its output exists. Use when rerunning with "
@@ -1092,6 +1184,10 @@ def main(  # noqa: PLR0913
         vae_tiling=vae_tiling,
         with_audio=with_audio,
         audio_output_dir=audio_output_dir,
+        audio_min_rms_db=audio_min_rms_db,
+        audio_min_active_ratio=audio_min_active_ratio,
+        audio_activity_window_ms=audio_activity_window_ms,
+        allow_missing_audio=allow_missing_audio,
         overwrite=overwrite,
     )
 

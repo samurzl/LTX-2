@@ -7,7 +7,7 @@ import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import torch
 import wandb
@@ -30,13 +30,13 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 from torch.utils.data import DataLoader
-from torchvision.transforms import functional as F  # noqa: N812
+from torchvision.transforms import functional as F
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
-from ltx_trainer.datasets import PrecomputedDataset
+from ltx_trainer.datasets import OptionalSourceGroupedBatchSampler, PrecomputedDataset, collate_precomputed_samples
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
@@ -44,7 +44,7 @@ from ltx_trainer.model_loader import load_model as load_ltx_model
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
-from ltx_trainer.timestep_samplers import SAMPLERS
+from ltx_trainer.timestep_samplers import SAMPLERS, RangeScaledTimestepSampler, TimestepSampler
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
@@ -90,6 +90,16 @@ class TrainingStepOutput:
     sigma: Tensor  # [B,] sampled sigma, detached from computational graph
 
 
+@dataclass(frozen=True)
+class NoiseExpert:
+    """A named LoRA adapter and the sigma interval it trains on."""
+
+    name: str
+    min_sigma: float
+    max_sigma: float
+    sampler: TimestepSampler
+
+
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
@@ -110,6 +120,8 @@ class LtxvTrainer:
         self._training_state_size_warned = False
         self._wandb_run = None
         self._sigma_tracker = SigmaBucketTracker()
+        self._noise_experts: list[NoiseExpert] = []
+        self._active_noise_expert: NoiseExpert | None = None
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -149,6 +161,7 @@ class LtxvTrainer:
         self._init_dataloader()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
+        self._init_noise_experts()
 
         # Synchronize all processes after initialization
         self._accelerator.wait_for_everyone()
@@ -208,8 +221,14 @@ class LtxvTrainer:
                     if is_optimization_step:
                         self._global_step += 1
 
-                    output = self._training_step(batch)
-                    self._accelerator.backward(output.loss.mean())
+                    expert = self._select_noise_expert(step)
+                    self._set_active_lora_adapter(expert.name)
+
+                    if self._nsync_enabled:
+                        output = self._nsync_training_step(batch, expert.sampler)
+                    else:
+                        output = self._training_step(batch, expert.sampler)
+                        self._accelerator.backward(output.loss.mean())
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
@@ -342,32 +361,44 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
+    @property
+    def _nsync_enabled(self) -> bool:
+        return self._config.lora is not None and self._config.lora.nsync.enabled
+
+    def _training_step(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+        timestep_sampler: TimestepSampler | None = None,
+    ) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
+        timestep_sampler = timestep_sampler or self._timestep_sampler
+
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
 
-        if "video_prompt_embeds" in conditions:
-            # New format: separate video/audio features from precompute()
-            video_features = conditions["video_prompt_embeds"]
-            audio_features = conditions.get("audio_prompt_embeds")
-        else:
-            # Legacy format: single prompt_embeds tensor — duplicate for both modalities
-            video_features = conditions["prompt_embeds"]
-            audio_features = conditions["prompt_embeds"]
+        if not conditions.get("_embeddings_processed", False):
+            if "video_prompt_embeds" in conditions:
+                # New format: separate video/audio features from precompute()
+                video_features = conditions["video_prompt_embeds"]
+                audio_features = conditions.get("audio_prompt_embeds")
+            else:
+                # Legacy format: single prompt_embeds tensor — duplicate for both modalities
+                video_features = conditions["prompt_embeds"]
+                audio_features = conditions["prompt_embeds"]
 
-        mask = conditions["prompt_attention_mask"]
-        additive_mask = convert_to_additive_mask(mask, video_features.dtype)
-        video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
-            video_features, audio_features, additive_mask
-        )
+            mask = conditions["prompt_attention_mask"]
+            additive_mask = convert_to_additive_mask(mask, video_features.dtype)
+            video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+                video_features, audio_features, additive_mask
+            )
 
-        conditions["video_prompt_embeds"] = video_embeds
-        conditions["audio_prompt_embeds"] = audio_embeds
-        conditions["prompt_attention_mask"] = attention_mask
+            conditions["video_prompt_embeds"] = video_embeds
+            conditions["audio_prompt_embeds"] = audio_embeds
+            conditions["prompt_attention_mask"] = attention_mask
+            conditions["_embeddings_processed"] = True
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
-        model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
+        model_inputs = self._training_strategy.prepare_training_inputs(batch, timestep_sampler)
 
         # Run transformer forward pass with Modality-based interface
         video_pred, audio_pred = self._transformer(
@@ -381,6 +412,122 @@ class LtxvTrainer:
         sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
 
         return TrainingStepOutput(loss=loss, sigma=sigma)
+
+    def _nsync_training_step(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+        timestep_sampler: TimestepSampler,
+    ) -> TrainingStepOutput:
+        """Run NSYNC positive/negative gradient projection for one micro-batch."""
+        if batch.get("negative_latents") is None:
+            raise ValueError("NSYNC is enabled, but the batch does not contain negative_latents")
+
+        accumulated_grads = self._clone_current_grads()
+
+        self._clear_trainable_grads()
+        negative_batch = dict(batch)
+        negative_batch["latents"] = batch["negative_latents"]
+        negative_batch["_force_video_only"] = True
+        negative_output = self._training_step(negative_batch, timestep_sampler)
+        self._accelerator.backward(negative_output.loss.mean())
+        negative_grads = self._clone_current_grads()
+
+        self._clear_trainable_grads()
+        positive_output = self._training_step(batch, timestep_sampler)
+        self._accelerator.backward(positive_output.loss.mean())
+        self._apply_nsync_projection(negative_grads)
+        self._add_grads(accumulated_grads)
+
+        return positive_output
+
+    def _clone_current_grads(self) -> dict[torch.nn.Parameter, Tensor]:
+        """Clone current trainable gradients, preserving only parameters with gradients."""
+        return {param: param.grad.detach().clone() for param in self._trainable_params if param.grad is not None}
+
+    def _clear_trainable_grads(self) -> None:
+        """Clear gradients for trainable parameters only."""
+        for param in self._trainable_params:
+            param.grad = None
+
+    def _add_grads(self, grads: dict[torch.nn.Parameter, Tensor]) -> None:
+        """Add previously accumulated gradients back after NSYNC projection."""
+        for param, grad in grads.items():
+            if param.grad is None:
+                param.grad = grad
+            else:
+                param.grad.add_(grad.to(device=param.grad.device, dtype=param.grad.dtype))
+
+    def _apply_nsync_projection(self, negative_grads: dict[torch.nn.Parameter, Tensor]) -> None:
+        """Project positive gradients away from negative gradients per configured group."""
+        eps = self._config.lora.nsync.eps
+
+        for params in self._gradient_projection_groups.values():
+            dot = None
+            denom = None
+            for param in params:
+                if param.grad is None or param not in negative_grads:
+                    continue
+                pos_grad = param.grad.detach().float()
+                neg_grad = negative_grads[param].to(device=param.grad.device).float()
+                group_dot = torch.sum(pos_grad * neg_grad)
+                group_denom = torch.sum(neg_grad * neg_grad)
+                dot = group_dot if dot is None else dot + group_dot
+                denom = group_denom if denom is None else denom + group_denom
+
+            if dot is None or denom is None or denom.item() <= 0.0:
+                continue
+
+            scale = dot / (denom + eps)
+            for param in params:
+                if param.grad is None or param not in negative_grads:
+                    continue
+                neg_grad = negative_grads[param].to(device=param.grad.device, dtype=param.grad.dtype)
+                param.grad.sub_(scale.to(device=param.grad.device, dtype=param.grad.dtype) * neg_grad)
+
+    @property
+    def _text_encoder_path(self) -> str | Path:
+        """Resolve Gemma root with component-path override support."""
+        path = self._config.model.component_paths.text_encoder or self._config.model.text_encoder_path
+        if path is None:
+            raise ValueError("text_encoder_path or model.component_paths.text_encoder must be provided")
+        return path
+
+    def _component_path(self, name: str) -> str | Path:
+        """Resolve a component checkpoint path, falling back to the base model path."""
+        path = getattr(self._config.model.component_paths, name)
+        if path is not None:
+            return path
+        if self._config.model.model_path is not None:
+            return self._config.model.model_path
+        raise ValueError(f"model.component_paths.{name} or model.model_path must be provided")
+
+    def _video_vae_component_path(self, direction: Literal["encoder", "decoder"]) -> str | Path:
+        """Resolve video VAE encoder/decoder checkpoint paths."""
+        paths = self._config.model.component_paths
+        specific = paths.video_vae_encoder if direction == "encoder" else paths.video_vae_decoder
+        path = specific or paths.video_vae
+        if path is not None:
+            return path
+        if self._config.model.model_path is not None:
+            return self._config.model.model_path
+        raise ValueError(
+            f"model.component_paths.video_vae_{direction}, model.component_paths.video_vae, "
+            "or model.model_path must be provided"
+        )
+
+    def _audio_vae_component_path(self, direction: Literal["encoder", "decoder"]) -> str | Path:
+        """Resolve audio VAE encoder/decoder checkpoint paths."""
+        paths = self._config.model.component_paths
+        specific = paths.audio_vae_encoder if direction == "encoder" else paths.audio_vae_decoder
+        path = specific or paths.audio_vae
+        if path is not None:
+            return path
+        if self._config.model.model_path is not None:
+            return self._config.model.model_path
+        raise ValueError(
+            f"model.component_paths.audio_vae_{direction}, model.component_paths.audio_vae, "
+            "or model.model_path must be provided"
+        )
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -398,7 +545,7 @@ class LtxvTrainer:
 
         logger.debug("Loading text encoder...")
         text_encoder = load_text_encoder(
-            gemma_model_path=self._config.model.text_encoder_path,
+            gemma_model_path=self._text_encoder_path,
             device=init_device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
@@ -407,7 +554,7 @@ class LtxvTrainer:
         # Load embeddings processor (feature extractor + connectors)
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
-            checkpoint_path=self._config.model.model_path,
+            checkpoint_path=self._component_path("embeddings_processor"),
             device=init_device,
             dtype=torch.bfloat16,
         )
@@ -465,6 +612,11 @@ class LtxvTrainer:
             with_audio_vae_decoder=load_audio,
             with_vocoder=load_audio,
             with_text_encoder=False,  # Text encoder handled separately
+            transformer_path=self._component_path("transformer"),
+            video_vae_encoder_path=self._video_vae_component_path("encoder"),
+            video_vae_decoder_path=self._video_vae_component_path("decoder"),
+            audio_vae_decoder_path=self._audio_vae_component_path("decoder"),
+            vocoder_path=self._component_path("vocoder"),
         )
 
         # Extract components
@@ -517,6 +669,10 @@ class LtxvTrainer:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        self._trainable_param_names = {
+            param: name for name, param in self._transformer.named_parameters() if param.requires_grad
+        }
+        self._gradient_projection_groups = self._build_gradient_projection_groups()
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
     def _init_timestep_sampler(self) -> None:
@@ -524,9 +680,37 @@ class LtxvTrainer:
         sampler_cls = SAMPLERS[self._config.flow_matching.timestep_sampling_mode]
         self._timestep_sampler = sampler_cls(**self._config.flow_matching.timestep_sampling_params)
 
+    def _init_noise_experts(self) -> None:
+        """Initialize sigma-range samplers for LoRA experts."""
+        experts = self._configured_noise_expert_ranges()
+        self._noise_experts = [
+            NoiseExpert(
+                name=name,
+                min_sigma=min_sigma,
+                max_sigma=max_sigma,
+                sampler=RangeScaledTimestepSampler(self._timestep_sampler, min_sigma, max_sigma),
+            )
+            for name, (min_sigma, max_sigma) in experts.items()
+        ]
+        self._active_noise_expert = self._noise_experts[0]
+
+    def _configured_noise_expert_ranges(self) -> dict[str, tuple[float, float]]:
+        """Return configured LoRA expert ranges, including the default single expert."""
+        if self._config.model.training_mode != "lora" or self._config.lora is None:
+            return {"default": (0.0, 1.0)}
+        return self._config.lora.noise_experts or {"default": (0.0, 1.0)}
+
+    def _select_noise_expert(self, step: int) -> NoiseExpert:
+        """Select the expert for this micro-batch."""
+        if not self._noise_experts:
+            self._init_noise_experts()
+        expert = self._noise_experts[step % len(self._noise_experts)]
+        self._active_noise_expert = expert
+        return expert
+
     def _setup_lora(self) -> None:
         """Configure LoRA adapters for the transformer. Only called in LoRA training mode."""
-        logger.debug(f"Adding LoRA adapter with rank {self._config.lora.rank}")
+        logger.debug(f"Adding LoRA adapter(s) with rank {self._config.lora.rank}")
         lora_config = LoraConfig(
             r=self._config.lora.rank,
             lora_alpha=self._config.lora.alpha,
@@ -534,9 +718,47 @@ class LtxvTrainer:
             lora_dropout=self._config.lora.dropout,
             init_lora_weights=True,
         )
+        expert_names = list(self._configured_noise_expert_ranges())
         # Wrap the transformer with PEFT to add LoRA layers
         # noinspection PyTypeChecker
-        self._transformer = get_peft_model(self._transformer, lora_config)
+        self._transformer = get_peft_model(self._transformer, lora_config, adapter_name=expert_names[0])
+        for adapter_name in expert_names[1:]:
+            self._transformer.add_adapter(adapter_name, lora_config)
+        self._lora_adapter_names = expert_names
+        self._set_active_lora_adapter(expert_names[0])
+
+        # Ensure every adapter is included in the optimizer even if PEFT toggles
+        # inactive adapter parameters when switching active adapters.
+        for name, param in self._transformer.named_parameters():
+            if ".lora_" in name:
+                param.requires_grad_(True)
+
+    def _set_active_lora_adapter(self, adapter_name: str) -> None:
+        """Activate a named LoRA adapter when training LoRA experts."""
+        if self._config.model.training_mode != "lora" or not hasattr(self, "_transformer"):
+            return
+        if hasattr(self._transformer, "set_adapter"):
+            self._transformer.set_adapter(adapter_name)
+            for name, param in self._transformer.named_parameters():
+                if ".lora_" in name:
+                    param.requires_grad_(True)
+
+    def _build_gradient_projection_groups(self) -> dict[str, list[torch.nn.Parameter]]:
+        """Build NSYNC gradient projection groups from trainable parameter names."""
+        groups: dict[str, list[torch.nn.Parameter]] = {}
+        projection_scope = self._config.lora.nsync.projection_scope if self._config.lora is not None else "layer"
+        for param, name in self._trainable_param_names.items():
+            group_name = name if projection_scope == "parameter" else self._layer_projection_group_name(name)
+            groups.setdefault(group_name, []).append(param)
+        return groups
+
+    @staticmethod
+    def _layer_projection_group_name(param_name: str) -> str:
+        """Map a parameter name to its transformer-block projection group."""
+        match = re.search(r"transformer_blocks\.(\d+)", param_name)
+        if match:
+            return f"transformer_blocks.{match.group(1)}"
+        return param_name.rsplit(".", 2)[0]
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config, then resolve resume state."""
@@ -569,6 +791,25 @@ class LtxvTrainer:
 
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
+        if len(getattr(self, "_lora_adapter_names", ["default"])) > 1:
+            step_match = re.search(r"step_(\d+)", checkpoint_path.name)
+            step_suffix = step_match.group(1) if step_match else None
+            for adapter_name in self._lora_adapter_names:
+                adapter_checkpoint = checkpoint_path
+                if step_suffix is not None:
+                    candidate = checkpoint_path.parent / f"lora_weights_{adapter_name}_step_{step_suffix}.safetensors"
+                    if candidate.exists():
+                        adapter_checkpoint = candidate
+                    else:
+                        logger.warning(f"⚠️ Missing LoRA expert checkpoint for '{adapter_name}': {candidate}")
+                        continue
+                self._load_lora_adapter_checkpoint(adapter_checkpoint, adapter_name)
+            return
+
+        self._load_lora_adapter_checkpoint(checkpoint_path, self._lora_adapter_names[0])
+
+    def _load_lora_adapter_checkpoint(self, checkpoint_path: Path, adapter_name: str) -> None:
+        """Load a single LoRA adapter checkpoint."""
         state_dict = load_file(checkpoint_path)
 
         # Adjust layer names to match internal format.
@@ -577,9 +818,9 @@ class LtxvTrainer:
 
         # Load LoRA weights and verify all weights were loaded
         base_model = self._transformer.get_base_model()
-        set_peft_model_state_dict(base_model, state_dict)
+        set_peft_model_state_dict(base_model, state_dict, adapter_name=adapter_name)
 
-        logger.info("✅ LoRA checkpoint loaded successfully")
+        logger.info(f"✅ LoRA checkpoint loaded successfully for adapter '{adapter_name}'")
 
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
         """Determine resume state by looking for a training state file next to the loaded checkpoint.
@@ -609,6 +850,12 @@ class LtxvTrainer:
             and fp.lora_rank != cfg.lora.rank
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
+        if cfg.model.training_mode == "lora" and cfg.lora is not None:
+            current_experts = cfg.lora.noise_experts
+            if fp.lora_noise_experts != current_experts:
+                mismatches.append(f"lora_noise_experts: {fp.lora_noise_experts} → {current_experts}")
+            if fp.nsync_enabled != cfg.lora.nsync.enabled:
+                mismatches.append(f"nsync_enabled: {fp.nsync_enabled} → {cfg.lora.nsync.enabled}")
         if mismatches:
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
@@ -741,22 +988,54 @@ class LtxvTrainer:
         if self._dataset is None:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
+            optional_data_sources = set(self._training_strategy.get_optional_data_sources())
 
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
+            if self._nsync_enabled:
+                if isinstance(data_sources, list):
+                    data_sources = {source: source for source in data_sources}
+                data_sources[self._config.lora.nsync.negative_latents_dir] = "negative_latents"
+
+            self._dataset = PrecomputedDataset(
+                self._config.data.preprocessed_data_root,
+                data_sources=data_sources,
+                optional_data_sources=optional_data_sources,
+            )
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         num_workers = self._config.data.num_dataloader_workers
-        dataloader = DataLoader(
-            self._dataset,
-            batch_size=self._config.optimization.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=num_workers,
-            pin_memory=num_workers > 0,
-            persistent_workers=num_workers > 0,
-        )
+        if self._is_mixed_audio_training:
+            batch_sampler = OptionalSourceGroupedBatchSampler(
+                self._dataset,
+                output_key="audio_latents",
+                batch_size=self._config.optimization.batch_size,
+                drop_last=True,
+                shuffle=True,
+            )
+            dataloader = DataLoader(
+                self._dataset,
+                batch_sampler=batch_sampler,
+                num_workers=num_workers,
+                pin_memory=num_workers > 0,
+                persistent_workers=num_workers > 0,
+                collate_fn=collate_precomputed_samples,
+            )
+        else:
+            dataloader = DataLoader(
+                self._dataset,
+                batch_size=self._config.optimization.batch_size,
+                shuffle=True,
+                drop_last=True,
+                num_workers=num_workers,
+                pin_memory=num_workers > 0,
+                persistent_workers=num_workers > 0,
+                collate_fn=collate_precomputed_samples,
+            )
 
         self._dataloader = self._accelerator.prepare(dataloader)
+
+    @property
+    def _is_mixed_audio_training(self) -> bool:
+        return bool(getattr(self._config.training_strategy, "mixed_audio", False))
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
@@ -1119,23 +1398,21 @@ class LtxvTrainer:
         # For LoRA: extract only adapter weights; for full: use as-is
         if is_lora:
             unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
-            # For FSDP, pass full_state_dict since model params aren't directly accessible
-            state_dict = get_peft_model_state_dict(unwrapped, state_dict=full_state_dict if is_fsdp else None)
+            saved_paths = []
+            for adapter_name in self._lora_adapter_names:
+                adapter_path = self._lora_checkpoint_path(save_dir, adapter_name)
+                state_dict = self._get_lora_state_dict_for_save(
+                    unwrapped=unwrapped,
+                    full_state_dict=full_state_dict,
+                    is_fsdp=is_fsdp,
+                    adapter_name=adapter_name,
+                    save_dtype=save_dtype,
+                )
+                metadata = self._build_checkpoint_metadata(adapter_name=adapter_name)
+                save_file(state_dict, adapter_path, metadata=metadata)
+                saved_paths.append(adapter_path)
 
-            # Remove "base_model.model." prefix added by PEFT
-            state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
-
-            # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
-            state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
-
-            # Cast to configured precision
-            state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
-
-            # Build metadata for safetensors file
-            metadata = self._build_checkpoint_metadata()
-
-            # Save to disk with metadata
-            save_file(state_dict, saved_weights_path, metadata=metadata)
+            saved_weights_path = saved_paths[0]
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
@@ -1153,15 +1430,58 @@ class LtxvTrainer:
 
         return saved_weights_path
 
+    def _lora_checkpoint_path(self, save_dir: Path, adapter_name: str) -> Path:
+        """Return the checkpoint path for a LoRA adapter."""
+        if len(self._lora_adapter_names) == 1 and adapter_name == "default":
+            return save_dir / f"lora_weights_step_{self._global_step:05d}.safetensors"
+        return save_dir / f"lora_weights_{adapter_name}_step_{self._global_step:05d}.safetensors"
+
+    @staticmethod
+    def _get_lora_state_dict_for_save(
+        unwrapped: torch.nn.Module,
+        full_state_dict: dict[str, Tensor],
+        is_fsdp: bool,
+        adapter_name: str,
+        save_dtype: torch.dtype,
+    ) -> dict[str, Tensor]:
+        """Extract and convert one LoRA adapter state dict for checkpoint saving."""
+        state_dict = get_peft_model_state_dict(
+            unwrapped,
+            state_dict=full_state_dict if is_fsdp else None,
+            adapter_name=adapter_name,
+        )
+
+        # Remove "base_model.model." prefix added by PEFT
+        state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
+
+        # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
+        state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
+
+        return {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
+
     def _cleanup_checkpoints(self) -> None:
         """Clean up old checkpoints."""
         if 0 < self._config.checkpoints.keep_last_n < len(self._checkpoint_paths):
             checkpoints_to_remove = self._checkpoint_paths[: -self._config.checkpoints.keep_last_n]
             for old_checkpoint in checkpoints_to_remove:
-                if old_checkpoint.exists():
-                    old_checkpoint.unlink()
-                    logger.info(f"Removed old checkpoint: {old_checkpoint}")
+                for path in self._checkpoint_family_paths(old_checkpoint):
+                    if path.exists():
+                        path.unlink()
+                        logger.info(f"Removed old checkpoint: {path}")
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
+
+    def _checkpoint_family_paths(self, checkpoint_path: Path) -> list[Path]:
+        """Return all sibling expert checkpoint paths for a saved step."""
+        if len(getattr(self, "_lora_adapter_names", [])) <= 1:
+            return [checkpoint_path]
+        match = re.search(r"step_(\d+)", checkpoint_path.name)
+        if not match:
+            return [checkpoint_path]
+        step_suffix = match.group(1)
+        return [
+            checkpoint_path.parent / f"lora_weights_{adapter_name}_step_{step_suffix}.safetensors"
+            for adapter_name in self._lora_adapter_names
+        ]
 
     def _save_training_state(self, save_dir: Path) -> None:
         """Save training state alongside checkpoint for resume.
@@ -1196,6 +1516,8 @@ class LtxvTrainer:
                 scheduler_type=self._config.optimization.scheduler_type,
                 training_mode=self._config.model.training_mode,
                 lora_rank=self._config.lora.rank if self._config.lora is not None else None,
+                lora_noise_experts=self._config.lora.noise_experts if self._config.lora is not None else None,
+                nsync_enabled=self._config.lora.nsync.enabled if self._config.lora is not None else False,
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
@@ -1243,7 +1565,7 @@ class LtxvTrainer:
                     logger.debug(f"Removed old training state: {old_state}")
             self._training_state_paths = self._training_state_paths[-keep_n:]
 
-    def _build_checkpoint_metadata(self) -> dict[str, str]:
+    def _build_checkpoint_metadata(self, adapter_name: str | None = None) -> dict[str, str]:
         """Build metadata dictionary for safetensors checkpoint.
         Delegates to the training strategy to get strategy-specific metadata
         that downstream inference pipelines may need.
@@ -1252,6 +1574,16 @@ class LtxvTrainer:
             Values are converted to strings for safetensors compatibility.
         """
         raw_metadata = self._training_strategy.get_checkpoint_metadata()
+        if adapter_name is not None:
+            raw_metadata["lora_adapter_name"] = adapter_name
+            expert_ranges = self._configured_noise_expert_ranges()
+            if adapter_name in expert_ranges:
+                min_sigma, max_sigma = expert_ranges[adapter_name]
+                raw_metadata["noise_expert_min_sigma"] = min_sigma
+                raw_metadata["noise_expert_max_sigma"] = max_sigma
+        if self._nsync_enabled:
+            raw_metadata["nsync_enabled"] = True
+            raw_metadata["nsync_projection_scope"] = self._config.lora.nsync.projection_scope
         # Convert all values to strings for safetensors compatibility
         metadata = {k: str(v) for k, v in raw_metadata.items()}
         if metadata:
