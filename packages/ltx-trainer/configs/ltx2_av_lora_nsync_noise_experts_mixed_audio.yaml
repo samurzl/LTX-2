@@ -19,6 +19,7 @@
 #   --audio-min-rms-db -60 \
 #   --audio-min-active-ratio 0.01 \
 #   --generate-negatives \
+#   --negative-distilled-lora /path/to/ltx-2-distilled-lora.safetensors \
 #   --negative-latents-dir negative_latents
 #
 # =============================================================================

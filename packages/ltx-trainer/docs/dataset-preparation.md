@@ -127,7 +127,8 @@ uv run python scripts/process_dataset.py dataset.json \
 ### With NSYNC Synthetic Negatives
 
 For NSYNC training, the trainer expects a generated negative video latent for each positive caption. The full
-preprocessing script can generate those videos with the base model, then encode them into `negative_latents/`:
+preprocessing script can generate those videos with one-stage distilled-LoRA sampling, then encode them into
+`negative_latents/`:
 
 ```bash
 uv run python scripts/process_dataset.py dataset.json \
@@ -135,6 +136,7 @@ uv run python scripts/process_dataset.py dataset.json \
     --model-path /path/to/ltx-2-model.safetensors \
     --text-encoder-path /path/to/gemma-model \
     --generate-negatives \
+    --negative-distilled-lora /path/to/ltx-2-distilled-lora.safetensors \
     --negative-latents-dir negative_latents
 ```
 

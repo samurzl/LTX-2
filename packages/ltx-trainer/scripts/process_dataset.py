@@ -58,8 +58,10 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
     negative_videos_dir: str | None = None,
     negative_latents_dir: str = "negative_latents",
     negative_prompt: str = "",
-    negative_inference_steps: int = 30,
-    negative_guidance_scale: float = 4.0,
+    negative_distilled_lora: str | None = None,
+    negative_distilled_lora_strength: float = 1.0,
+    negative_inference_steps: int = 8,
+    negative_guidance_scale: float = 1.0,
     negative_seed: int = 42,
     load_text_encoder_in_8bit: bool = False,
     overwrite: bool = False,
@@ -119,7 +121,7 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
         )
 
         if generate_negatives:
-            logger.info("Generating synthetic negative videos with the base model...")
+            logger.info("Generating synthetic negative videos with one-stage distilled-LoRA sampling...")
             negative_videos_base = Path(negative_videos_dir) if negative_videos_dir else output_base / "negative_videos"
             negative_dataset = generate_negative_videos(
                 dataset_file=dataset_file,
@@ -131,6 +133,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                 resolution_buckets=resolution_buckets,
                 device=device,
                 negative_prompt=negative_prompt,
+                distilled_lora=negative_distilled_lora,
+                distilled_lora_strength=negative_distilled_lora_strength,
                 num_inference_steps=negative_inference_steps,
                 guidance_scale=negative_guidance_scale,
                 seed=negative_seed,
@@ -246,17 +250,24 @@ def generate_negative_videos(  # noqa: PLR0913
     resolution_buckets: list[tuple[int, int, int]],
     device: str,
     negative_prompt: str,
+    distilled_lora: str | None,
+    distilled_lora_strength: float,
     num_inference_steps: int,
     guidance_scale: float,
     seed: int,
     overwrite: bool,
 ) -> str:
-    """Generate one synthetic negative video per caption using ltx-pipelines."""
+    """Generate one synthetic negative video per caption using one-stage ltx-pipelines sampling."""
     import torch  # noqa: PLC0415
 
     from ltx_core.components.guiders import MultiModalGuiderParams  # noqa: PLC0415
+    from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps  # noqa: PLC0415
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline  # noqa: PLC0415
+    from ltx_pipelines.utils.constants import DISTILLED_SIGMAS  # noqa: PLC0415
     from ltx_pipelines.utils.media_io import encode_video  # noqa: PLC0415
+
+    if distilled_lora is None:
+        raise ValueError("distilled_lora is required for synthetic negative generation")
 
     if len(resolution_buckets) > 1:
         logger.warning(
@@ -266,6 +277,9 @@ def generate_negative_videos(  # noqa: PLR0913
 
     frames, height, width = resolution_buckets[0]
     output_dir.mkdir(parents=True, exist_ok=True)
+    distilled_lora_path = Path(distilled_lora).expanduser().resolve()
+    if not distilled_lora_path.is_file():
+        raise FileNotFoundError(f"Distilled LoRA not found: {distilled_lora_path}")
 
     captions = CaptionsDataset(
         dataset_file=dataset_file,
@@ -278,9 +292,24 @@ def generate_negative_videos(  # noqa: PLR0913
     pipeline = TI2VidOneStagePipeline(
         checkpoint_path=model_path,
         gemma_root=text_encoder_path,
-        loras=[],
+        loras=[
+            LoraPathStrengthAndSDOps(
+                str(distilled_lora_path),
+                distilled_lora_strength,
+                LTXV_LORA_COMFY_RENAMING_MAP,
+            )
+        ],
         device=torch.device(device),
     )
+    sigmas = None
+    if num_inference_steps == len(DISTILLED_SIGMAS) - 1:
+        sigmas = DISTILLED_SIGMAS
+    else:
+        logger.warning(
+            "Using %s custom negative inference steps with the generic scheduler instead of the default "
+            "distilled sigma schedule.",
+            num_inference_steps,
+        )
 
     metadata = []
     for idx in range(len(captions)):
@@ -305,6 +334,7 @@ def generate_negative_videos(  # noqa: PLR0913
             video_guider_params=MultiModalGuiderParams(cfg_scale=guidance_scale),
             audio_guider_params=MultiModalGuiderParams(cfg_scale=guidance_scale),
             images=[],
+            sigmas=sigmas,
         )
         encode_video(
             video=video,
@@ -402,7 +432,7 @@ def main(  # noqa: PLR0913
     ),
     generate_negatives: bool = typer.Option(
         default=False,
-        help="Generate one base-model synthetic negative video per caption and encode it for NSYNC",
+        help="Generate one synthetic negative video per caption with one-stage distilled-LoRA sampling for NSYNC",
     ),
     negative_videos_dir: str | None = typer.Option(
         default=None,
@@ -416,12 +446,20 @@ def main(  # noqa: PLR0913
         default="",
         help="Negative prompt used while generating synthetic negative videos",
     ),
+    negative_distilled_lora: str | None = typer.Option(
+        default=None,
+        help="Distilled LoRA path used for fast one-stage synthetic negative generation",
+    ),
+    negative_distilled_lora_strength: float = typer.Option(
+        default=1.0,
+        help="Strength for --negative-distilled-lora",
+    ),
     negative_inference_steps: int = typer.Option(
-        default=30,
+        default=8,
         help="Number of inference steps for synthetic negative video generation",
     ),
     negative_guidance_scale: float = typer.Option(
-        default=4.0,
+        default=1.0,
         help="CFG scale for synthetic negative video generation",
     ),
     negative_seed: int = typer.Option(
@@ -485,6 +523,10 @@ def main(  # noqa: PLR0913
         logger.warning("--reference-downscale-factor specified but no --reference-column provided. Ignoring.")
     if mixed_audio and not with_audio:
         raise typer.BadParameter("--mixed-audio requires --with-audio")
+    if generate_negatives and negative_distilled_lora is None:
+        raise typer.BadParameter("--negative-distilled-lora is required when --generate-negatives is set")
+    if negative_inference_steps < 1:
+        raise typer.BadParameter("--negative-inference-steps must be >= 1")
 
     preprocess_dataset(
         dataset_file=dataset_path,
@@ -511,6 +553,8 @@ def main(  # noqa: PLR0913
         negative_videos_dir=negative_videos_dir,
         negative_latents_dir=negative_latents_dir,
         negative_prompt=negative_prompt,
+        negative_distilled_lora=negative_distilled_lora,
+        negative_distilled_lora_strength=negative_distilled_lora_strength,
         negative_inference_steps=negative_inference_steps,
         negative_guidance_scale=negative_guidance_scale,
         negative_seed=negative_seed,

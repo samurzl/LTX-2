@@ -109,6 +109,12 @@ Set one of these to use Gemini Flash without passing `--api-key`:
 
 The `scripts/process_dataset.py` script processes videos and caches latents for training.
 
+To inspect a dataset and get a copy-pasteable bucket string first:
+
+```bash
+uv run python scripts/suggest_resolution_buckets.py dataset.json --details
+```
+
 ```bash
 # Basic preprocessing
 uv run python scripts/process_dataset.py dataset.json \
