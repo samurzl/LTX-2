@@ -54,7 +54,7 @@ def _repeat_state(state: LatentState, n: int) -> LatentState:
     )
 
 
-def _guided_denoise(  # noqa: PLR0913,PLR0915
+def _guided_denoise(  # noqa: PLR0912,PLR0913,PLR0915
     transformer: X0Model,
     video_state: LatentState | None,
     audio_state: LatentState | None,
@@ -186,8 +186,13 @@ def _guided_denoise(  # noqa: PLR0913,PLR0915
     ptb_v, ptb_a = r.get("ptb", (0.0, 0.0))
     mod_v, mod_a = r.get("mod", (0.0, 0.0))
 
-    denoised_video = last_denoised_video if v_skip else video_guider.calculate(cond_v, uncond_v, ptb_v, mod_v)
-    denoised_audio = last_denoised_audio if a_skip else audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a)
+    denoised_video = None
+    if video_state is not None:
+        denoised_video = last_denoised_video if v_skip else video_guider.calculate(cond_v, uncond_v, ptb_v, mod_v)
+
+    denoised_audio = None
+    if audio_state is not None:
+        denoised_audio = last_denoised_audio if a_skip else audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a)
     return (
         DenoisedLatentResult.result_or_none(
             denoised=denoised_video, uncond=uncond_v, cond=cond_v, ptb=ptb_v, mod=mod_v
@@ -273,8 +278,8 @@ class GuidedDenoiser:
             step_index=step_index,
             force_uncond_pass=self.force_uncond_pass,
         )
-        self._last_denoised_video = guided_denoise_result_v.denoised
-        self._last_denoised_audio = guided_denoise_result_a.denoised
+        self._last_denoised_video = guided_denoise_result_v.denoised if guided_denoise_result_v is not None else None
+        self._last_denoised_audio = guided_denoise_result_a.denoised if guided_denoise_result_a is not None else None
         return guided_denoise_result_v, guided_denoise_result_a
 
 
@@ -333,6 +338,6 @@ class FactoryGuidedDenoiser:
             step_index=step_index,
             force_uncond_pass=self.force_uncond_pass,
         )
-        self._last_denoised_video = guided_denoise_result_v.denoised
-        self._last_denoised_audio = guided_denoise_result_a.denoised
+        self._last_denoised_video = guided_denoise_result_v.denoised if guided_denoise_result_v is not None else None
+        self._last_denoised_audio = guided_denoise_result_a.denoised if guided_denoise_result_a is not None else None
         return guided_denoise_result_v, guided_denoise_result_a

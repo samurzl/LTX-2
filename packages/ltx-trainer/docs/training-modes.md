@@ -212,7 +212,7 @@ Use the `--reference-downscale-factor` option when running `process_dataset.py`:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets 768x768x25 \
     --model-path /path/to/ltx2.safetensors \
-    --text-encoder-path /path/to/gemma \
+    --text-encoder-path /path/to/gemma.safetensors \
     --reference-column "reference_path" \
     --reference-downscale-factor 2
 ```

@@ -70,7 +70,7 @@ class ModelComponentPaths(ConfigBaseModel):
 
     text_encoder: str | Path | None = Field(
         default=None,
-        description="Optional Gemma text encoder root directory",
+        description="Optional Gemma text encoder .safetensors file or model directory",
     )
 
 
@@ -87,7 +87,10 @@ class ModelConfig(ConfigBaseModel):
 
     text_encoder_path: str | Path | None = Field(
         default=None,
-        description="Path to text encoder (required for LTX-2/Gemma models, optional for LTXV/T5 models)",
+        description=(
+            "Path to a single Gemma text encoder .safetensors file or model directory "
+            "(required for LTX-2/Gemma models, optional for LTXV/T5 models)"
+        ),
     )
 
     training_mode: Literal["lora", "full"] = Field(

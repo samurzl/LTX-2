@@ -370,7 +370,7 @@ Create an example config in `configs/`:
 
 model:
   model_path: "/path/to/ltx2.safetensors"
-  text_encoder_path: "/path/to/gemma"
+  text_encoder_path: "/path/to/gemma.safetensors"
   training_mode: "lora"
 
 training_strategy:

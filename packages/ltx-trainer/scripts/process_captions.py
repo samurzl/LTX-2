@@ -8,7 +8,7 @@ This module provides functionality for processing text captions, including:
 - CaptionsDataset for caption-only preprocessing workflows
 Can be used as a standalone script:
     python scripts/process_captions.py dataset.json --output-dir /path/to/output \
-        --model-source /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
+        --model-source /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors
 """
 
 import json
@@ -246,7 +246,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
         dataset_file: Path to metadata file (CSV/JSON/JSONL) containing captions and media paths
         output_dir: Directory to save embeddings
         model_path: Path to LTX-2 checkpoint (.safetensors)
-        text_encoder_path: Path to Gemma text encoder directory
+        text_encoder_path: Path to a single Gemma .safetensors file or model directory
         caption_column: Column name containing captions in the metadata file
         media_column: Column name containing media paths (used for output naming)
         lora_trigger: Optional trigger word to prepend to each caption
@@ -401,7 +401,7 @@ def main(  # noqa: PLR0913
     ),
     text_encoder_path: str = typer.Option(
         ...,
-        help="Path to Gemma text encoder directory",
+        help="Path to a single Gemma .safetensors file or model directory",
     ),
     caption_column: str = typer.Option(
         default="caption",
@@ -449,14 +449,14 @@ def main(  # noqa: PLR0913
         # Process captions with LTX-2 model
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
             --model-path /path/to/ltx2_checkpoint.safetensors \\
-            --text-encoder-path /path/to/gemma
+            --text-encoder-path /path/to/gemma.safetensors
         # Add a trigger word for LoRA training
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors \\
             --lora-trigger "mytoken"
         # Remove LLM-generated prefixes from captions
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors \\
             --remove-llm-prefixes
     """
 

@@ -8,7 +8,7 @@ Before you begin, ensure you have:
 
 1. **LTX-2 Model Checkpoint** - A local `.safetensors` file containing the LTX-2 model weights.
    Download `ltx-2-19b-dev.safetensors` from: [HuggingFace Hub](https://huggingface.co/Lightricks/LTX-2)
-2. **Gemma Text Encoder** - A local directory containing the Gemma model (required for LTX-2).
+2. **Gemma Text Encoder** - A local Gemma `.safetensors` file or model directory (required for LTX-2).
    Download from: [HuggingFace Hub](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized/)
 3. **Linux with CUDA** - The trainer requires `triton` which is Linux-only
 4. **GPU with sufficient VRAM** - 80GB recommended for the standard config. For GPUs with 32GB VRAM (e.g., RTX 5090),
@@ -54,7 +54,7 @@ uv run python scripts/caption_videos.py scenes_output_dir/ --output dataset.json
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 ```
 
 See [Dataset Preparation](dataset-preparation.md) for detailed instructions.
@@ -72,7 +72,7 @@ Key settings to update:
 ```yaml
 model:
   model_path: "/path/to/ltx-2-model.safetensors"
-  text_encoder_path: "/path/to/gemma-model"
+  text_encoder_path: "/path/to/gemma.safetensors"
 
 data:
   preprocessed_data_root: "/path/to/preprocessed/data"

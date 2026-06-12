@@ -57,13 +57,13 @@ Reduce spatial or temporal dimensions to save memory:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "512x512x49" \
     --model-path /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma
+    --text-encoder-path /path/to/gemma.safetensors
 
 # Fewer frames
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x25" \
     --model-path /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma
+    --text-encoder-path /path/to/gemma.safetensors
 ```
 
 #### 5. Enable Model Quantization
@@ -118,15 +118,17 @@ uv run python scripts/train.py configs/ltx2_av_lora.yaml
 > Always use `uv run` to execute Python scripts. This automatically uses the correct virtual environment
 > without requiring manual activation.
 
-### Issue: "Gemma model path is not a directory" Error
+### Issue: Gemma tokenizer or processor assets cannot be resolved
 
 **Solution:**
-The `text_encoder_path` must point to a directory containing the Gemma model, not a file:
+`text_encoder_path` may point to either a single Gemma `.safetensors` file or a Gemma model directory. The
+`.safetensors` file contains the weights, but tokenization still needs tokenizer assets. The loader first looks next to
+the file or inside the directory, then falls back to the default Gemma tokenizer/processor source.
 
 ```yaml
 model:
   model_path: "/path/to/ltx-2-model.safetensors"  # File path
-  text_encoder_path: "/path/to/gemma-model/"      # Directory path
+  text_encoder_path: "/path/to/gemma.safetensors" # File path
 ```
 
 ### Issue: "Model path does not exist" Error

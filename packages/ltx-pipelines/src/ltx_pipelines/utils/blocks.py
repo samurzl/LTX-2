@@ -72,12 +72,12 @@ from ltx_core.text_encoders.gemma import (
     GEMMA_MODEL_OPS,
     EmbeddingsProcessorConfigurator,
     GemmaTextEncoderConfigurator,
-    module_ops_from_gemma_root,
+    gemma_weight_paths_from_source,
+    module_ops_from_gemma_source,
 )
 from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor, EmbeddingsProcessorOutput
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
-from ltx_core.utils import find_matching_file
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
@@ -476,9 +476,8 @@ class PromptEncoder:
             self._text_encoder_builder = text_encoder_builder
             self._streaming_text_encoder_builder = None
         else:
-            module_ops = module_ops_from_gemma_root(gemma_root)
-            model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
-            weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+            module_ops = module_ops_from_gemma_source(gemma_root)
+            weight_paths = gemma_weight_paths_from_source(gemma_root)
             self._text_encoder_builder = Builder(
                 model_path=tuple(weight_paths),
                 model_class_configurator=GemmaTextEncoderConfigurator,

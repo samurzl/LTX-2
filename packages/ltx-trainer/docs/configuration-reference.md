@@ -40,7 +40,7 @@ Controls the base model and training mode settings.
 ```yaml
 model:
   model_path: "/path/to/ltx-2-model.safetensors"  # Local checkpoint, or null for full component_paths
-  text_encoder_path: "/path/to/gemma-model"       # Path to Gemma text encoder directory
+  text_encoder_path: "/path/to/gemma.safetensors" # Gemma weights file or model directory
   training_mode: "lora"                           # "lora" or "full"
   load_checkpoint: null                           # Path to checkpoint to resume from
   component_paths: { }                            # Optional split Comfy-style component paths
@@ -51,7 +51,7 @@ model:
 | Parameter           | Description                                                                                                                                                    |
 |---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `model_path`        | Local path to the LTX-2 model checkpoint (`.safetensors` file). Required unless the required split component paths are provided. URLs are not supported.       |
-| `text_encoder_path` | **Required.** Path to the Gemma text encoder model directory. Download from [HuggingFace](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized/). |
+| `text_encoder_path` | **Required.** Path to a single Gemma text encoder `.safetensors` file or a Gemma model directory. |
 | `training_mode`     | Training approach - `"lora"` for LoRA training or `"full"` for full-rank fine-tuning.                                                                          |
 | `load_checkpoint`   | Optional path to resume training from a checkpoint file or directory.                                                                                          |
 | `component_paths`   | Optional per-component checkpoint overrides for Comfy-style layouts. Unset fields fall back to `model_path` or `text_encoder_path`.                            |
@@ -66,14 +66,14 @@ Use `component_paths` when the base model is stored as separate Comfy files:
 ```yaml
 model:
   model_path: null
-  text_encoder_path: "/path/to/gemma"
+  text_encoder_path: "/path/to/gemma.safetensors"
   component_paths:
     transformer: "/path/to/diffusion_model.safetensors"
     embeddings_processor: "/path/to/text_embedding_projection.safetensors"
     video_vae: "/path/to/video_vae.safetensors"
     audio_vae: "/path/to/audio_vae.safetensors"
     vocoder: "/path/to/vocoder.safetensors"
-    text_encoder: "/path/to/gemma"
+    text_encoder: "/path/to/gemma.safetensors"
 ```
 
 ### LoraConfig

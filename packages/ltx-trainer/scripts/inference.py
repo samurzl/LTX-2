@@ -143,7 +143,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         "--text-encoder-path",
         type=str,
         required=True,
-        help="Path to Gemma text encoder directory",
+        help="Path to a single Gemma .safetensors file or model directory",
     )
 
     # LoRA arguments

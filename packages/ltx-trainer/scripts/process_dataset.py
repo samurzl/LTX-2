@@ -7,21 +7,28 @@ latent representations of video clips and text embeddings of their captions. The
 data can be used to accelerate training of video generation models and to save GPU memory.
 Basic usage:
     python scripts/process_dataset.py /path/to/dataset.json --resolution-buckets 768x768x49 \
-        --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
+        --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors
 The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
 """
 
-import json
+from __future__ import annotations
+
+import math
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from decode_latents import LatentsDecoder
 from process_captions import CaptionsDataset, compute_captions_embeddings
-from process_videos import compute_latents, compute_scaled_resolution_buckets, parse_resolution_buckets
+from process_videos import _atomic_save, compute_latents, compute_scaled_resolution_buckets, parse_resolution_buckets
 from rich.console import Console
 
+from ltx_core.quantization import QuantizationPolicy
 from ltx_trainer import logger
 from ltx_trainer.gpu_utils import free_gpu_memory_context
+
+if TYPE_CHECKING:
+    import torch
 
 console = Console()
 
@@ -62,6 +69,14 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
     negative_distilled_lora_strength: float = 1.0,
     negative_inference_steps: int = 8,
     negative_guidance_scale: float = 1.0,
+    negative_backend: str = "native",
+    negative_quantization: str = "auto",
+    comfy_server: str = "http://127.0.0.1:8188",
+    comfy_checkpoint_name: str | None = None,
+    comfy_text_encoder_name: str | None = None,
+    comfy_distilled_lora_name: str | None = None,
+    comfy_sampler_name: str = "euler_cfg_pp",
+    comfy_timeout_seconds: float = 1800.0,
     negative_seed: int = 42,
     load_text_encoder_in_8bit: bool = False,
     overwrite: bool = False,
@@ -121,37 +136,59 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
         )
 
         if generate_negatives:
-            logger.info("Generating synthetic negative videos with one-stage distilled-LoRA sampling...")
-            negative_videos_base = Path(negative_videos_dir) if negative_videos_dir else output_base / "negative_videos"
-            negative_dataset = generate_negative_videos(
-                dataset_file=dataset_file,
-                caption_column=caption_column,
-                media_column=video_column,
-                output_dir=negative_videos_base,
-                model_path=model_path,
-                text_encoder_path=text_encoder_path,
-                resolution_buckets=resolution_buckets,
-                device=device,
-                negative_prompt=negative_prompt,
-                distilled_lora=negative_distilled_lora,
-                distilled_lora_strength=negative_distilled_lora_strength,
-                num_inference_steps=negative_inference_steps,
-                guidance_scale=negative_guidance_scale,
-                seed=negative_seed,
-                overwrite=overwrite,
-            )
+            logger.info("Generating synthetic negative latents with one-stage distilled-LoRA sampling...")
+            if negative_videos_dir is not None:
+                logger.warning(
+                    "--negative-videos-dir is ignored by the fast direct-latent negative generator; "
+                    "no intermediate videos are written."
+                )
 
-            compute_latents(
-                dataset_file=negative_dataset,
-                video_column="media_path",
-                resolution_buckets=resolution_buckets,
-                output_dir=str(output_base / negative_latents_dir),
-                model_path=model_path,
-                batch_size=batch_size,
-                device=device,
-                vae_tiling=vae_tiling,
-                overwrite=overwrite,
-            )
+            if negative_backend == "comfy":
+                generate_negative_latents_comfy(
+                    dataset_file=dataset_file,
+                    caption_column=caption_column,
+                    media_column=video_column,
+                    output_dir=output_base / negative_latents_dir,
+                    model_path=model_path,
+                    text_encoder_path=text_encoder_path,
+                    resolution_buckets=resolution_buckets,
+                    negative_prompt=negative_prompt,
+                    distilled_lora=negative_distilled_lora,
+                    distilled_lora_strength=negative_distilled_lora_strength,
+                    num_inference_steps=negative_inference_steps,
+                    guidance_scale=negative_guidance_scale,
+                    seed=negative_seed,
+                    lora_trigger=lora_trigger,
+                    remove_llm_prefixes=remove_llm_prefixes,
+                    comfy_server=comfy_server,
+                    comfy_checkpoint_name=comfy_checkpoint_name,
+                    comfy_text_encoder_name=comfy_text_encoder_name,
+                    comfy_distilled_lora_name=comfy_distilled_lora_name,
+                    comfy_sampler_name=comfy_sampler_name,
+                    comfy_timeout_seconds=comfy_timeout_seconds,
+                    overwrite=overwrite,
+                )
+            else:
+                generate_negative_latents(
+                    dataset_file=dataset_file,
+                    caption_column=caption_column,
+                    media_column=video_column,
+                    conditions_dir=conditions_dir,
+                    output_dir=output_base / negative_latents_dir,
+                    model_path=model_path,
+                    text_encoder_path=text_encoder_path,
+                    resolution_buckets=resolution_buckets,
+                    device=device,
+                    negative_prompt=negative_prompt,
+                    distilled_lora=negative_distilled_lora,
+                    distilled_lora_strength=negative_distilled_lora_strength,
+                    num_inference_steps=negative_inference_steps,
+                    guidance_scale=negative_guidance_scale,
+                    quantization=negative_quantization,
+                    seed=negative_seed,
+                    load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+                    overwrite=overwrite,
+                )
 
         # Process reference videos if reference_column is provided
         if reference_column:
@@ -240,10 +277,11 @@ def _validate_dataset_file(dataset_path: str) -> None:
         raise ValueError(f"Dataset file must be CSV, JSON, or JSONL format: {dataset_file}")
 
 
-def generate_negative_videos(  # noqa: PLR0913
+def generate_negative_latents(  # noqa: PLR0913, PLR0915
     dataset_file: str,
     caption_column: str,
     media_column: str,
+    conditions_dir: Path,
     output_dir: Path,
     model_path: str,
     text_encoder_path: str,
@@ -254,17 +292,20 @@ def generate_negative_videos(  # noqa: PLR0913
     distilled_lora_strength: float,
     num_inference_steps: int,
     guidance_scale: float,
+    quantization: str,
     seed: int,
+    load_text_encoder_in_8bit: bool,
     overwrite: bool,
-) -> str:
-    """Generate one synthetic negative video per caption using one-stage ltx-pipelines sampling."""
+) -> None:
+    """Generate one synthetic negative latent per caption without decoding intermediate videos."""
     import torch  # noqa: PLC0415
+    from accelerate import PartialState  # noqa: PLC0415
 
     from ltx_core.components.guiders import MultiModalGuiderParams  # noqa: PLC0415
     from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps  # noqa: PLC0415
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline  # noqa: PLC0415
     from ltx_pipelines.utils.constants import DISTILLED_SIGMAS  # noqa: PLC0415
-    from ltx_pipelines.utils.media_io import encode_video  # noqa: PLC0415
+    from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder  # noqa: PLC0415
 
     if distilled_lora is None:
         raise ValueError("distilled_lora is required for synthetic negative generation")
@@ -277,6 +318,7 @@ def generate_negative_videos(  # noqa: PLR0913
 
     frames, height, width = resolution_buckets[0]
     output_dir.mkdir(parents=True, exist_ok=True)
+    conditions_dir.mkdir(parents=True, exist_ok=True)
     distilled_lora_path = Path(distilled_lora).expanduser().resolve()
     if not distilled_lora_path.is_file():
         raise FileNotFoundError(f"Distilled LoRA not found: {distilled_lora_path}")
@@ -289,6 +331,27 @@ def generate_negative_videos(  # noqa: PLR0913
         remove_llm_prefixes=False,
     )
 
+    state = PartialState()
+
+    def _output_file_for_item(item: dict) -> Path:
+        return output_dir / Path(item["output_path"])
+
+    todo = [
+        idx
+        for idx in range(state.process_index, len(captions), state.num_processes)
+        if overwrite or not _output_file_for_item(captions[idx]).is_file()
+    ]
+    if not todo:
+        logger.info(f"Rank {state.process_index}/{state.num_processes}: no negative latents to generate")
+        return
+    logger.info(
+        f"Rank {state.process_index}/{state.num_processes}: generating {len(todo):,} "
+        f"of {len(captions):,} negative latents"
+    )
+
+    torch_device = torch.device(device)
+    quantization_policy = _build_negative_quantization_policy(quantization, model_path)
+
     pipeline = TI2VidOneStagePipeline(
         checkpoint_path=model_path,
         gemma_root=text_encoder_path,
@@ -299,7 +362,8 @@ def generate_negative_videos(  # noqa: PLR0913
                 LTXV_LORA_COMFY_RENAMING_MAP,
             )
         ],
-        device=torch.device(device),
+        device=torch_device,
+        quantization=quantization_policy,
     )
     sigmas = None
     if num_inference_steps == len(DISTILLED_SIGMAS) - 1:
@@ -311,45 +375,258 @@ def generate_negative_videos(  # noqa: PLR0913
             num_inference_steps,
         )
 
-    metadata = []
-    for idx in range(len(captions)):
+    embeddings_processor = load_embeddings_processor(model_path, device=torch_device, dtype=torch.bfloat16).eval()
+    negative_video_context = None
+    negative_audio_context = None
+    if not math.isclose(guidance_scale, 1.0):
+        text_encoder = load_text_encoder(
+            text_encoder_path,
+            device=torch_device,
+            dtype=torch.bfloat16,
+            load_in_8bit=load_text_encoder_in_8bit,
+        ).eval()
+        with torch.inference_mode():
+            neg_hidden_states, neg_attention_mask = text_encoder.encode(negative_prompt, padding_side="left")
+            neg_out = embeddings_processor.process_hidden_states(neg_hidden_states, neg_attention_mask, "left")
+            negative_video_context = neg_out.video_encoding
+            negative_audio_context = neg_out.audio_encoding
+        del text_encoder
+
+    embeddings_processor.feature_extractor = None
+
+    with torch.inference_mode(), pipeline.stage.model_context() as transformer:
+        for idx in todo:
+            item = captions[idx]
+            output_file = _output_file_for_item(item)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            condition_file = conditions_dir / Path(item["output_path"])
+            video_context, audio_context = _load_condition_context(
+                condition_file=condition_file,
+                embeddings_processor=embeddings_processor,
+                device=torch_device,
+            )
+
+            video_latent, _, _ = pipeline.generate_latents_from_context(
+                v_context_p=video_context,
+                a_context_p=audio_context,
+                v_context_n=negative_video_context,
+                a_context_n=negative_audio_context,
+                seed=seed + idx,
+                height=height,
+                width=width,
+                num_frames=frames,
+                frame_rate=24.0,
+                num_inference_steps=num_inference_steps,
+                video_guider_params=MultiModalGuiderParams(cfg_scale=guidance_scale),
+                audio_guider_params=MultiModalGuiderParams(cfg_scale=1.0),
+                images=[],
+                sigmas=sigmas,
+                generate_audio=False,
+                transformer=transformer,
+            )
+
+            latent = video_latent.squeeze(0).detach().cpu().contiguous()
+            _atomic_save(
+                {
+                    "latents": latent,
+                    "num_frames": latent.shape[1],
+                    "height": latent.shape[2],
+                    "width": latent.shape[3],
+                    "fps": 24.0,
+                },
+                output_file,
+            )
+
+
+def generate_negative_latents_comfy(  # noqa: PLR0913, PLR0915
+    dataset_file: str,
+    caption_column: str,
+    media_column: str,
+    output_dir: Path,
+    model_path: str,
+    text_encoder_path: str,
+    resolution_buckets: list[tuple[int, int, int]],
+    negative_prompt: str,
+    distilled_lora: str | None,
+    distilled_lora_strength: float,
+    num_inference_steps: int,
+    guidance_scale: float,
+    seed: int,
+    lora_trigger: str | None,
+    remove_llm_prefixes: bool,
+    comfy_server: str,
+    comfy_checkpoint_name: str | None,
+    comfy_text_encoder_name: str | None,
+    comfy_distilled_lora_name: str | None,
+    comfy_sampler_name: str,
+    comfy_timeout_seconds: float,
+    overwrite: bool,
+) -> None:
+    """Generate one synthetic negative latent per caption through a running ComfyUI server."""
+    from accelerate import PartialState  # noqa: PLC0415
+
+    from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES  # noqa: PLC0415
+    from ltx_trainer.comfy_negative_backend import (  # noqa: PLC0415
+        build_ltxv_negative_workflow,
+        comfy_latent_bytes_to_trainer_payload,
+        run_comfy_workflow_and_fetch_latent,
+    )
+
+    if distilled_lora is None:
+        raise ValueError("distilled_lora is required for synthetic negative generation")
+
+    if len(resolution_buckets) > 1:
+        logger.warning(
+            "Comfy negative generation uses the first resolution bucket. "
+            "Use a single bucket when generated negatives must exactly mirror mixed-bucket training data."
+        )
+
+    frames, height, width = resolution_buckets[0]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_name = comfy_checkpoint_name or Path(model_path).name
+    text_encoder_name = comfy_text_encoder_name or Path(text_encoder_path).name
+    lora_name = comfy_distilled_lora_name or Path(distilled_lora).name
+
+    captions = CaptionsDataset(
+        dataset_file=dataset_file,
+        caption_column=caption_column,
+        media_column=media_column,
+        lora_trigger=lora_trigger,
+        remove_llm_prefixes=remove_llm_prefixes,
+    )
+
+    state = PartialState()
+
+    def _output_file_for_item(item: dict) -> Path:
+        return output_dir / Path(item["output_path"])
+
+    todo = [
+        idx
+        for idx in range(state.process_index, len(captions), state.num_processes)
+        if overwrite or not _output_file_for_item(captions[idx]).is_file()
+    ]
+    if not todo:
+        logger.info(f"Rank {state.process_index}/{state.num_processes}: no Comfy negative latents to generate")
+        return
+    logger.info(
+        f"Rank {state.process_index}/{state.num_processes}: generating {len(todo):,} "
+        f"of {len(captions):,} negative latents through ComfyUI at {comfy_server}"
+    )
+    logger.info(
+        "Using ComfyUI model names: checkpoint=%s, text_encoder=%s, distilled_lora=%s",
+        checkpoint_name,
+        text_encoder_name,
+        lora_name,
+    )
+
+    sigmas = DISTILLED_SIGMA_VALUES if num_inference_steps == len(DISTILLED_SIGMA_VALUES) - 1 else None
+    if sigmas is None:
+        logger.warning(
+            "Using %s custom negative inference steps with Comfy's LTXV scheduler instead of the default "
+            "distilled sigma schedule.",
+            num_inference_steps,
+        )
+
+    for idx in todo:
         item = captions[idx]
-        rel_output = Path(item["output_path"]).with_suffix(".mp4")
-        output_path = output_dir / rel_output
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if output_path.exists() and not overwrite:
-            metadata.append({"caption": item["prompt"], "media_path": str(rel_output)})
-            continue
-
-        video, audio = pipeline(
+        output_file = _output_file_for_item(item)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        workflow = build_ltxv_negative_workflow(
+            checkpoint_name=checkpoint_name,
+            text_encoder_name=text_encoder_name,
             prompt=item["prompt"],
             negative_prompt=negative_prompt,
-            seed=seed + idx,
-            height=height,
             width=width,
-            num_frames=frames,
+            height=height,
+            frames=frames,
             frame_rate=24.0,
-            num_inference_steps=num_inference_steps,
-            video_guider_params=MultiModalGuiderParams(cfg_scale=guidance_scale),
-            audio_guider_params=MultiModalGuiderParams(cfg_scale=guidance_scale),
-            images=[],
+            seed=seed + idx,
+            guidance_scale=guidance_scale,
+            distilled_lora_name=lora_name,
+            distilled_lora_strength=distilled_lora_strength,
+            sampler_name=comfy_sampler_name,
+            filename_prefix=f"ltx_trainer_negatives/{state.process_index:03d}_{idx:08d}",
             sigmas=sigmas,
+            num_inference_steps=num_inference_steps,
         )
-        encode_video(
-            video=video,
-            fps=24.0,
-            audio=audio,
-            output_path=str(output_path),
-            video_chunks_number=1,
+        latent_bytes = run_comfy_workflow_and_fetch_latent(
+            workflow,
+            server_url=comfy_server,
+            timeout_seconds=comfy_timeout_seconds,
         )
-        metadata.append({"caption": item["prompt"], "media_path": str(rel_output)})
+        _atomic_save(
+            comfy_latent_bytes_to_trainer_payload(latent_bytes, frame_rate=24.0),
+            output_file,
+        )
 
-    negative_dataset = output_dir / "negative_dataset.json"
-    with open(negative_dataset, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
 
-    return str(negative_dataset)
+def _load_condition_context(
+    condition_file: Path,
+    embeddings_processor: object,
+    device: "torch.device",
+) -> tuple["torch.Tensor", "torch.Tensor | None"]:
+    import torch  # noqa: PLC0415
+
+    from ltx_core.text_encoders.gemma import convert_to_additive_mask  # noqa: PLC0415
+
+    if not condition_file.is_file():
+        raise FileNotFoundError(f"Caption embedding file not found: {condition_file}")
+
+    data = torch.load(condition_file, map_location="cpu")
+    video_features = data["video_prompt_embeds"]
+    if video_features.dim() == 2:
+        video_features = video_features.unsqueeze(0)
+    video_features = video_features.to(device=device, dtype=torch.bfloat16)
+
+    audio_features = data.get("audio_prompt_embeds")
+    if audio_features is not None:
+        if audio_features.dim() == 2:
+            audio_features = audio_features.unsqueeze(0)
+        audio_features = audio_features.to(device=device, dtype=torch.bfloat16)
+    elif getattr(embeddings_processor, "audio_connector", None) is not None:
+        audio_features = video_features
+
+    attention_mask = data["prompt_attention_mask"]
+    if attention_mask.dim() == 1:
+        attention_mask = attention_mask.unsqueeze(0)
+    attention_mask = attention_mask.to(device=device)
+    additive_mask = convert_to_additive_mask(attention_mask, video_features.dtype)
+
+    video_context, audio_context, _ = embeddings_processor.create_embeddings(
+        video_features,
+        audio_features,
+        additive_mask,
+    )
+    return video_context, audio_context
+
+
+def _build_negative_quantization_policy(kind: str, checkpoint_path: str) -> QuantizationPolicy | None:
+    from safetensors import safe_open  # noqa: PLC0415
+
+    from ltx_pipelines.utils.quantization_factory import QuantizationKind  # noqa: PLC0415
+
+    normalized = kind.lower()
+    if normalized == "none":
+        return None
+    if normalized == "auto":
+        normalized = "none"
+        try:
+            with safe_open(checkpoint_path, framework="pt") as f:
+                keys = list(f.keys())
+            if any(key.endswith(".weight_scale") for key in keys):
+                normalized = QuantizationKind.FP8_SCALED_MM.value
+            elif "fp8" in Path(checkpoint_path).name.lower():
+                normalized = QuantizationKind.FP8_CAST.value
+        except Exception as e:
+            logger.warning("Could not inspect checkpoint for automatic negative quantization: %s", e)
+        if normalized == "none":
+            logger.info("Negative generation quantization auto-detect: no fp8 checkpoint markers found")
+            return None
+
+    quantization_kind = QuantizationKind(normalized)
+    logger.info("Using %s quantization for negative generation", quantization_kind.value)
+    return quantization_kind.to_policy(checkpoint_path)
 
 
 @app.command()
@@ -368,7 +645,7 @@ def main(  # noqa: PLR0913
     ),
     text_encoder_path: str = typer.Option(
         ...,
-        help="Path to Gemma text encoder directory",
+        help="Path to a single Gemma .safetensors file or model directory",
     ),
     caption_column: str = typer.Option(
         default="caption",
@@ -432,11 +709,11 @@ def main(  # noqa: PLR0913
     ),
     generate_negatives: bool = typer.Option(
         default=False,
-        help="Generate one synthetic negative video per caption with one-stage distilled-LoRA sampling for NSYNC",
+        help="Generate one synthetic negative latent per caption with one-stage distilled-LoRA sampling for NSYNC",
     ),
     negative_videos_dir: str | None = typer.Option(
         default=None,
-        help="Directory for generated negative videos (defaults to .precomputed/negative_videos)",
+        help="Deprecated: ignored by the fast direct-latent negative generator",
     ),
     negative_latents_dir: str = typer.Option(
         default="negative_latents",
@@ -444,7 +721,7 @@ def main(  # noqa: PLR0913
     ),
     negative_prompt: str = typer.Option(
         default="",
-        help="Negative prompt used while generating synthetic negative videos",
+        help="Negative prompt used only when --negative-guidance-scale is not 1.0",
     ),
     negative_distilled_lora: str | None = typer.Option(
         default=None,
@@ -456,15 +733,50 @@ def main(  # noqa: PLR0913
     ),
     negative_inference_steps: int = typer.Option(
         default=8,
-        help="Number of inference steps for synthetic negative video generation",
+        help="Number of inference steps for synthetic negative latent generation",
     ),
     negative_guidance_scale: float = typer.Option(
         default=1.0,
-        help="CFG scale for synthetic negative video generation",
+        help="CFG scale for synthetic negative generation. Default 1.0 disables CFG for speed",
+    ),
+    negative_backend: str = typer.Option(
+        default="native",
+        help="Backend for synthetic negative generation: native or comfy",
+    ),
+    negative_quantization: str = typer.Option(
+        default="auto",
+        help=(
+            "Quantization for synthetic negative generation: auto, none, fp8-cast, or fp8-scaled-mm. "
+            "Use auto for fp8 checkpoint files. Ignored when --negative-backend comfy."
+        ),
+    ),
+    comfy_server: str = typer.Option(
+        default="http://127.0.0.1:8188",
+        help="ComfyUI server URL used when --negative-backend comfy",
+    ),
+    comfy_checkpoint_name: str | None = typer.Option(
+        default=None,
+        help="ComfyUI checkpoints model name for the LTX checkpoint. Defaults to basename of --model-path.",
+    ),
+    comfy_text_encoder_name: str | None = typer.Option(
+        default=None,
+        help="ComfyUI text_encoders model name for Gemma. Defaults to basename of --text-encoder-path.",
+    ),
+    comfy_distilled_lora_name: str | None = typer.Option(
+        default=None,
+        help="ComfyUI loras model name for the distilled LoRA. Defaults to basename of --negative-distilled-lora.",
+    ),
+    comfy_sampler_name: str = typer.Option(
+        default="euler_cfg_pp",
+        help="ComfyUI sampler name used when --negative-backend comfy",
+    ),
+    comfy_timeout_seconds: float = typer.Option(
+        default=1800.0,
+        help="Seconds to wait for each ComfyUI negative-latent prompt before timing out",
     ),
     negative_seed: int = typer.Option(
         default=42,
-        help="Base random seed for synthetic negative video generation",
+        help="Base random seed for synthetic negative latent generation",
     ),
     load_text_encoder_in_8bit: bool = typer.Option(
         default=False,
@@ -489,22 +801,22 @@ def main(  # noqa: PLR0913
     Examples:
         # Process a dataset with LTX-2 model
         python scripts/process_dataset.py dataset.json --resolution-buckets 768x768x25 \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors
         # Process dataset with custom column names
         python scripts/process_dataset.py dataset.json --resolution-buckets 768x768x25 \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors \\
             --caption-column "text" --video-column "video_path"
         # Process dataset with reference videos for IC-LoRA training
         python scripts/process_dataset.py dataset.json --resolution-buckets 768x768x25 \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors \\
             --reference-column "reference_path"
         # Process dataset with scaled reference videos (half resolution) for efficient IC-LoRA
         python scripts/process_dataset.py dataset.json --resolution-buckets 768x768x25 \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors \\
             --reference-column "reference_path" --reference-downscale-factor 2
         # Process dataset with audio for audio-video training
         python scripts/process_dataset.py dataset.json --resolution-buckets 768x512x97 \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors \\
             --with-audio
     """
     parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets)
@@ -527,6 +839,12 @@ def main(  # noqa: PLR0913
         raise typer.BadParameter("--negative-distilled-lora is required when --generate-negatives is set")
     if negative_inference_steps < 1:
         raise typer.BadParameter("--negative-inference-steps must be >= 1")
+    if negative_backend not in {"native", "comfy"}:
+        raise typer.BadParameter("--negative-backend must be one of: native, comfy")
+    if negative_quantization not in {"auto", "none", "fp8-cast", "fp8-scaled-mm"}:
+        raise typer.BadParameter("--negative-quantization must be one of: auto, none, fp8-cast, fp8-scaled-mm")
+    if comfy_timeout_seconds <= 0:
+        raise typer.BadParameter("--comfy-timeout-seconds must be > 0")
 
     preprocess_dataset(
         dataset_file=dataset_path,
@@ -557,6 +875,14 @@ def main(  # noqa: PLR0913
         negative_distilled_lora_strength=negative_distilled_lora_strength,
         negative_inference_steps=negative_inference_steps,
         negative_guidance_scale=negative_guidance_scale,
+        negative_backend=negative_backend,
+        negative_quantization=negative_quantization,
+        comfy_server=comfy_server,
+        comfy_checkpoint_name=comfy_checkpoint_name,
+        comfy_text_encoder_name=comfy_text_encoder_name,
+        comfy_distilled_lora_name=comfy_distilled_lora_name,
+        comfy_sampler_name=comfy_sampler_name,
+        comfy_timeout_seconds=comfy_timeout_seconds,
         negative_seed=negative_seed,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
         overwrite=overwrite,

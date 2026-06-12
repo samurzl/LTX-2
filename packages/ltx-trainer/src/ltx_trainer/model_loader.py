@@ -8,9 +8,9 @@ Example usage:
     # Load individual components
     vae_encoder = load_video_vae_encoder("/path/to/checkpoint.safetensors", device="cuda")
     vae_decoder = load_video_vae_decoder("/path/to/checkpoint.safetensors", device="cuda")
-    text_encoder = load_text_encoder("/path/to/gemma", device="cuda")
+    text_encoder = load_text_encoder("/path/to/gemma.safetensors", device="cuda")
     # Load all components at once
-    components = load_model("/path/to/checkpoint.safetensors", text_encoder_path="/path/to/gemma")
+    components = load_model("/path/to/checkpoint.safetensors", text_encoder_path="/path/to/gemma.safetensors")
 """
 
 from __future__ import annotations
@@ -195,16 +195,13 @@ def load_text_encoder(
 ) -> "GemmaTextEncoder":
     """Load the Gemma text encoder.
     Args:
-        gemma_model_path: Path to Gemma model directory
+        gemma_model_path: Path to a single Gemma .safetensors file or a Gemma model directory
         device: Device to load model on
         dtype: Data type for model weights
         load_in_8bit: Whether to load the Gemma model in 8-bit precision using bitsandbytes.
     Returns:
         Loaded GemmaTextEncoder
     """
-    if not Path(gemma_model_path).is_dir():
-        raise ValueError(f"Gemma model path is not a directory: {gemma_model_path}")
-
     # Use 8-bit loading path if requested
     if load_in_8bit:
         from ltx_trainer.gemma_8bit import load_8bit_gemma
@@ -217,20 +214,18 @@ def load_text_encoder(
         GEMMA_LLM_KEY_OPS,
         GEMMA_MODEL_OPS,
         GemmaTextEncoderConfigurator,
-        module_ops_from_gemma_root,
+        gemma_weight_paths_from_source,
+        module_ops_from_gemma_source,
     )
-    from ltx_core.utils import find_matching_file
 
     torch_device = _to_torch_device(device)
-
-    gemma_model_folder = find_matching_file(str(gemma_model_path), "model*.safetensors").parent
-    gemma_weight_paths = [str(p) for p in gemma_model_folder.rglob("*.safetensors")]
+    gemma_weight_paths = gemma_weight_paths_from_source(gemma_model_path)
 
     text_encoder = SingleGPUModelBuilder(
         model_path=tuple(gemma_weight_paths),
         model_class_configurator=GemmaTextEncoderConfigurator,
         model_sd_ops=GEMMA_LLM_KEY_OPS,
-        module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
+        module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_source(gemma_model_path, include_processor=False)),
     ).build(device=torch_device, dtype=dtype)
 
     return text_encoder
@@ -311,7 +306,7 @@ def load_model(  # noqa: PLR0913
     Args:
         checkpoint_path: Path to the monolithic safetensors checkpoint file. Optional when all requested component
             paths are supplied separately.
-        text_encoder_path: Path to Gemma model directory (required if with_text_encoder=True)
+        text_encoder_path: Path to a single Gemma .safetensors file or directory (required if with_text_encoder=True)
         device: Device to load models on ("cuda", "cpu", etc.)
         dtype: Data type for model weights
         with_video_vae_encoder: Whether to load the video VAE encoder (for preprocessing)

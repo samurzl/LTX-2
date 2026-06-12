@@ -15,7 +15,13 @@ class LTXVGemmaTokenizer:
     ensuring correct settings and output formatting for downstream consumption.
     """
 
-    def __init__(self, tokenizer_path: str, max_length: int = 256, padding_side: PaddingSide = PaddingSide.LEFT):
+    def __init__(
+        self,
+        tokenizer_path: str,
+        max_length: int = 256,
+        padding_side: PaddingSide = PaddingSide.LEFT,
+        local_files_only: bool = True,
+    ):
         """
         Initialize the tokenizer.
         Args:
@@ -24,7 +30,9 @@ class LTXVGemmaTokenizer:
             padding_side (PaddingSide, optional): Side to pad on. Defaults to ``PaddingSide.LEFT``.
         """
         self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path, local_files_only=True, model_max_length=max_length
+            tokenizer_path,
+            local_files_only=local_files_only,
+            model_max_length=max_length,
         )
         self.tokenizer.padding_side = padding_side.value
         if self.tokenizer.pad_token is None:

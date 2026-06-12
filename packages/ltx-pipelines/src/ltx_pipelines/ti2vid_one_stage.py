@@ -48,7 +48,7 @@ class TI2VidOneStagePipeline:
     Assumes full non distilled model is provided in the checkpoint_path.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         checkpoint_path: str,
         gemma_root: str,
@@ -117,31 +117,114 @@ class TI2VidOneStagePipeline:
         max_batch_size: int = 1,
         sigmas: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
-        assert_resolution(height=height, width=width, is_two_stage=False)
+        video_latent, audio_latent, generator = self.generate_latents(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            video_guider_params=video_guider_params,
+            audio_guider_params=audio_guider_params,
+            images=images,
+            enhance_prompt=enhance_prompt,
+            max_batch_size=max_batch_size,
+            sigmas=sigmas,
+            generate_audio=True,
+        )
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        noiser = GaussianNoiser(generator=generator)
-        dtype = torch.bfloat16
+        if audio_latent is None:
+            raise RuntimeError("Audio latent generation was unexpectedly disabled")
 
+        decoded_video = self.video_decoder(video_latent, tiling_config, generator=generator)
+        decoded_audio = self.audio_decoder(audio_latent)
+        return decoded_video, decoded_audio
+
+    def generate_latents(  # noqa: PLR0913
+        self,
+        prompt: str,
+        negative_prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        num_inference_steps: int,
+        video_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        audio_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        images: list[ImageConditioningInput],
+        enhance_prompt: bool = False,
+        max_batch_size: int = 1,
+        sigmas: torch.Tensor | None = None,
+        generate_audio: bool = True,
+        transformer: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Generator]:
         ctx_p, ctx_n = self.prompt_encoder(
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
         )
-        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
-
-        stage_1_conditionings = self.image_conditioner(
-            lambda enc: combined_image_conditionings(
-                images=images,
-                height=height,
-                width=width,
-                video_encoder=enc,
-                dtype=dtype,
-                device=self.device,
-            )
+        return self.generate_latents_from_context(
+            v_context_p=ctx_p.video_encoding,
+            a_context_p=ctx_p.audio_encoding,
+            v_context_n=ctx_n.video_encoding,
+            a_context_n=ctx_n.audio_encoding,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            video_guider_params=video_guider_params,
+            audio_guider_params=audio_guider_params,
+            images=images,
+            max_batch_size=max_batch_size,
+            sigmas=sigmas,
+            generate_audio=generate_audio,
+            transformer=transformer,
         )
+
+    def generate_latents_from_context(  # noqa: PLR0913
+        self,
+        v_context_p: torch.Tensor,
+        a_context_p: torch.Tensor | None,
+        v_context_n: torch.Tensor | None,
+        a_context_n: torch.Tensor | None,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        num_inference_steps: int,
+        video_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        audio_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        images: list[ImageConditioningInput],
+        max_batch_size: int = 1,
+        sigmas: torch.Tensor | None = None,
+        generate_audio: bool = True,
+        transformer: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Generator]:
+        assert_resolution(height=height, width=width, is_two_stage=False)
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        dtype = torch.bfloat16
+
+        stage_1_conditionings = []
+        if images:
+            stage_1_conditionings = self.image_conditioner(
+                lambda enc: combined_image_conditionings(
+                    images=images,
+                    height=height,
+                    width=width,
+                    video_encoder=enc,
+                    dtype=dtype,
+                    device=self.device,
+                )
+            )
 
         sigmas = (sigmas if sigmas is not None else self._scheduler.execute(steps=num_inference_steps)).to(
             dtype=torch.float32, device=self.device
@@ -156,32 +239,50 @@ class TI2VidOneStagePipeline:
             negative_context=a_context_n,
         )
 
-        video_state, audio_state = self.stage(
-            denoiser=FactoryGuidedDenoiser(
-                v_context=v_context_p,
-                a_context=a_context_p,
-                video_guider_factory=video_guider_factory,
-                audio_guider_factory=audio_guider_factory,
-            ),
-            sigmas=sigmas,
-            noiser=noiser,
-            width=width,
-            height=height,
-            frames=num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(
-                context=v_context_p,
-                conditionings=stage_1_conditionings,
-            ),
-            audio=ModalitySpec(
-                context=a_context_p,
-            ),
-            max_batch_size=max_batch_size,
+        denoiser = FactoryGuidedDenoiser(
+            v_context=v_context_p,
+            a_context=a_context_p if generate_audio else None,
+            video_guider_factory=video_guider_factory,
+            audio_guider_factory=audio_guider_factory,
         )
+        video_spec = ModalitySpec(
+            context=v_context_p,
+            conditionings=stage_1_conditionings,
+        )
+        audio_spec = ModalitySpec(context=a_context_p) if generate_audio and a_context_p is not None else None
 
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator=generator)
-        decoded_audio = self.audio_decoder(audio_state.latent)
-        return decoded_video, decoded_audio
+        if transformer is None:
+            video_state, audio_state = self.stage(
+                denoiser=denoiser,
+                sigmas=sigmas,
+                noiser=noiser,
+                width=width,
+                height=height,
+                frames=num_frames,
+                fps=frame_rate,
+                video=video_spec,
+                audio=audio_spec,
+                max_batch_size=max_batch_size,
+            )
+        else:
+            video_state, audio_state = self.stage.run(
+                transformer=transformer,
+                denoiser=denoiser,
+                sigmas=sigmas,
+                noiser=noiser,
+                width=width,
+                height=height,
+                frames=num_frames,
+                fps=frame_rate,
+                video=video_spec,
+                audio=audio_spec,
+                max_batch_size=max_batch_size,
+            )
+
+        if video_state is None:
+            raise RuntimeError("Video latent generation did not produce a video state")
+
+        return video_state.latent, audio_state.latent if audio_state is not None else None, generator
 
 
 @torch.inference_mode()

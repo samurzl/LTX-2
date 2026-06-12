@@ -8,6 +8,8 @@ from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 from ltx_core.utils import find_matching_file
 
+DEFAULT_GEMMA_ASSET_SOURCE = "google/gemma-3-12b-it"
+
 
 class GemmaTextEncoder(torch.nn.Module):
     """Pure Gemma text encoder — runs the LLM and returns raw hidden states.
@@ -174,16 +176,89 @@ def _pad_inputs_for_attention_alignment(
     return model_inputs
 
 
-def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
-    tokenizer_root = str(find_matching_file(gemma_root, "tokenizer.model").parent)
-    processor_root = str(find_matching_file(gemma_root, "preprocessor_config.json").parent)
+def gemma_weight_paths_from_source(gemma_source: str | Path) -> tuple[str, ...]:
+    """Resolve Gemma weights from either a directory or a single safetensors file."""
+    source_path = Path(gemma_source)
+    if source_path.is_file():
+        if source_path.suffix != ".safetensors":
+            raise ValueError(f"Gemma weight file must be a .safetensors file: {gemma_source}")
+        return (str(source_path),)
+
+    if source_path.is_dir():
+        model_folder = find_matching_file(str(source_path), "model*.safetensors").parent
+        return tuple(str(path) for path in sorted(model_folder.rglob("*.safetensors")))
+
+    raise FileNotFoundError(
+        f"Gemma source must be a directory or a single .safetensors file: {gemma_source}"
+    )
+
+
+def _find_optional_asset_root(gemma_source: str | Path, pattern: str) -> str | None:
+    source_path = Path(gemma_source)
+    if source_path.is_file():
+        source_path = source_path.parent
+    if not source_path.is_dir():
+        return None
+
+    matches = sorted(source_path.rglob(pattern))
+    if not matches:
+        return None
+    return str(matches[0].parent)
+
+
+def _resolve_gemma_asset_source(
+    gemma_source: str | Path,
+    pattern: str,
+    *,
+    allow_default_assets: bool,
+) -> tuple[str, bool]:
+    local_root = _find_optional_asset_root(gemma_source, pattern)
+    if local_root is not None:
+        return local_root, True
+
+    if allow_default_assets:
+        return DEFAULT_GEMMA_ASSET_SOURCE, False
+
+    raise FileNotFoundError(
+        f"No files matching pattern '{pattern}' found under {gemma_source}. "
+        "A single Gemma safetensors file contains weights only; tokenizer/processor "
+        "assets must be next to it, in the Gemma directory, or loadable from the default "
+        f"source '{DEFAULT_GEMMA_ASSET_SOURCE}'."
+    )
+
+
+def module_ops_from_gemma_source(
+    gemma_source: str | Path,
+    *,
+    include_processor: bool = True,
+    allow_default_assets: bool = True,
+) -> tuple[ModuleOps, ...]:
+    tokenizer_source, tokenizer_local_only = _resolve_gemma_asset_source(
+        gemma_source,
+        "tokenizer.model",
+        allow_default_assets=allow_default_assets,
+    )
+    processor_source = None
+    processor_local_only = True
+    if include_processor:
+        processor_source, processor_local_only = _resolve_gemma_asset_source(
+            gemma_source,
+            "preprocessor_config.json",
+            allow_default_assets=allow_default_assets,
+        )
 
     def load_tokenizer(module: GemmaTextEncoder) -> GemmaTextEncoder:
-        module.tokenizer = LTXVGemmaTokenizer(tokenizer_root, 1024)
+        module.tokenizer = LTXVGemmaTokenizer(tokenizer_source, 1024, local_files_only=tokenizer_local_only)
         return module
 
     def load_processor(module: GemmaTextEncoder) -> GemmaTextEncoder:
-        image_processor = AutoImageProcessor.from_pretrained(processor_root, local_files_only=True, use_fast=False)
+        if processor_source is None:
+            raise ValueError("Processor source was not resolved")
+        image_processor = AutoImageProcessor.from_pretrained(
+            processor_source,
+            local_files_only=processor_local_only,
+            use_fast=False,
+        )
         if not module.tokenizer:
             raise ValueError("Tokenizer model operation must be performed before processor model operation")
         module.processor = Gemma3Processor(image_processor=image_processor, tokenizer=module.tokenizer.tokenizer)
@@ -199,4 +274,10 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
         matcher=lambda module: isinstance(module, GemmaTextEncoder) and module.processor is None,
         mutator=load_processor,
     )
-    return (tokenizer_load_ops, processor_load_ops)
+    if include_processor:
+        return (tokenizer_load_ops, processor_load_ops)
+    return (tokenizer_load_ops,)
+
+
+def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
+    return module_ops_from_gemma_source(gemma_root, allow_default_assets=False)

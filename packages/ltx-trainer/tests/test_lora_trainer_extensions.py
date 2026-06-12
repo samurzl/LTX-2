@@ -10,11 +10,23 @@ import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+CORE_SRC = REPO_ROOT / "packages" / "ltx-core" / "src"
 TRAINER_SRC = REPO_ROOT / "packages" / "ltx-trainer" / "src"
 TRAINER_SCRIPTS = REPO_ROOT / "packages" / "ltx-trainer" / "scripts"
+sys.path.insert(0, str(CORE_SRC))
 sys.path.insert(0, str(TRAINER_SRC))
 sys.path.insert(0, str(TRAINER_SCRIPTS))
 
+from ltx_core.text_encoders.gemma import (
+    DEFAULT_GEMMA_ASSET_SOURCE,
+    gemma_weight_paths_from_source,
+    module_ops_from_gemma_source,
+)
+from ltx_trainer.comfy_negative_backend import (
+    SAVE_LATENT_NODE_ID,
+    build_ltxv_negative_workflow,
+    comfy_latent_bytes_to_trainer_payload,
+)
 from ltx_trainer.config import ModelConfig, LoraConfig
 from ltx_trainer.datasets import (
     OptionalSourceGroupedBatchSampler,
@@ -47,6 +59,84 @@ def test_component_paths_can_replace_base_model_path() -> None:
 
     with pytest.raises(ValueError, match="component paths must be provided"):
         ModelConfig(model_path=None, component_paths={"transformer": "/comfy/diffusion_model.safetensors"})
+
+
+def test_gemma_single_file_source_resolves_weights_and_tokenizer_ops(tmp_path: Path) -> None:
+    gemma_file = tmp_path / "gemma.safetensors"
+    gemma_file.write_bytes(b"")
+
+    assert gemma_weight_paths_from_source(gemma_file) == (str(gemma_file),)
+
+    ops = module_ops_from_gemma_source(gemma_file, include_processor=False)
+    assert [op.name for op in ops] == ["TokenizerLoad"]
+
+
+def test_gemma_directory_source_keeps_local_assets(tmp_path: Path) -> None:
+    model_dir = tmp_path / "gemma"
+    model_dir.mkdir()
+    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"")
+    (model_dir / "tokenizer.model").write_bytes(b"")
+
+    assert gemma_weight_paths_from_source(model_dir) == (str(model_dir / "model-00001-of-00001.safetensors"),)
+
+    ops = module_ops_from_gemma_source(model_dir, include_processor=False, allow_default_assets=False)
+    assert [op.name for op in ops] == ["TokenizerLoad"]
+
+
+def test_gemma_single_file_source_rejects_processor_when_default_disabled(tmp_path: Path) -> None:
+    gemma_file = tmp_path / "gemma.safetensors"
+    gemma_file.write_bytes(b"")
+
+    with pytest.raises(FileNotFoundError, match=DEFAULT_GEMMA_ASSET_SOURCE):
+        module_ops_from_gemma_source(gemma_file, allow_default_assets=False)
+
+
+def test_comfy_negative_workflow_uses_ltxv_nodes() -> None:
+    workflow = build_ltxv_negative_workflow(
+        checkpoint_name="ltx.safetensors",
+        text_encoder_name="gemma_fp4.safetensors",
+        prompt="a test prompt",
+        negative_prompt="low quality",
+        width=768,
+        height=512,
+        frames=97,
+        frame_rate=24.0,
+        seed=123,
+        guidance_scale=1.0,
+        distilled_lora_name="distilled.safetensors",
+        distilled_lora_strength=0.5,
+        sigmas=[1.0, 0.5, 0.0],
+    )
+
+    assert workflow["2"]["class_type"] == "LTXAVTextEncoderLoader"
+    assert workflow["2"]["inputs"]["text_encoder"] == "gemma_fp4.safetensors"
+    assert workflow["3"]["inputs"]["lora_name"] == "distilled.safetensors"
+    assert workflow["4"]["inputs"]["text"] == "a test prompt"
+    assert workflow["7"]["inputs"] == {"width": 768, "height": 512, "length": 97, "batch_size": 1}
+    assert workflow["13"]["class_type"] == "ManualSigmas"
+    assert workflow["13"]["inputs"]["sigmas"] == "1, 0.5, 0"
+    assert workflow[SAVE_LATENT_NODE_ID]["class_type"] == "SaveLatent"
+
+
+def test_comfy_latent_bytes_convert_to_trainer_payload(tmp_path: Path) -> None:
+    from safetensors.torch import save_file
+
+    latent_file = tmp_path / "sample.latent"
+    save_file(
+        {
+            "latent_tensor": torch.zeros(1, 128, 3, 4, 5),
+            "latent_format_version_0": torch.tensor([]),
+        },
+        latent_file,
+    )
+
+    payload = comfy_latent_bytes_to_trainer_payload(latent_file.read_bytes(), frame_rate=24.0)
+
+    assert payload["latents"].shape == (128, 3, 4, 5)
+    assert payload["num_frames"] == 3
+    assert payload["height"] == 4
+    assert payload["width"] == 5
+    assert payload["fps"] == 24.0
 
 
 def test_range_scaled_timestep_sampler_maps_into_expert_range() -> None:

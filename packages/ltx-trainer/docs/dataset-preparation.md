@@ -94,7 +94,7 @@ This step preprocesses your video dataset by:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 ```
 
 ### With Audio Processing
@@ -105,7 +105,7 @@ For audio-video training, add the `--with-audio` flag:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --with-audio
 ```
 
@@ -117,7 +117,7 @@ video sample remains available for video-only loss during training.
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --with-audio \
     --mixed-audio \
     --audio-min-rms-db -60 \
@@ -127,21 +127,43 @@ uv run python scripts/process_dataset.py dataset.json \
 ### With NSYNC Synthetic Negatives
 
 For NSYNC training, the trainer expects a generated negative video latent for each positive caption. The full
-preprocessing script can generate those videos with one-stage distilled-LoRA sampling, then encode them into
-`negative_latents/`:
+preprocessing script writes those latents directly with one-stage distilled-LoRA sampling, reusing the caption
+embeddings from `conditions/` and avoiding intermediate MP4 decode/re-encode work:
 
 ```bash
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --generate-negatives \
     --negative-distilled-lora /path/to/ltx-2-distilled-lora.safetensors \
+    --negative-quantization auto \
     --negative-latents-dir negative_latents
 ```
 
-Generated negative videos are written under `.precomputed/negative_videos/` by default. Their latents are paired with
-the positive samples by relative path and reuse the same caption embeddings during training.
+Generated negative latents are written under `.precomputed/negative_latents/` by default. They are paired with the
+positive samples by relative path and reuse the same caption embeddings during training. With fp8 checkpoint files,
+`--negative-quantization auto` selects the fp8 inference backend when the checkpoint exposes fp8 markers.
+
+If you already use ComfyUI for LTX-2/Gemma quantized files, negative generation can delegate sampling to a running
+ComfyUI server instead:
+
+```bash
+uv run python scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma.safetensors \
+    --generate-negatives \
+    --negative-backend comfy \
+    --negative-distilled-lora /path/to/ltx-2-distilled-lora.safetensors \
+    --comfy-server http://127.0.0.1:8188
+```
+
+The Comfy backend uses Comfy's own LTX/Gemma loaders, including its quantized checkpoint support. The checkpoint,
+Gemma text encoder, and LoRA must be available in Comfy's `models/checkpoints`, `models/text_encoders`, and
+`models/loras` folders. By default the script uses the basename of `--model-path`, `--text-encoder-path`, and
+`--negative-distilled-lora`; override them with `--comfy-checkpoint-name`, `--comfy-text-encoder-name`, and
+`--comfy-distilled-lora-name` when the Comfy filenames differ.
 
 ### 🚀 Multi-GPU Preprocessing
 
@@ -153,7 +175,7 @@ The same approach applies to `process_videos.py` and `process_captions.py` when 
 uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 ```
 
 Outputs are written atomically (via a per-process temporary file, then renamed), so an interrupted run leaves no
@@ -167,7 +189,7 @@ corrupt files. By default a rerun **resumes** — items whose output `.pt` alrea
 > uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
 >     --resolution-buckets "960x544x49" \
 >     --model-path /path/to/ltx-2.3-model.safetensors \
->     --text-encoder-path /path/to/gemma-model \
+>     --text-encoder-path /path/to/gemma.safetensors \
 >     --overwrite
 > ```
 
@@ -250,7 +272,7 @@ The dimensions of each bucket must follow these constraints due to LTX-2's VAE a
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 ```
 
 Multiple buckets are supported by separating entries with `;`:
@@ -259,7 +281,7 @@ Multiple buckets are supported by separating entries with `;`:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49;512x512x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 ```
 
 **Video processing workflow:**
@@ -343,7 +365,7 @@ in your dataset JSON/JSONL/CSV that contains the reference video paths:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --reference-column "reference_path"
 ```
 
@@ -381,7 +403,7 @@ When training a LoRA, you can specify a trigger token that will be prepended to 
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --lora-trigger "MYTRIGGER"
 ```
 
@@ -401,7 +423,7 @@ decoded and saved to `.precomputed/decoded_audio`. This allows you to visually a
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --decode
 ```
 

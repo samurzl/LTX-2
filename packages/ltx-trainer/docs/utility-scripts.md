@@ -120,20 +120,20 @@ uv run python scripts/suggest_resolution_buckets.py dataset.json --details
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 
 # With audio processing
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --with-audio
 
 # With video decoding for verification
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --decode
 ```
 
@@ -143,7 +143,7 @@ Multiple resolution buckets can be specified, separated by `;`:
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49;512x512x81" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 ```
 
 > [!NOTE]
@@ -160,13 +160,13 @@ so stale outputs are replaced. Use the same `accelerate launch` pattern (and `--
 uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --text-encoder-path /path/to/gemma.safetensors
 
 # Force re-encoding of all items (e.g. after switching model or resolution)
 uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
     --model-path /path/to/ltx-2.3-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --text-encoder-path /path/to/gemma.safetensors \
     --overwrite
 ```
 
@@ -250,14 +250,14 @@ The `scripts/inference.py` script runs inference with a trained model.
 # By default, uses CFG scale 4.0 and STG scale 1.0 with block 29
 uv run python scripts/inference.py \
     --checkpoint /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma \
+    --text-encoder-path /path/to/gemma.safetensors \
     --prompt "A cat playing with a ball" \
     --output output.mp4
 
 # Video-only (skip audio generation)
 uv run python scripts/inference.py \
     --checkpoint /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma \
+    --text-encoder-path /path/to/gemma.safetensors \
     --prompt "A cat playing with a ball" \
     --skip-audio \
     --output output.mp4
@@ -265,7 +265,7 @@ uv run python scripts/inference.py \
 # Image-to-video with conditioning image
 uv run python scripts/inference.py \
     --checkpoint /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma \
+    --text-encoder-path /path/to/gemma.safetensors \
     --prompt "A cat walking" \
     --condition-image first_frame.png \
     --output output.mp4
@@ -273,7 +273,7 @@ uv run python scripts/inference.py \
 # Custom guidance settings
 uv run python scripts/inference.py \
     --checkpoint /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma \
+    --text-encoder-path /path/to/gemma.safetensors \
     --prompt "A cat playing with a ball" \
     --guidance-scale 4.0 \
     --stg-scale 1.0 \
@@ -283,7 +283,7 @@ uv run python scripts/inference.py \
 # Disable STG (CFG only)
 uv run python scripts/inference.py \
     --checkpoint /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma \
+    --text-encoder-path /path/to/gemma.safetensors \
     --prompt "A cat playing with a ball" \
     --stg-scale 0.0 \
     --output output.mp4

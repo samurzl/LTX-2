@@ -45,6 +45,12 @@ def load_8bit_gemma(
         ImportError: If bitsandbytes is not installed
         FileNotFoundError: If required model files are not found
     """
+    if Path(gemma_model_path).is_file():
+        raise ValueError(
+            "8-bit Gemma loading currently requires a directory-style Gemma model. "
+            "Use load_text_encoder_in_8bit: false when text_encoder_path points to a single .safetensors file."
+        )
+
     try:
         from transformers import BitsAndBytesConfig, Gemma3ForConditionalGeneration
     except ImportError as e:

@@ -36,9 +36,9 @@ model:
   # This should be a local path to your downloaded model
   model_path: "path/to/ltx-2-model.safetensors"
 
-  # Path to the text encoder model directory
+  # Path to the text encoder .safetensors file or model directory
   # For LTX-2, this is typically the Gemma-based text encoder
-  text_encoder_path: "path/to/gemma-text-encoder"
+  text_encoder_path: "path/to/gemma.safetensors"
 
   # Training mode: "lora" for efficient adapter training, "full" for full fine-tuning
   # LoRA is recommended for most use cases (faster, less memory, prevents overfitting)

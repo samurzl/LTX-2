@@ -295,7 +295,7 @@ def basic_arg_parser(
         "--gemma-root",
         type=resolve_existing_path,
         required=True,
-        help="Path to the root directory containing the Gemma text encoder model files.",
+        help="Path to the Gemma text encoder .safetensors file or model directory.",
     )
     parser.add_argument(
         "--prompt",

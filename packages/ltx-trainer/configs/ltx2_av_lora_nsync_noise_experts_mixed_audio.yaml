@@ -13,13 +13,16 @@
 # uv run python scripts/process_dataset.py dataset.json \
 #   --resolution-buckets "576x576x89" \
 #   --model-path /path/to/ltx-2-model.safetensors \
-#   --text-encoder-path /path/to/gemma-text-encoder \
+#   --text-encoder-path /path/to/gemma.safetensors \
 #   --with-audio \
 #   --mixed-audio \
 #   --audio-min-rms-db -60 \
 #   --audio-min-active-ratio 0.01 \
 #   --generate-negatives \
 #   --negative-distilled-lora /path/to/ltx-2-distilled-lora.safetensors \
+#   --negative-quantization auto \
+#   # Or delegate quantized negative generation to a running ComfyUI server:
+#   # --negative-backend comfy --comfy-server http://127.0.0.1:8188 \
 #   --negative-latents-dir negative_latents
 #
 # =============================================================================
@@ -27,7 +30,7 @@
 model:
   # Set this to null when all required weights are supplied through component_paths below.
   model_path: "/path/to/ltx-2-model.safetensors"
-  text_encoder_path: "/path/to/gemma-text-encoder"
+  text_encoder_path: "/path/to/gemma.safetensors"
   training_mode: "lora"
   load_checkpoint: null
 
@@ -39,7 +42,7 @@ model:
     video_vae: "/path/to/comfy/video_vae.safetensors"
     audio_vae: "/path/to/comfy/audio_vae.safetensors"
     vocoder: "/path/to/comfy/vocoder.safetensors"
-    text_encoder: "/path/to/comfy/gemma"
+    text_encoder: "/path/to/comfy/gemma.safetensors"
 
 lora:
   rank: 32
@@ -78,17 +81,19 @@ optimization:
   optimizer_type: "adamw"
   scheduler_type: "linear"
   scheduler_params: { }
-  enable_gradient_checkpointing: true
+  # Fast single-80GB default: keep checkpointing off unless your exact resolution/rank OOMs.
+  enable_gradient_checkpointing: false
 
 acceleration:
   mixed_precision_mode: "bf16"
+  # A100 throughput default: keep the trainable run bf16. Use "fp8-quanto" only if memory becomes the limiter.
   quantization: null
   load_text_encoder_in_8bit: false
   offload_optimizer_during_validation: false
 
 data:
   preprocessed_data_root: "/path/to/preprocessed/data"
-  num_dataloader_workers: 2
+  num_dataloader_workers: 4
 
 validation:
   prompts:
@@ -99,8 +104,9 @@ validation:
   video_dims: [576, 576, 89]
   frame_rate: 25.0
   seed: 42
-  inference_steps: 30
-  interval: 100
+  inference_steps: 12
+  # Validation is expensive; keep it infrequent for throughput, or set null to disable.
+  interval: 500
   guidance_scale: 4.0
   stg_scale: 1.0
   stg_blocks: [29]
