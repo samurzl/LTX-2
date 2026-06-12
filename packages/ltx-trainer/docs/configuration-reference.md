@@ -275,7 +275,7 @@ Hardware acceleration and compute optimization settings.
 ```yaml
 acceleration:
   mixed_precision_mode: "bf16"                  # "no", "fp16", or "bf16"
-  quantization: null                            # Quantization options
+  quantization: null                            # Optional post-load trainer quantization
   load_text_encoder_in_8bit: false              # Load text encoder in 8-bit
   offload_optimizer_during_validation: false    # Offload optimizer state to CPU during validation
 ```
@@ -285,7 +285,7 @@ acceleration:
 | Parameter                             | Description                                                                                                                                                                              |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `mixed_precision_mode`                | Precision mode - `"bf16"` recommended for modern GPUs                                                                                                                                    |
-| `quantization`                        | Model quantization: `null`, `"int8-quanto"`, `"int4-quanto"`, `"fp8-quanto"`, etc.                                                                                                       |
+| `quantization`                        | Optional post-load trainer quantization: `null`, `"int8-quanto"`, `"int4-quanto"`, `"fp8-quanto"`, etc. Scaled FP8 transformer checkpoints are dequantized safely on load; FP4/NVFP4 transformer checkpoints are not supported for native training. |
 | `load_text_encoder_in_8bit`           | Load the Gemma text encoder in 8-bit to save GPU memory                                                                                                                                  |
 | `offload_optimizer_during_validation` | Move optimizer state to CPU before validation video sampling and back afterwards. Useful when validation OOMs because VAE decoder + transformer + optimizer state can't coexist on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP. |
 

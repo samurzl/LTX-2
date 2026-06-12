@@ -15,6 +15,8 @@ Example usage:
 
 from __future__ import annotations
 
+import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,6 +31,7 @@ Device = str | torch.device
 # Type checking imports (not loaded at runtime)
 if TYPE_CHECKING:
     from ltx_core.components.schedulers import LTX2Scheduler
+    from ltx_core.loader.sd_ops import SDOps
     from ltx_core.model.audio_vae import AudioDecoder, AudioEncoder, Vocoder
     from ltx_core.model.transformer import LTXModel
     from ltx_core.model.video_vae import VideoDecoder, VideoEncoder
@@ -39,6 +42,131 @@ if TYPE_CHECKING:
 def _to_torch_device(device: Device) -> torch.device:
     """Convert device specification to torch.device."""
     return torch.device(device) if isinstance(device, str) else device
+
+
+def _read_safetensors_header(path: str | Path) -> dict[str, dict]:
+    with Path(path).open("rb") as f:
+        header_size = struct.unpack("<Q", f.read(8))[0]
+        return json.loads(f.read(header_size).decode("utf-8"))
+
+
+def _is_fp8_dtype(dtype: str | None) -> bool:
+    return dtype is not None and dtype.startswith("F8")
+
+
+def _is_fp4_dtype(dtype: str | None) -> bool:
+    return dtype is not None and dtype.startswith("F4")
+
+
+def _is_weight_or_bias_scale_key(key: str) -> bool:
+    return key.endswith((".weight_scale", ".bias_scale"))
+
+
+def _chain_sd_ops(first: "SDOps", second: "SDOps") -> "SDOps":
+    from ltx_core.loader.sd_ops import SDOps
+
+    allowed_keys = None
+    if first.allowed_keys is not None or second.allowed_keys is not None:
+        allowed_keys = frozenset(first.allowed_keys or ()) | frozenset(second.allowed_keys or ())
+
+    return SDOps(
+        name=f"{first.name}+{second.name}",
+        mapping=(*first.mapping, *second.mapping),
+        allowed_keys=allowed_keys,
+    )
+
+
+def _build_scaled_fp8_dequant_sd_ops(checkpoint_path: str | Path, base_sd_ops: "SDOps") -> "SDOps":
+    """Build sd-ops that consume FP8 ``*_scale`` siblings and load BF16 weights."""
+    from safetensors import safe_open
+
+    from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
+
+    scales: dict[str, torch.Tensor] = {}
+    with safe_open(str(checkpoint_path), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if not _is_weight_or_bias_scale_key(key):
+                continue
+            parent_raw_key = key.removesuffix("_scale")
+            parent_model_key = base_sd_ops.apply_to_key(parent_raw_key) or parent_raw_key
+            scales[parent_model_key] = f.get_tensor(key)
+
+    def _fold_scale(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+        scale = scales.get(param_key)
+        if scale is None:
+            return [KeyValueOperationResult(param_key, value)]
+        dequantized = (value.to(torch.float32) * scale.to(device=value.device, dtype=torch.float32)).to(torch.bfloat16)
+        return [KeyValueOperationResult(param_key, dequantized)]
+
+    def _drop_scale(scale_key: str, _value: torch.Tensor) -> list[KeyValueOperationResult]:
+        param_key = scale_key.removesuffix("_scale")
+        if param_key not in scales:
+            raise ValueError(f"Scale key {scale_key!r} has no matching scaled FP8 parameter")
+        return []
+
+    return (
+        SDOps("SCALED_FP8_DEQUANT_TO_BF16")
+        .with_kv_operation(key_suffix=".weight_scale", operation=_drop_scale)
+        .with_kv_operation(key_suffix=".bias_scale", operation=_drop_scale)
+        .with_kv_operation(key_suffix=".weight", operation=_fold_scale)
+        .with_kv_operation(key_suffix=".bias", operation=_fold_scale)
+    )
+
+
+def _transformer_sd_ops_for_checkpoint(checkpoint_path: str | Path, base_sd_ops: "SDOps") -> "SDOps":
+    """Return transformer sd-ops, adding safe prequant handling when needed."""
+    path = Path(checkpoint_path)
+    lower_name = path.name.lower()
+
+    if any(marker in lower_name for marker in ("nvfp4", "fp4")):
+        raise ValueError(
+            "Native training cannot load FP4/NVFP4 LTX transformer checkpoints directly. "
+            "Use a BF16/FP8 LTX transformer checkpoint for training; the Comfy backend can still be "
+            "used for negative generation from Comfy's quantized models."
+        )
+
+    try:
+        header = _read_safetensors_header(path)
+    except Exception as e:
+        logger.warning("Could not inspect transformer checkpoint quantization for %s: %s", path, e)
+        return base_sd_ops
+
+    tensor_dtypes = {key: value.get("dtype") for key, value in header.items() if key != "__metadata__"}
+    if any(_is_fp4_dtype(dtype) for dtype in tensor_dtypes.values()):
+        raise ValueError(
+            "Native training cannot load FP4/NVFP4 LTX transformer checkpoints directly. "
+            "Use a BF16/FP8 LTX transformer checkpoint for training."
+        )
+
+    scale_keys = [key for key in tensor_dtypes if _is_weight_or_bias_scale_key(key)]
+    if not scale_keys:
+        return base_sd_ops
+
+    scaled_fp8_keys = [
+        key
+        for key in scale_keys
+        if _is_fp8_dtype(tensor_dtypes.get(key.removesuffix("_scale")))
+    ]
+    if not scaled_fp8_keys:
+        preview = ", ".join(scale_keys[:4])
+        raise ValueError(
+            "Transformer checkpoint contains quantization scale tensors that are not paired with FP8 weights. "
+            f"First scale keys: {preview}. Native training currently supports BF16/plain FP8 or scaled FP8 only."
+        )
+
+    if len(scaled_fp8_keys) != len(scale_keys):
+        preview = ", ".join((set(scale_keys) - set(scaled_fp8_keys)).copy())
+        raise ValueError(
+            "Transformer checkpoint mixes scaled FP8 and unsupported quantization scale tensors. "
+            f"Unsupported scale keys include: {preview[:200]}"
+        )
+
+    logger.info(
+        "Detected scaled FP8 transformer checkpoint at %s; folding %d scale tensors into BF16 weights for training.",
+        path,
+        len(scale_keys),
+    )
+    return _chain_sd_ops(base_sd_ops, _build_scaled_fp8_dequant_sd_ops(path, base_sd_ops))
 
 
 # =============================================================================
@@ -65,10 +193,12 @@ def load_transformer(
         LTXModelConfigurator,
     )
 
+    model_sd_ops = _transformer_sd_ops_for_checkpoint(checkpoint_path, LTXV_MODEL_COMFY_RENAMING_MAP)
+
     return SingleGPUModelBuilder(
         model_path=str(checkpoint_path),
         model_class_configurator=LTXModelConfigurator,
-        model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+        model_sd_ops=model_sd_ops,
     ).build(device=_to_torch_device(device), dtype=dtype)
 
 

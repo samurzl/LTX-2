@@ -89,7 +89,9 @@ optimization:
 
 acceleration:
   mixed_precision_mode: "bf16"
-  # A100 throughput default: keep the trainable run bf16. Use "fp8-quanto" only if memory becomes the limiter.
+  # A100 throughput default: keep the trainable run bf16. Scaled FP8 transformer
+  # checkpoints are dequantized safely on load; FP4/NVFP4 transformer checkpoints
+  # are not supported for native training. Use "fp8-quanto" only if memory becomes the limiter.
   quantization: null
   load_text_encoder_in_8bit: false
   offload_optimizer_during_validation: false

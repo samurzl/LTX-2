@@ -23,6 +23,8 @@ from ltx_core.text_encoders.gemma import (
     gemma_weight_paths_from_source,
     module_ops_from_gemma_source,
 )
+from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+from ltx_core.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
 from ltx_trainer.comfy_negative_backend import (
     SAVE_LATENT_NODE_ID,
     build_ltxv_negative_workflow,
@@ -34,6 +36,7 @@ from ltx_trainer.datasets import (
     PrecomputedDataset,
     collate_precomputed_samples,
 )
+from ltx_trainer.model_loader import _transformer_sd_ops_for_checkpoint
 from ltx_trainer.timestep_samplers import RangeScaledTimestepSampler, UniformTimestepSampler
 from ltx_trainer.trainer import LtxvTrainer
 from process_videos import _audio_has_activity
@@ -165,6 +168,42 @@ def test_comfy_latent_bytes_convert_to_trainer_payload(tmp_path: Path) -> None:
     assert payload["height"] == 4
     assert payload["width"] == 5
     assert payload["fps"] == 24.0
+
+
+def test_transformer_loader_folds_scaled_fp8_weights(tmp_path: Path) -> None:
+    from safetensors.torch import save_file
+
+    checkpoint = tmp_path / "ltx_fp8.safetensors"
+    save_file(
+        {
+            "model.diffusion_model.transformer_blocks.0.attn1.to_q.weight": torch.full(
+                (2, 2),
+                2.0,
+                dtype=torch.float8_e4m3fn,
+            ),
+            "model.diffusion_model.transformer_blocks.0.attn1.to_q.weight_scale": torch.tensor(
+                0.5,
+                dtype=torch.float32,
+            ),
+        },
+        checkpoint,
+    )
+
+    sd_ops = _transformer_sd_ops_for_checkpoint(checkpoint, LTXV_MODEL_COMFY_RENAMING_MAP)
+    state = SafetensorsStateDictLoader().load(str(checkpoint), sd_ops=sd_ops, device=torch.device("cpu")).sd
+
+    weight = state["transformer_blocks.0.attn1.to_q.weight"]
+    assert weight.dtype == torch.bfloat16
+    assert torch.allclose(weight.float(), torch.ones_like(weight.float()))
+    assert "transformer_blocks.0.attn1.to_q.weight_scale" not in state
+
+
+def test_transformer_loader_rejects_native_fp4_files(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "ltx_nvfp4.safetensors"
+    checkpoint.write_bytes(b"not a real checkpoint")
+
+    with pytest.raises(ValueError, match="FP4/NVFP4"):
+        _transformer_sd_ops_for_checkpoint(checkpoint, LTXV_MODEL_COMFY_RENAMING_MAP)
 
 
 def test_range_scaled_timestep_sampler_maps_into_expert_range() -> None:
