@@ -386,15 +386,16 @@ class LtxvTrainer:
                 video_features = conditions["prompt_embeds"]
                 audio_features = conditions["prompt_embeds"]
 
-            mask = conditions["prompt_attention_mask"]
-            additive_mask = convert_to_additive_mask(mask, video_features.dtype)
-            video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
-                video_features, audio_features, additive_mask
-            )
+            with torch.no_grad():
+                mask = conditions["prompt_attention_mask"]
+                additive_mask = convert_to_additive_mask(mask, video_features.dtype)
+                video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+                    video_features, audio_features, additive_mask
+                )
 
-            conditions["video_prompt_embeds"] = video_embeds
-            conditions["audio_prompt_embeds"] = audio_embeds
-            conditions["prompt_attention_mask"] = attention_mask
+            conditions["video_prompt_embeds"] = video_embeds.detach()
+            conditions["audio_prompt_embeds"] = audio_embeds.detach() if audio_embeds is not None else None
+            conditions["prompt_attention_mask"] = attention_mask.detach()
             conditions["_embeddings_processed"] = True
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
@@ -586,6 +587,8 @@ class LtxvTrainer:
         # Unload Gemma model and feature extractor, keep only connectors for training
         del text_encoder
         self._embeddings_processor.feature_extractor = None
+        self._embeddings_processor.requires_grad_(False)
+        self._embeddings_processor.eval()
 
         logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings

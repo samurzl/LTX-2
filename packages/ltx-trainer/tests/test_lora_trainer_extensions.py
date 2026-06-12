@@ -245,3 +245,75 @@ def test_nsync_projection_is_layer_wise() -> None:
     layer1_dot = torch.dot(p3.grad, negative_grads[p3])
     assert layer0_dot.abs() < 1e-6
     assert layer1_dot.abs() < 1e-6
+
+
+def test_nsync_reuses_processed_conditions_without_second_backward_error() -> None:
+    class FakeAccelerator:
+        def backward(self, loss: torch.Tensor) -> None:
+            loss.backward()
+
+    class FakeEmbeddingsProcessor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def create_embeddings(
+            self,
+            video_features: torch.Tensor,
+            audio_features: torch.Tensor | None,
+            _additive_attention_mask: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+            batch_size, seq_len = video_features.shape[:2]
+            attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+            return video_features * self.weight, None, attention_mask
+
+    class FakeTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def forward(self, *, video: SimpleNamespace, audio: None, perturbations: None) -> tuple[torch.Tensor, None]:
+            return video.context * self.weight, None
+
+    class FakeStrategy:
+        def prepare_training_inputs(self, batch: dict, _timestep_sampler: object) -> SimpleNamespace:
+            context = batch["conditions"]["video_prompt_embeds"]
+            return SimpleNamespace(
+                video=SimpleNamespace(enabled=True, sigma=torch.ones(context.shape[0]), context=context),
+                audio=None,
+            )
+
+        def compute_loss(
+            self,
+            video_pred: torch.Tensor,
+            _audio_pred: None,
+            _model_inputs: SimpleNamespace,
+        ) -> torch.Tensor:
+            return video_pred.flatten(1).mean(dim=1)
+
+    transformer = FakeTransformer()
+    trainer = object.__new__(LtxvTrainer)
+    trainer._accelerator = FakeAccelerator()
+    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12)))
+    trainer._embeddings_processor = FakeEmbeddingsProcessor()
+    trainer._training_strategy = FakeStrategy()
+    trainer._transformer = transformer
+    trainer._trainable_params = [transformer.weight]
+    trainer._gradient_projection_groups = {"all": [transformer.weight]}
+
+    conditions = {
+        "video_prompt_embeds": torch.ones(1, 4, 2),
+        "audio_prompt_embeds": None,
+        "prompt_attention_mask": torch.ones(1, 4, dtype=torch.int64),
+    }
+    batch = {
+        "conditions": conditions,
+        "latents": {"latents": torch.zeros(1)},
+        "negative_latents": {"latents": torch.zeros(1)},
+    }
+
+    output = trainer._nsync_training_step(batch, timestep_sampler=object())
+
+    assert output.loss.shape == (1,)
+    assert conditions["_embeddings_processed"] is True
+    assert not conditions["video_prompt_embeds"].requires_grad
