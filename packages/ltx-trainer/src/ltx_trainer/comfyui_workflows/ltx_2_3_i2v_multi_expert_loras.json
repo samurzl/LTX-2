@@ -25,14 +25,14 @@
             "bounding": [
               3720,
               4260,
-              1248,
-              996
+              1788,
+              1188
             ],
             "color": "#3f789e",
             "flags": {},
             "font_size": 24,
             "id": 2,
-            "title": "Generate Low Resolution"
+            "title": "Generate Low Resolution (Split Experts)"
           },
           {
             "bounding": [
@@ -51,14 +51,14 @@
             "bounding": [
               5650,
               4260,
-              1188,
-              996
+              2172,
+              1188
             ],
             "color": "#3f789e",
             "flags": {},
             "font_size": 24,
             "id": 6,
-            "title": "Generate High Resolution"
+            "title": "Generate High Resolution (Split Experts)"
           },
           {
             "bounding": [
@@ -136,7 +136,7 @@
             "flags": {},
             "font_size": 24,
             "id": 26,
-            "title": "Expert LoRAs"
+            "title": "Expert LoRAs (Branched, Not Stacked)"
           }
         ],
         "id": "b94257db-cdc1-45d3-8913-ca61e782d9c1",
@@ -313,7 +313,7 @@
           },
           {
             "id": 478,
-            "origin_id": 277,
+            "origin_id": 276,
             "origin_slot": 0,
             "target_id": 213,
             "target_slot": 0,
@@ -337,7 +337,7 @@
           },
           {
             "id": 541,
-            "origin_id": 277,
+            "origin_id": 276,
             "origin_slot": 0,
             "target_id": 231,
             "target_slot": 0,
@@ -689,7 +689,7 @@
           },
           {
             "id": 488,
-            "origin_id": 215,
+            "origin_id": 278,
             "origin_slot": 0,
             "target_id": 217,
             "target_slot": 0,
@@ -737,7 +737,7 @@
           },
           {
             "id": 578,
-            "origin_id": 219,
+            "origin_id": 281,
             "origin_slot": 0,
             "target_id": 218,
             "target_slot": 0,
@@ -929,11 +929,139 @@
           },
           {
             "id": 626,
-            "origin_id": 276,
+            "origin_id": 232,
             "origin_slot": 0,
             "target_id": 277,
             "target_slot": 0,
             "type": "MODEL"
+          },
+          {
+            "id": 627,
+            "origin_id": 215,
+            "origin_slot": 0,
+            "target_id": 278,
+            "target_slot": 4,
+            "type": "LATENT"
+          },
+          {
+            "id": 628,
+            "origin_id": 219,
+            "origin_slot": 0,
+            "target_id": 281,
+            "target_slot": 4,
+            "type": "LATENT"
+          },
+          {
+            "id": 629,
+            "origin_id": 277,
+            "origin_slot": 0,
+            "target_id": 279,
+            "target_slot": 0,
+            "type": "MODEL"
+          },
+          {
+            "id": 630,
+            "origin_id": 277,
+            "origin_slot": 0,
+            "target_id": 282,
+            "target_slot": 0,
+            "type": "MODEL"
+          },
+          {
+            "id": 631,
+            "origin_id": 239,
+            "origin_slot": 0,
+            "target_id": 279,
+            "target_slot": 1,
+            "type": "CONDITIONING"
+          },
+          {
+            "id": 632,
+            "origin_id": 239,
+            "origin_slot": 1,
+            "target_id": 279,
+            "target_slot": 2,
+            "type": "CONDITIONING"
+          },
+          {
+            "id": 633,
+            "origin_id": 212,
+            "origin_slot": 0,
+            "target_id": 282,
+            "target_slot": 1,
+            "type": "CONDITIONING"
+          },
+          {
+            "id": 634,
+            "origin_id": 212,
+            "origin_slot": 1,
+            "target_id": 282,
+            "target_slot": 2,
+            "type": "CONDITIONING"
+          },
+          {
+            "id": 635,
+            "origin_id": 279,
+            "origin_slot": 0,
+            "target_id": 278,
+            "target_slot": 1,
+            "type": "GUIDER"
+          },
+          {
+            "id": 636,
+            "origin_id": 282,
+            "origin_slot": 0,
+            "target_id": 281,
+            "target_slot": 1,
+            "type": "GUIDER"
+          },
+          {
+            "id": 637,
+            "origin_id": 209,
+            "origin_slot": 0,
+            "target_id": 278,
+            "target_slot": 2,
+            "type": "SAMPLER"
+          },
+          {
+            "id": 638,
+            "origin_id": 246,
+            "origin_slot": 0,
+            "target_id": 281,
+            "target_slot": 2,
+            "type": "SAMPLER"
+          },
+          {
+            "id": 639,
+            "origin_id": 280,
+            "origin_slot": 0,
+            "target_id": 278,
+            "target_slot": 3,
+            "type": "SIGMAS"
+          },
+          {
+            "id": 640,
+            "origin_id": 280,
+            "origin_slot": 0,
+            "target_id": 281,
+            "target_slot": 3,
+            "type": "SIGMAS"
+          },
+          {
+            "id": 641,
+            "origin_id": 237,
+            "origin_slot": 0,
+            "target_id": 278,
+            "target_slot": 0,
+            "type": "NOISE"
+          },
+          {
+            "id": 642,
+            "origin_id": 216,
+            "origin_slot": 0,
+            "target_id": 281,
+            "target_slot": 0,
+            "type": "NOISE"
           }
         ],
         "name": "Video Generation (LTX-2.3)",
@@ -947,7 +1075,8 @@
             "outputs": [
               {
                 "links": [
-                  490
+                  490,
+                  642
                 ],
                 "localized_name": "NOISE",
                 "name": "NOISE",
@@ -989,7 +1118,8 @@
             "outputs": [
               {
                 "links": [
-                  483
+                  483,
+                  641
                 ],
                 "localized_name": "NOISE",
                 "name": "NOISE",
@@ -1142,7 +1272,8 @@
             "outputs": [
               {
                 "links": [
-                  492
+                  492,
+                  638
                 ],
                 "localized_name": "SAMPLER",
                 "name": "SAMPLER",
@@ -1212,8 +1343,9 @@
             ],
             "type": "ManualSigmas",
             "widgets_values": [
-              "0.85, 0.7250, 0.4219, 0.0"
-            ]
+              "0.85, 0.725, 0.5"
+            ],
+            "title": "High-Res High-Sigma Schedule"
           },
           {
             "flags": {},
@@ -1315,7 +1447,7 @@
             "outputs": [
               {
                 "links": [
-                  488
+                  627
                 ],
                 "localized_name": "output",
                 "name": "output",
@@ -1349,7 +1481,8 @@
               168
             ],
             "type": "SamplerCustomAdvanced",
-            "widgets_values": []
+            "widgets_values": [],
+            "title": "Low-Res High-Sigma Sampler"
           },
           {
             "flags": {},
@@ -1379,7 +1512,8 @@
             "outputs": [
               {
                 "links": [
-                  479
+                  479,
+                  633
                 ],
                 "localized_name": "positive",
                 "name": "positive",
@@ -1387,7 +1521,8 @@
               },
               {
                 "links": [
-                  480
+                  480,
+                  634
                 ],
                 "localized_name": "negative",
                 "name": "negative",
@@ -1449,7 +1584,8 @@
             "outputs": [
               {
                 "links": [
-                  625
+                  625,
+                  626
                 ],
                 "localized_name": "MODEL",
                 "name": "MODEL",
@@ -1795,7 +1931,8 @@
             "outputs": [
               {
                 "links": [
-                  485
+                  485,
+                  637
                 ],
                 "localized_name": "SAMPLER",
                 "name": "SAMPLER",
@@ -2562,7 +2699,8 @@
               {
                 "links": [
                   475,
-                  518
+                  518,
+                  631
                 ],
                 "localized_name": "positive",
                 "name": "positive",
@@ -2571,7 +2709,8 @@
               {
                 "links": [
                   476,
-                  519
+                  519,
+                  632
                 ],
                 "localized_name": "negative",
                 "name": "negative",
@@ -2709,8 +2848,9 @@
             ],
             "type": "ManualSigmas",
             "widgets_values": [
-              "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
-            ]
+              "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.5"
+            ],
+            "title": "Low-Res High-Sigma Schedule"
           },
           {
             "flags": {},
@@ -2807,7 +2947,7 @@
             "outputs": [
               {
                 "links": [
-                  578
+                  628
                 ],
                 "localized_name": "output",
                 "name": "output",
@@ -2841,7 +2981,8 @@
               168
             ],
             "type": "SamplerCustomAdvanced",
-            "widgets_values": []
+            "widgets_values": [],
+            "title": "High-Res High-Sigma Sampler"
           },
           {
             "flags": {},
@@ -3508,7 +3649,8 @@
             "outputs": [
               {
                 "links": [
-                  626
+                  541,
+                  478
                 ],
                 "localized_name": "MODEL",
                 "name": "MODEL",
@@ -3545,10 +3687,10 @@
               504,
               138.65625
             ],
-            "title": "Expert LoRA 1",
+            "title": "High-Sigma Expert LoRA",
             "type": "LoraLoaderModelOnly",
             "widgets_values": [
-              "lora_weights_low_noise_step_02000.safetensors",
+              "lora_weights_high_noise_step_02000.safetensors",
               1.0
             ]
           },
@@ -3568,8 +3710,8 @@
             "outputs": [
               {
                 "links": [
-                  478,
-                  541
+                  629,
+                  630
                 ],
                 "localized_name": "MODEL",
                 "name": "MODEL",
@@ -3606,12 +3748,331 @@
               504,
               138.65625
             ],
-            "title": "Expert LoRA 2",
+            "title": "Low-Sigma Expert LoRA",
             "type": "LoraLoaderModelOnly",
             "widgets_values": [
-              "lora_weights_high_noise_step_02000.safetensors",
+              "lora_weights_low_noise_step_02000.safetensors",
               1.0
             ]
+          },
+          {
+            "flags": {},
+            "id": 278,
+            "inputs": [
+              {
+                "link": 641,
+                "localized_name": "noise",
+                "name": "noise",
+                "type": "NOISE"
+              },
+              {
+                "link": 635,
+                "localized_name": "guider",
+                "name": "guider",
+                "type": "GUIDER"
+              },
+              {
+                "link": 637,
+                "localized_name": "sampler",
+                "name": "sampler",
+                "type": "SAMPLER"
+              },
+              {
+                "link": 639,
+                "localized_name": "sigmas",
+                "name": "sigmas",
+                "type": "SIGMAS"
+              },
+              {
+                "link": 627,
+                "localized_name": "latent_image",
+                "name": "latent_image",
+                "type": "LATENT"
+              }
+            ],
+            "mode": 0,
+            "order": 11,
+            "outputs": [
+              {
+                "links": [
+                  488
+                ],
+                "localized_name": "output",
+                "name": "output",
+                "type": "LATENT"
+              },
+              {
+                "links": [],
+                "localized_name": "denoised_output",
+                "name": "denoised_output",
+                "type": "LATENT"
+              }
+            ],
+            "pos": [
+              4626.0,
+              5234.0
+            ],
+            "properties": {
+              "Node name for S&R": "SamplerCustomAdvanced",
+              "cnr_id": "comfy-core",
+              "enableTabs": false,
+              "hasSecondTab": false,
+              "secondTabOffset": 80,
+              "secondTabText": "Send Back",
+              "secondTabWidth": 65,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "ver": "0.3.60"
+            },
+            "size": [
+              255.75,
+              168
+            ],
+            "type": "SamplerCustomAdvanced",
+            "widgets_values": [],
+            "title": "Low-Res Low-Sigma Sampler"
+          },
+          {
+            "flags": {},
+            "id": 279,
+            "inputs": [
+              {
+                "link": 629,
+                "localized_name": "model",
+                "name": "model",
+                "type": "MODEL"
+              },
+              {
+                "link": 631,
+                "localized_name": "positive",
+                "name": "positive",
+                "type": "CONDITIONING"
+              },
+              {
+                "link": 632,
+                "localized_name": "negative",
+                "name": "negative",
+                "type": "CONDITIONING"
+              }
+            ],
+            "mode": 0,
+            "order": 21,
+            "outputs": [
+              {
+                "links": [
+                  635
+                ],
+                "localized_name": "GUIDER",
+                "name": "GUIDER",
+                "type": "GUIDER"
+              }
+            ],
+            "pos": [
+              4218.0,
+              5234.0
+            ],
+            "properties": {
+              "Node name for S&R": "CFGGuider",
+              "cnr_id": "comfy-core",
+              "enableTabs": false,
+              "hasSecondTab": false,
+              "secondTabOffset": 80,
+              "secondTabText": "Send Back",
+              "secondTabWidth": 65,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "ver": "0.3.64"
+            },
+            "size": [
+              324,
+              152
+            ],
+            "type": "CFGGuider",
+            "widgets_values": [
+              1
+            ],
+            "title": "Low-Res Low-Sigma Guider"
+          },
+          {
+            "flags": {},
+            "id": 280,
+            "inputs": [],
+            "mode": 0,
+            "order": 5,
+            "outputs": [
+              {
+                "links": [
+                  639,
+                  640
+                ],
+                "localized_name": "SIGMAS",
+                "name": "SIGMAS",
+                "type": "SIGMAS"
+              }
+            ],
+            "pos": [
+              4230.0,
+              5136.0
+            ],
+            "properties": {
+              "Node name for S&R": "ManualSigmas",
+              "cnr_id": "comfy-core",
+              "enableTabs": false,
+              "hasSecondTab": false,
+              "secondTabOffset": 80,
+              "secondTabText": "Send Back",
+              "secondTabWidth": 65,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "ver": "0.14.1"
+            },
+            "size": [
+              324,
+              108
+            ],
+            "title": "Low-Sigma Schedule",
+            "type": "ManualSigmas",
+            "widgets_values": [
+              "0.5, 0.421875, 0.0"
+            ]
+          },
+          {
+            "flags": {},
+            "id": 281,
+            "inputs": [
+              {
+                "link": 642,
+                "localized_name": "noise",
+                "name": "noise",
+                "type": "NOISE"
+              },
+              {
+                "link": 636,
+                "localized_name": "guider",
+                "name": "guider",
+                "type": "GUIDER"
+              },
+              {
+                "link": 638,
+                "localized_name": "sampler",
+                "name": "sampler",
+                "type": "SAMPLER"
+              },
+              {
+                "link": 640,
+                "localized_name": "sigmas",
+                "name": "sigmas",
+                "type": "SIGMAS"
+              },
+              {
+                "link": 628,
+                "localized_name": "latent_image",
+                "name": "latent_image",
+                "type": "LATENT"
+              }
+            ],
+            "mode": 0,
+            "order": 14,
+            "outputs": [
+              {
+                "links": [
+                  578
+                ],
+                "localized_name": "output",
+                "name": "output",
+                "type": "LATENT"
+              },
+              {
+                "links": [],
+                "localized_name": "denoised_output",
+                "name": "denoised_output",
+                "type": "LATENT"
+              }
+            ],
+            "pos": [
+              6518.0,
+              5234.0
+            ],
+            "properties": {
+              "Node name for S&R": "SamplerCustomAdvanced",
+              "cnr_id": "comfy-core",
+              "enableTabs": false,
+              "hasSecondTab": false,
+              "secondTabOffset": 80,
+              "secondTabText": "Send Back",
+              "secondTabWidth": 65,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "ver": "0.3.75"
+            },
+            "size": [
+              254.859375,
+              168
+            ],
+            "type": "SamplerCustomAdvanced",
+            "widgets_values": [],
+            "title": "High-Res Low-Sigma Sampler"
+          },
+          {
+            "flags": {},
+            "id": 282,
+            "inputs": [
+              {
+                "link": 630,
+                "localized_name": "model",
+                "name": "model",
+                "type": "MODEL"
+              },
+              {
+                "link": 633,
+                "localized_name": "positive",
+                "name": "positive",
+                "type": "CONDITIONING"
+              },
+              {
+                "link": 634,
+                "localized_name": "negative",
+                "name": "negative",
+                "type": "CONDITIONING"
+              }
+            ],
+            "mode": 0,
+            "order": 21,
+            "outputs": [
+              {
+                "links": [
+                  636
+                ],
+                "localized_name": "GUIDER",
+                "name": "GUIDER",
+                "type": "GUIDER"
+              }
+            ],
+            "pos": [
+              6110.0,
+              5234.0
+            ],
+            "properties": {
+              "Node name for S&R": "CFGGuider",
+              "cnr_id": "comfy-core",
+              "enableTabs": false,
+              "hasSecondTab": false,
+              "secondTabOffset": 80,
+              "secondTabText": "Send Back",
+              "secondTabWidth": 65,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "ver": "0.3.64"
+            },
+            "size": [
+              324,
+              152
+            ],
+            "type": "CFGGuider",
+            "widgets_values": [
+              1
+            ],
+            "title": "High-Res Low-Sigma Guider"
           }
         ],
         "outputNode": {
@@ -3641,8 +4102,8 @@
         "revision": 0,
         "state": {
           "lastGroupId": 26,
-          "lastLinkId": 626,
-          "lastNodeId": 277,
+          "lastLinkId": 642,
+          "lastNodeId": 282,
           "lastRerouteId": 0
         },
         "version": 1,
@@ -4059,8 +4520,8 @@
   },
   "groups": [],
   "id": "07824bbb-6672-4bb0-ac36-4313a519e35b",
-  "last_link_id": 626,
-  "last_node_id": 277,
+  "last_link_id": 642,
+  "last_node_id": 282,
   "links": [
     [
       594,
@@ -4101,7 +4562,7 @@
       "title": "Model Links",
       "type": "MarkdownNote",
       "widgets_values": [
-        "- Huggingface: [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3/)\n- Github: [LTX-2](https://github.com/Lightricks/LTX-2)\n\n## LTX-2.3 I2V With Expert LoRAs\n\nThis workflow is based on ComfyUI's default LTX-2.3 Image-to-Video template, with prompt enhancement removed. The prompt text is encoded directly, and two model-only Expert LoRA slots are chained after the distilled LoRA so both LTX sampling stages use the same expert stack. Defaults are tuned for a realistic 48 GB FP8 run that should stay cache-friendly between generations on a normal ComfyUI setup: 768x512 output, 49 frames, FP8 checkpoint, FP4 text encoder, and tiled VAE decode. This workflow cannot force ComfyUI to keep models resident if your launch flags or memory settings make it unload models; if you still see model reloads between queued runs, lower the output size/length or use ComfyUI normal/high-VRAM settings instead of low-VRAM/offload modes.\n\nUse the Expert LoRA widgets for LoRAs produced by `lora.noise_experts`, for example:\n\n- `lora_weights_low_noise_step_02000.safetensors`\n- `lora_weights_high_noise_step_02000.safetensors`\n\nCopy your trained expert LoRAs into `ComfyUI/models/loras`, then choose the filenames in `expert_lora_1` and `expert_lora_2` and tune each strength. Leave a slot at strength `0.0` if you want to disable it while keeping the workflow wired. If you have extra headroom and the model stack stays resident, raise length to 81 or 97 frames; keep values at `8n + 1`. The original 1280x720, 121-frame two-stage template is not a realistic fast target for 48 GB once extra expert LoRAs are added.\n\n## LTX-2.3 Prompting Tips\n\n1. **Core Actions**: Describe events and actions as they occur over time\n2. **Visual Details**: Describe all visual details you want to appear in the video\n3. **Audio**: Describe sounds and dialogue needed for the scene\n\n## Model Links (for Local Users)\n\n**checkpoints**\n\n- [ltx-2.3-22b-dev-fp8.safetensors](https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors)\n\n**loras**\n\n- [ltx-2.3-22b-distilled-lora-384.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors)\n- Your trained expert LoRAs from ltx-trainer\n\n**latent_upscale_models**\n\n- [ltx-2.3-spatial-upscaler-x2-1.1.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors)\n\n## Model Storage Location\n\n```\nComfyUI/\n├── models/\n│   ├── checkpoints/\n│   │   └── ltx-2.3-22b-dev-fp8.safetensors\n│   ├── loras/\n│   │   ├── ltx-2.3-22b-distilled-lora-384.safetensors\n│   │   ├── lora_weights_low_noise_step_02000.safetensors\n│   │   └── lora_weights_high_noise_step_02000.safetensors\n│   └── latent_upscale_models/\n│       └── ltx-2.3-spatial-upscaler-x2-1.1.safetensors\n```\n\n## Report Issue\n\nNote: Please update ComfyUI first ([guide](https://docs.comfy.org/installation/update_comfyui)) and prepare required models. Desktop/Cloud updates follow stable releases, so some nightly-supported models may not be available yet.\n\n- Cannot run / runtime errors: [ComfyUI/issues](https://github.com/Comfy-Org/ComfyUI/issues)\n- UI / frontend issues: [ComfyUI_frontend/issues](https://github.com/Comfy-Org/ComfyUI_frontend/issues)\n- Workflow issues: [workflow_templates/issues](https://github.com/Comfy-Org/workflow_templates/issues)\n"
+        "- Huggingface: [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3/)\n- Github: [LTX-2](https://github.com/Lightricks/LTX-2)\n\n## LTX-2.3 I2V With Expert LoRAs\n\nThis workflow is based on ComfyUI's default LTX-2.3 Image-to-Video template, with prompt enhancement removed. The prompt text is encoded directly. The distilled LoRA is shared, then the denoising schedule is split into high-sigma and low-sigma sampler passes. Each pass uses exactly one model-only Expert LoRA, so experts are branched by segment rather than stacked globally. Defaults are tuned for a realistic 48 GB FP8 run that should stay cache-friendly between generations on a normal ComfyUI setup: 768x512 output, 49 frames, FP8 checkpoint, FP4 text encoder, and tiled VAE decode. This workflow cannot force ComfyUI to keep models resident if your launch flags or memory settings make it unload models; if you still see model reloads between queued runs, lower the output size/length or use ComfyUI normal/high-VRAM settings instead of low-VRAM/offload modes.\n\nUse the Expert LoRA widgets for LoRAs produced by `lora.noise_experts`, for example:\n\n- `lora_weights_high_noise_step_02000.safetensors` for sigma 1.0 -> 0.5\n- `lora_weights_low_noise_step_02000.safetensors` for sigma 0.5 -> 0.0\n\nCopy your trained expert LoRAs into `ComfyUI/models/loras`, then choose the filenames in `expert_lora_1` and `expert_lora_2` and tune each strength. Leave a slot at strength `0.0` if you want to disable it while keeping the workflow wired. If you have extra headroom and the model stack stays resident, raise length to 81 or 97 frames; keep values at `8n + 1`. The original 1280x720, 121-frame two-stage template is not a realistic fast target for 48 GB once extra expert LoRAs are added.\n\n## LTX-2.3 Prompting Tips\n\n1. **Core Actions**: Describe events and actions as they occur over time\n2. **Visual Details**: Describe all visual details you want to appear in the video\n3. **Audio**: Describe sounds and dialogue needed for the scene\n\n## Model Links (for Local Users)\n\n**checkpoints**\n\n- [ltx-2.3-22b-dev-fp8.safetensors](https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors)\n\n**loras**\n\n- [ltx-2.3-22b-distilled-lora-384.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors)\n- Your trained expert LoRAs from ltx-trainer\n\n**latent_upscale_models**\n\n- [ltx-2.3-spatial-upscaler-x2-1.1.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors)\n\n## Model Storage Location\n\n```\nComfyUI/\n├── models/\n│   ├── checkpoints/\n│   │   └── ltx-2.3-22b-dev-fp8.safetensors\n│   ├── loras/\n│   │   ├── ltx-2.3-22b-distilled-lora-384.safetensors\n│   │   ├── lora_weights_low_noise_step_02000.safetensors\n│   │   └── lora_weights_high_noise_step_02000.safetensors\n│   └── latent_upscale_models/\n│       └── ltx-2.3-spatial-upscaler-x2-1.1.safetensors\n```\n\n## Report Issue\n\nNote: Please update ComfyUI first ([guide](https://docs.comfy.org/installation/update_comfyui)) and prepare required models. Desktop/Cloud updates follow stable releases, so some nightly-supported models may not be available yet.\n\n- Cannot run / runtime errors: [ComfyUI/issues](https://github.com/Comfy-Org/ComfyUI/issues)\n- UI / frontend issues: [ComfyUI_frontend/issues](https://github.com/Comfy-Org/ComfyUI_frontend/issues)\n- Workflow issues: [workflow_templates/issues](https://github.com/Comfy-Org/workflow_templates/issues)\n"
       ]
     },
     {

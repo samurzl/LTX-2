@@ -51,28 +51,48 @@ def test_ltx_2_3_i2v_expert_lora_workflow_uses_fp8_48gb_defaults() -> None:
     assert nodes[251]["widgets_values"][0] == 512
 
 
-def test_ltx_2_3_i2v_expert_lora_workflow_chains_two_model_only_experts() -> None:
+def test_ltx_2_3_i2v_expert_lora_workflow_splits_denoising_by_expert() -> None:
     workflow, subgraph = _load_workflow()
     nodes = {node["id"]: node for node in subgraph["nodes"]}
     links = {link["id"]: link for link in subgraph["links"]}
 
     assert nodes[276]["type"] == "LoraLoaderModelOnly"
-    assert nodes[276]["title"] == "Expert LoRA 1"
-    assert nodes[276]["widgets_values"] == ["lora_weights_low_noise_step_02000.safetensors", 1.0]
+    assert nodes[276]["title"] == "High-Sigma Expert LoRA"
+    assert nodes[276]["widgets_values"] == ["lora_weights_high_noise_step_02000.safetensors", 1.0]
     assert nodes[277]["type"] == "LoraLoaderModelOnly"
-    assert nodes[277]["title"] == "Expert LoRA 2"
-    assert nodes[277]["widgets_values"] == ["lora_weights_high_noise_step_02000.safetensors", 1.0]
+    assert nodes[277]["title"] == "Low-Sigma Expert LoRA"
+    assert nodes[277]["widgets_values"] == ["lora_weights_low_noise_step_02000.safetensors", 1.0]
 
     assert links[520]["origin_id"] == 236
     assert links[520]["target_id"] == 232
     assert links[625]["origin_id"] == 232
     assert links[625]["target_id"] == 276
-    assert links[626]["origin_id"] == 276
+    assert links[626]["origin_id"] == 232
     assert links[626]["target_id"] == 277
-    assert links[478]["origin_id"] == 277
-    assert links[478]["target_id"] == 213
-    assert links[541]["origin_id"] == 277
+
+    assert links[541]["origin_id"] == 276
     assert links[541]["target_id"] == 231
+    assert links[478]["origin_id"] == 276
+    assert links[478]["target_id"] == 213
+    assert links[629]["origin_id"] == 277
+    assert links[629]["target_id"] == 279
+    assert links[630]["origin_id"] == 277
+    assert links[630]["target_id"] == 282
+
+    assert nodes[252]["widgets_values"] == [
+        "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.5"
+    ]
+    assert nodes[211]["widgets_values"] == ["0.85, 0.725, 0.5"]
+    assert nodes[280]["widgets_values"] == ["0.5, 0.421875, 0.0"]
+
+    assert links[627]["origin_id"] == 215
+    assert links[627]["target_id"] == 278
+    assert links[488]["origin_id"] == 278
+    assert links[488]["target_id"] == 217
+    assert links[628]["origin_id"] == 219
+    assert links[628]["target_id"] == 281
+    assert links[578]["origin_id"] == 281
+    assert links[578]["target_id"] == 218
 
     top_node = next(node for node in workflow["nodes"] if node["id"] == 267)
     proxy_widgets = top_node["properties"]["proxyWidgets"]
