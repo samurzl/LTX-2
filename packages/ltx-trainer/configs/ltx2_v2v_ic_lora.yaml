@@ -24,13 +24,14 @@
 # Model Configuration
 # -----------------------------------------------------------------------------
 # Specifies the base model to fine-tune and the training mode.
+# Default two-safetensors setup:
+#   1. model_path: the LTX single-file checkpoint
+#   2. text_encoder_path: the Gemma single-file checkpoint
 model:
-  # Path to the LTX-2 model checkpoint (.safetensors file)
-  # This should be a local path to your downloaded model
+  # Path to the LTX-2 single-file checkpoint (.safetensors)
   model_path: "path/to/ltx-2-model.safetensors"
 
-  # Path to the text encoder .safetensors file or model directory
-  # For LTX-2, this is typically the Gemma-based text encoder
+  # Path to the Gemma single-file checkpoint (.safetensors) or a model directory
   text_encoder_path: "path/to/gemma.safetensors"
 
   # Training mode: "lora" for efficient adapter training, "full" for full fine-tuning

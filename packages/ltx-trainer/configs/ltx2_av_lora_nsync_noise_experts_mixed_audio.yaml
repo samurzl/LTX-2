@@ -28,6 +28,9 @@
 # =============================================================================
 
 model:
+  # Default two-safetensors setup:
+  #   1. model_path: the LTX single-file checkpoint
+  #   2. text_encoder_path: the Gemma single-file checkpoint
   # Set this to null when all required weights are supplied through component_paths below.
   model_path: "/path/to/ltx-2-model.safetensors"
   text_encoder_path: "/path/to/gemma.safetensors"

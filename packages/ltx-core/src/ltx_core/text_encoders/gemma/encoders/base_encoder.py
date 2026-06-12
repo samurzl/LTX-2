@@ -41,8 +41,9 @@ class GemmaTextEncoder(torch.nn.Module):
             (hidden_states, attention_mask) where hidden_states is a tuple of per-layer tensors.
         """
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
-        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
-        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
+        device = _language_model_device(self.model)
+        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=device)
+        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=device)
         outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = outputs.hidden_states
         del outputs
@@ -135,6 +136,25 @@ class GemmaTextEncoder(torch.nn.Module):
 def _load_system_prompt(prompt_name: str) -> str:
     with open(Path(__file__).parent / "prompts" / f"{prompt_name}", "r") as f:
         return f.read()
+
+
+def _language_model_device(model: Gemma3ForConditionalGeneration) -> torch.device:
+    language_model = model.model.language_model
+    for tensor in language_model.parameters():
+        if tensor.device.type != "meta":
+            return tensor.device
+    for tensor in language_model.buffers():
+        if tensor.device.type != "meta":
+            return tensor.device
+
+    fallback_device = model.device
+    if fallback_device.type != "meta":
+        return fallback_device
+
+    raise RuntimeError(
+        "Gemma language weights are still on the meta device. This usually means the Gemma "
+        "safetensors file did not match any supported native key layout."
+    )
 
 
 def _cat_with_padding(

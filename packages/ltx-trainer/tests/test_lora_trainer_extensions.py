@@ -19,6 +19,7 @@ sys.path.insert(0, str(TRAINER_SCRIPTS))
 
 from ltx_core.text_encoders.gemma import (
     DEFAULT_GEMMA_ASSET_SOURCE,
+    GEMMA_LLM_KEY_OPS,
     gemma_weight_paths_from_source,
     module_ops_from_gemma_source,
 )
@@ -89,6 +90,33 @@ def test_gemma_single_file_source_rejects_processor_when_default_disabled(tmp_pa
 
     with pytest.raises(FileNotFoundError, match=DEFAULT_GEMMA_ASSET_SOURCE):
         module_ops_from_gemma_source(gemma_file, allow_default_assets=False)
+
+
+def test_gemma_key_ops_accept_hf_and_comfy_single_file_layouts() -> None:
+    assert (
+        GEMMA_LLM_KEY_OPS.apply_to_key("model.language_model.layers.0.self_attn.q_proj.weight")
+        == "model.model.language_model.layers.0.self_attn.q_proj.weight"
+    )
+    assert (
+        GEMMA_LLM_KEY_OPS.apply_to_key("language_model.model.layers.0.self_attn.q_proj.weight")
+        == "model.model.language_model.layers.0.self_attn.q_proj.weight"
+    )
+    assert (
+        GEMMA_LLM_KEY_OPS.apply_to_key("model.layers.47.self_attn.q_norm.weight")
+        == "model.model.language_model.layers.47.self_attn.q_norm.weight"
+    )
+    assert (
+        GEMMA_LLM_KEY_OPS.apply_to_key("model.embed_tokens.weight")
+        == "model.model.language_model.embed_tokens.weight"
+    )
+    assert GEMMA_LLM_KEY_OPS.apply_to_key("_quantization_metadata") is None
+
+    tensor = torch.zeros(1)
+    mapped = GEMMA_LLM_KEY_OPS.apply_to_key_value("model.model.language_model.embed_tokens.weight", tensor)
+    assert [key for key, _ in mapped] == [
+        "model.model.language_model.embed_tokens.weight",
+        "model.lm_head.weight",
+    ]
 
 
 def test_comfy_negative_workflow_uses_ltxv_nodes() -> None:

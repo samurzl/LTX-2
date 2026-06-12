@@ -228,7 +228,40 @@ def load_text_encoder(
         module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_source(gemma_model_path, include_processor=False)),
     ).build(device=torch_device, dtype=dtype)
 
+    _move_gemma_language_runtime_to_device(text_encoder, torch_device)
+
     return text_encoder
+
+
+def _move_gemma_language_runtime_to_device(text_encoder: "GemmaTextEncoder", device: torch.device) -> None:
+    language_model = text_encoder.model.model.language_model
+    uninitialized = _meta_tensor_names(language_model)
+    if uninitialized:
+        preview = ", ".join(uninitialized[:8])
+        suffix = "" if len(uninitialized) <= 8 else f", ... ({len(uninitialized)} total)"
+        raise RuntimeError(
+            "Gemma language weights were not fully loaded from text_encoder_path. "
+            f"First uninitialized language tensors: {preview}{suffix}. "
+            "Check that the Gemma safetensors file is an LTX/Comfy Gemma3-12B text encoder "
+            "or a Hugging Face Gemma3-12B checkpoint."
+        )
+
+    language_model.to(device)
+
+    lm_head = getattr(text_encoder.model, "lm_head", None)
+    if lm_head is not None and not _meta_tensor_names(lm_head):
+        lm_head.to(device)
+
+
+def _meta_tensor_names(module: torch.nn.Module) -> list[str]:
+    names = []
+    for name, param in module.named_parameters():
+        if param.device.type == "meta":
+            names.append(name)
+    for name, buf in module.named_buffers():
+        if buf.device.type == "meta":
+            names.append(name)
+    return names
 
 
 def load_embeddings_processor(

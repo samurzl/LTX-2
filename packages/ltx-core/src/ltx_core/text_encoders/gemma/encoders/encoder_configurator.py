@@ -104,7 +104,82 @@ def _create_feature_extractor(transformer_config: dict) -> torch.nn.Module:
 # --- Split SDOps: Gemma LLM keys vs Embeddings Processor keys ---
 
 
-def _build_gemma_llm_key_ops(*, transformers_v5: bool) -> SDOps:
+class GemmaLLMKeyOps:
+    """State-dict key mapper for Hugging Face and Comfy Gemma3-12B safetensors.
+
+    The native trainer builds a ``Gemma3ForConditionalGeneration`` wrapper, whose
+    language-model parameters live under ``model.model.language_model.*``. Gemma
+    files in the wild use a few layouts:
+
+    - Hugging Face full model: ``model.language_model.*``
+    - older/split Hugging Face layout: ``language_model.model.*``
+    - Comfy text encoder: ``model.layers.*``, ``model.embed_tokens.*``
+    """
+
+    name = "GEMMA_LLM_KEY_OPS"
+
+    def __init__(self, *, transformers_v5: bool) -> None:
+        self.transformers_v5 = transformers_v5
+
+    def apply_to_key(self, key: str) -> str | None:
+        if key.startswith("language_model.model."):
+            return "model.model.language_model." + key.removeprefix("language_model.model.")
+        if key.startswith("language_model."):
+            return "model.model.language_model." + key.removeprefix("language_model.")
+        if key.startswith("model.language_model."):
+            return "model.model.language_model." + key.removeprefix("model.language_model.")
+
+        # ComfyUI's standalone Gemma3-12B text encoder layout.
+        if key.startswith("model.layers."):
+            return "model.model.language_model.layers." + key.removeprefix("model.layers.")
+        if key.startswith("model.embed_tokens."):
+            return "model.model.language_model.embed_tokens." + key.removeprefix("model.embed_tokens.")
+        if key.startswith("model.norm."):
+            return "model.model.language_model.norm." + key.removeprefix("model.norm.")
+        if key.startswith("model.rotary_emb."):
+            return "model.model.language_model.rotary_emb." + key.removeprefix("model.rotary_emb.")
+
+        if key.startswith("lm_head."):
+            return "model." + key
+
+        vision_key = self._map_vision_key(key)
+        if vision_key is not None:
+            return vision_key
+
+        if key.startswith("multi_modal_projector."):
+            return "model.model.multi_modal_projector." + key.removeprefix("multi_modal_projector.")
+        if key.startswith("model.multi_modal_projector."):
+            return "model.model.multi_modal_projector." + key.removeprefix("model.multi_modal_projector.")
+
+        return None
+
+    def apply_to_key_value(self, key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+        if key == "model.model.language_model.embed_tokens.weight":
+            return [
+                KeyValueOperationResult(key, value),
+                KeyValueOperationResult("model.lm_head.weight", value),
+            ]
+        return [KeyValueOperationResult(key, value)]
+
+    def _map_vision_key(self, key: str) -> str | None:
+        if key.startswith("vision_tower.vision_model."):
+            if self.transformers_v5:
+                return "model.model.vision_tower." + key.removeprefix("vision_tower.vision_model.")
+            return "model.model.vision_tower.vision_model." + key.removeprefix("vision_tower.vision_model.")
+        if key.startswith("vision_tower."):
+            return "model.model.vision_tower." + key.removeprefix("vision_tower.")
+
+        if key.startswith("model.vision_tower.vision_model."):
+            if self.transformers_v5:
+                return "model.model.vision_tower." + key.removeprefix("model.vision_tower.vision_model.")
+            return "model.model.vision_tower.vision_model." + key.removeprefix("model.vision_tower.vision_model.")
+        if key.startswith("model.vision_tower."):
+            return "model.model.vision_tower." + key.removeprefix("model.vision_tower.")
+
+        return None
+
+
+def _build_gemma_llm_key_ops(*, transformers_v5: bool) -> GemmaLLMKeyOps:
     """Build the checkpoint-key remapping for the Gemma multimodal encoder.
     The vision-tower mapping differs between transformers <5 and >=5 because
     upstream PR https://github.com/huggingface/transformers/pull/39847 flattened
@@ -113,32 +188,7 @@ def _build_gemma_llm_key_ops(*, transformers_v5: bool) -> SDOps:
     ``vision_tower.vision_model.*`` prefix, so we strip the inner ``vision_model.``
     when targeting v5 and pass it through unchanged for v4.
     """
-    base = (
-        SDOps("GEMMA_LLM_KEY_OPS")
-        # 1. Map language model layers (note the double .model prefix)
-        .with_matching(prefix="language_model.model.")
-        .with_replacement("language_model.model.", "model.model.language_model.")
-        # 2. Map the Vision Tower (version-dependent — see docstring)
-        .with_matching(prefix="vision_tower.")
-    )
-    if transformers_v5:
-        base = base.with_replacement("vision_tower.vision_model.", "model.model.vision_tower.")
-    else:
-        base = base.with_replacement("vision_tower.", "model.model.vision_tower.")
-    return (
-        base
-        # 3. Map the Multi-Modal Projector
-        .with_matching(prefix="multi_modal_projector.")
-        .with_replacement("multi_modal_projector.", "model.model.multi_modal_projector.")
-        # 4. Duplicate embed_tokens to lm_head (needed for prompt enhancement via generate())
-        .with_kv_operation(
-            operation=lambda key, value: [
-                KeyValueOperationResult(key, value),
-                KeyValueOperationResult("model.lm_head.weight", value),
-            ],
-            key_prefix="model.model.language_model.embed_tokens.weight",
-        )
-    )
+    return GemmaLLMKeyOps(transformers_v5=transformers_v5)
 
 
 GEMMA_LLM_KEY_OPS = _build_gemma_llm_key_ops(transformers_v5=_TRANSFORMERS_V5)
