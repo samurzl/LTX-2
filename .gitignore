@@ -45,5 +45,9 @@ tmp
 !packages/ltx-pipelines/tests/assets/expected_hdr_ic_lora_exr/frame_*.exr
 !packages/ltx-pipelines/tests/assets/hdr_ic_lora_test_input.mp4
 
+# ComfyUI workflow templates
+!packages/ltx-trainer/src/ltx_trainer/comfyui_workflows/
+!packages/ltx-trainer/src/ltx_trainer/comfyui_workflows/*.json
+
 # Binary files
 *.so
