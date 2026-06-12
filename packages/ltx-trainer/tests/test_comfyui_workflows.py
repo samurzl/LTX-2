@@ -87,10 +87,15 @@ def test_ltx_2_3_i2v_expert_lora_workflow_splits_denoising_by_expert() -> None:
 
     assert links[627]["origin_id"] == 215
     assert links[627]["target_id"] == 278
+    assert nodes[283]["type"] == "DisableNoise"
+    assert links[643]["origin_id"] == 283
+    assert links[643]["target_id"] == 278
     assert links[488]["origin_id"] == 278
     assert links[488]["target_id"] == 217
     assert links[628]["origin_id"] == 219
     assert links[628]["target_id"] == 281
+    assert links[644]["origin_id"] == 283
+    assert links[644]["target_id"] == 281
     assert links[578]["origin_id"] == 281
     assert links[578]["target_id"] == 218
 

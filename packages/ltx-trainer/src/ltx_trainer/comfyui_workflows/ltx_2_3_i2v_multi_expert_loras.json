@@ -26,7 +26,7 @@
               3720,
               4260,
               1788,
-              1188
+              1260
             ],
             "color": "#3f789e",
             "flags": {},
@@ -52,7 +52,7 @@
               5650,
               4260,
               2172,
-              1188
+              1260
             ],
             "color": "#3f789e",
             "flags": {},
@@ -1048,16 +1048,16 @@
             "type": "SIGMAS"
           },
           {
-            "id": 641,
-            "origin_id": 237,
+            "id": 643,
+            "origin_id": 283,
             "origin_slot": 0,
             "target_id": 278,
             "target_slot": 0,
             "type": "NOISE"
           },
           {
-            "id": 642,
-            "origin_id": 216,
+            "id": 644,
+            "origin_id": 283,
             "origin_slot": 0,
             "target_id": 281,
             "target_slot": 0,
@@ -1075,8 +1075,7 @@
             "outputs": [
               {
                 "links": [
-                  490,
-                  642
+                  490
                 ],
                 "localized_name": "NOISE",
                 "name": "NOISE",
@@ -1118,8 +1117,7 @@
             "outputs": [
               {
                 "links": [
-                  483,
-                  641
+                  483
                 ],
                 "localized_name": "NOISE",
                 "name": "NOISE",
@@ -3760,7 +3758,7 @@
             "id": 278,
             "inputs": [
               {
-                "link": 641,
+                "link": 643,
                 "localized_name": "noise",
                 "name": "noise",
                 "type": "NOISE"
@@ -3941,7 +3939,7 @@
             "id": 281,
             "inputs": [
               {
-                "link": 642,
+                "link": 644,
                 "localized_name": "noise",
                 "name": "noise",
                 "type": "NOISE"
@@ -4073,6 +4071,47 @@
               1
             ],
             "title": "High-Res Low-Sigma Guider"
+          },
+          {
+            "flags": {},
+            "id": 283,
+            "inputs": [],
+            "mode": 0,
+            "order": 6,
+            "outputs": [
+              {
+                "links": [
+                  643,
+                  644
+                ],
+                "localized_name": "NOISE",
+                "name": "NOISE",
+                "type": "NOISE"
+              }
+            ],
+            "pos": [
+              4230.0,
+              5040.0
+            ],
+            "properties": {
+              "Node name for S&R": "DisableNoise",
+              "cnr_id": "comfy-core",
+              "enableTabs": false,
+              "hasSecondTab": false,
+              "secondTabOffset": 80,
+              "secondTabText": "Send Back",
+              "secondTabWidth": 65,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "ver": "0.3.60"
+            },
+            "size": [
+              324,
+              58
+            ],
+            "title": "No Noise for Continuation Segments",
+            "type": "DisableNoise",
+            "widgets_values": []
           }
         ],
         "outputNode": {
@@ -4102,8 +4141,8 @@
         "revision": 0,
         "state": {
           "lastGroupId": 26,
-          "lastLinkId": 642,
-          "lastNodeId": 282,
+          "lastLinkId": 644,
+          "lastNodeId": 283,
           "lastRerouteId": 0
         },
         "version": 1,
@@ -4520,8 +4559,8 @@
   },
   "groups": [],
   "id": "07824bbb-6672-4bb0-ac36-4313a519e35b",
-  "last_link_id": 642,
-  "last_node_id": 282,
+  "last_link_id": 644,
+  "last_node_id": 283,
   "links": [
     [
       594,
@@ -4562,7 +4601,7 @@
       "title": "Model Links",
       "type": "MarkdownNote",
       "widgets_values": [
-        "- Huggingface: [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3/)\n- Github: [LTX-2](https://github.com/Lightricks/LTX-2)\n\n## LTX-2.3 I2V With Expert LoRAs\n\nThis workflow is based on ComfyUI's default LTX-2.3 Image-to-Video template, with prompt enhancement removed. The prompt text is encoded directly. The distilled LoRA is shared, then the denoising schedule is split into high-sigma and low-sigma sampler passes. Each pass uses exactly one model-only Expert LoRA, so experts are branched by segment rather than stacked globally. Defaults are tuned for a realistic 48 GB FP8 run that should stay cache-friendly between generations on a normal ComfyUI setup: 768x512 output, 49 frames, FP8 checkpoint, FP4 text encoder, and tiled VAE decode. This workflow cannot force ComfyUI to keep models resident if your launch flags or memory settings make it unload models; if you still see model reloads between queued runs, lower the output size/length or use ComfyUI normal/high-VRAM settings instead of low-VRAM/offload modes.\n\nUse the Expert LoRA widgets for LoRAs produced by `lora.noise_experts`, for example:\n\n- `lora_weights_high_noise_step_02000.safetensors` for sigma 1.0 -> 0.5\n- `lora_weights_low_noise_step_02000.safetensors` for sigma 0.5 -> 0.0\n\nCopy your trained expert LoRAs into `ComfyUI/models/loras`, then choose the filenames in `expert_lora_1` and `expert_lora_2` and tune each strength. Leave a slot at strength `0.0` if you want to disable it while keeping the workflow wired. If you have extra headroom and the model stack stays resident, raise length to 81 or 97 frames; keep values at `8n + 1`. The original 1280x720, 121-frame two-stage template is not a realistic fast target for 48 GB once extra expert LoRAs are added.\n\n## LTX-2.3 Prompting Tips\n\n1. **Core Actions**: Describe events and actions as they occur over time\n2. **Visual Details**: Describe all visual details you want to appear in the video\n3. **Audio**: Describe sounds and dialogue needed for the scene\n\n## Model Links (for Local Users)\n\n**checkpoints**\n\n- [ltx-2.3-22b-dev-fp8.safetensors](https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors)\n\n**loras**\n\n- [ltx-2.3-22b-distilled-lora-384.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors)\n- Your trained expert LoRAs from ltx-trainer\n\n**latent_upscale_models**\n\n- [ltx-2.3-spatial-upscaler-x2-1.1.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors)\n\n## Model Storage Location\n\n```\nComfyUI/\n├── models/\n│   ├── checkpoints/\n│   │   └── ltx-2.3-22b-dev-fp8.safetensors\n│   ├── loras/\n│   │   ├── ltx-2.3-22b-distilled-lora-384.safetensors\n│   │   ├── lora_weights_low_noise_step_02000.safetensors\n│   │   └── lora_weights_high_noise_step_02000.safetensors\n│   └── latent_upscale_models/\n│       └── ltx-2.3-spatial-upscaler-x2-1.1.safetensors\n```\n\n## Report Issue\n\nNote: Please update ComfyUI first ([guide](https://docs.comfy.org/installation/update_comfyui)) and prepare required models. Desktop/Cloud updates follow stable releases, so some nightly-supported models may not be available yet.\n\n- Cannot run / runtime errors: [ComfyUI/issues](https://github.com/Comfy-Org/ComfyUI/issues)\n- UI / frontend issues: [ComfyUI_frontend/issues](https://github.com/Comfy-Org/ComfyUI_frontend/issues)\n- Workflow issues: [workflow_templates/issues](https://github.com/Comfy-Org/workflow_templates/issues)\n"
+        "- Huggingface: [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3/)\n- Github: [LTX-2](https://github.com/Lightricks/LTX-2)\n\n## LTX-2.3 I2V With Expert LoRAs\n\nThis workflow is based on ComfyUI's default LTX-2.3 Image-to-Video template, with prompt enhancement removed. The prompt text is encoded directly. The distilled LoRA is shared, then the denoising schedule is split into high-sigma and low-sigma sampler passes. Each pass uses exactly one model-only Expert LoRA, so experts are branched by segment rather than stacked globally. Only the first sampler in each split denoising pair receives RandomNoise; continuation samplers use DisableNoise so they refine the existing latent instead of injecting fresh noise at the segment boundary. Defaults are tuned for a realistic 48 GB FP8 run that should stay cache-friendly between generations on a normal ComfyUI setup: 768x512 output, 49 frames, FP8 checkpoint, FP4 text encoder, and tiled VAE decode. This workflow cannot force ComfyUI to keep models resident if your launch flags or memory settings make it unload models; if you still see model reloads between queued runs, lower the output size/length or use ComfyUI normal/high-VRAM settings instead of low-VRAM/offload modes.\n\nUse the Expert LoRA widgets for LoRAs produced by `lora.noise_experts`, for example:\n\n- `lora_weights_high_noise_step_02000.safetensors` for sigma 1.0 -> 0.5\n- `lora_weights_low_noise_step_02000.safetensors` for sigma 0.5 -> 0.0\n\nCopy your trained expert LoRAs into `ComfyUI/models/loras`, then choose the filenames in `expert_lora_1` and `expert_lora_2` and tune each strength. Leave a slot at strength `0.0` if you want to disable it while keeping the workflow wired. If you have extra headroom and the model stack stays resident, raise length to 81 or 97 frames; keep values at `8n + 1`. The original 1280x720, 121-frame two-stage template is not a realistic fast target for 48 GB once extra expert LoRAs are added.\n\n## LTX-2.3 Prompting Tips\n\n1. **Core Actions**: Describe events and actions as they occur over time\n2. **Visual Details**: Describe all visual details you want to appear in the video\n3. **Audio**: Describe sounds and dialogue needed for the scene\n\n## Model Links (for Local Users)\n\n**checkpoints**\n\n- [ltx-2.3-22b-dev-fp8.safetensors](https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors)\n\n**loras**\n\n- [ltx-2.3-22b-distilled-lora-384.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors)\n- Your trained expert LoRAs from ltx-trainer\n\n**latent_upscale_models**\n\n- [ltx-2.3-spatial-upscaler-x2-1.1.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors)\n\n## Model Storage Location\n\n```\nComfyUI/\n├── models/\n│   ├── checkpoints/\n│   │   └── ltx-2.3-22b-dev-fp8.safetensors\n│   ├── loras/\n│   │   ├── ltx-2.3-22b-distilled-lora-384.safetensors\n│   │   ├── lora_weights_low_noise_step_02000.safetensors\n│   │   └── lora_weights_high_noise_step_02000.safetensors\n│   └── latent_upscale_models/\n│       └── ltx-2.3-spatial-upscaler-x2-1.1.safetensors\n```\n\n## Report Issue\n\nNote: Please update ComfyUI first ([guide](https://docs.comfy.org/installation/update_comfyui)) and prepare required models. Desktop/Cloud updates follow stable releases, so some nightly-supported models may not be available yet.\n\n- Cannot run / runtime errors: [ComfyUI/issues](https://github.com/Comfy-Org/ComfyUI/issues)\n- UI / frontend issues: [ComfyUI_frontend/issues](https://github.com/Comfy-Org/ComfyUI_frontend/issues)\n- Workflow issues: [workflow_templates/issues](https://github.com/Comfy-Org/workflow_templates/issues)\n"
       ]
     },
     {
