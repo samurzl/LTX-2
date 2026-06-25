@@ -43,6 +43,54 @@ from ltx_trainer.validation_sampler import GenerationConfig, ValidationSampler
 from ltx_trainer.video_utils import read_video, save_video
 
 
+def validate_safetensors_file(parser: argparse.ArgumentParser, label: str, path: str | None) -> Path | None:
+    if path is None:
+        return None
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        parser.error(f"{label} not found: {resolved}")
+    if resolved.suffix != ".safetensors":
+        parser.error(f"{label} must have a .safetensors extension: {resolved}")
+    return resolved
+
+
+def validate_existing_file_or_dir(parser: argparse.ArgumentParser, label: str, path: str) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        parser.error(f"{label} not found: {resolved}")
+    if not resolved.is_file() and not resolved.is_dir():
+        parser.error(f"{label} must be a file or directory: {resolved}")
+    return resolved
+
+
+def validate_existing_file(parser: argparse.ArgumentParser, label: str, path: str | None) -> Path | None:
+    if path is None:
+        return None
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        parser.error(f"{label} not found: {resolved}")
+    return resolved
+
+
+def validate_output_path(parser: argparse.ArgumentParser, label: str, path: str | None) -> Path | None:
+    if path is None:
+        return None
+    resolved = Path(path).expanduser()
+    parent = resolved.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if not parent.is_dir():
+        parser.error(f"{label} parent is not a directory: {parent}")
+    probe_path = parent / ".ltx_preflight_write_test"
+    try:
+        probe_path.write_text("ok", encoding="utf-8")
+    except OSError as e:
+        parser.error(f"{label} parent is not writable: {parent} ({e})")
+    finally:
+        if probe_path.exists():
+            probe_path.unlink()
+    return resolved
+
+
 def load_image(image_path: str) -> torch.Tensor:
     """Load an image and convert to tensor [C, H, W] in [0, 1]."""
     image = open_image_as_srgb(image_path)
@@ -286,6 +334,27 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     # Validate arguments
     generate_audio = not args.skip_audio
+    validate_safetensors_file(parser, "Checkpoint", args.checkpoint)
+    validate_existing_file_or_dir(parser, "Text encoder path", args.text_encoder_path)
+    validate_safetensors_file(parser, "LoRA checkpoint", args.lora_path)
+    validate_existing_file(parser, "Condition image", args.condition_image)
+    validate_existing_file(parser, "Reference video", args.reference_video)
+    validate_output_path(parser, "Output path", args.output)
+    validate_output_path(parser, "Audio output path", args.audio_output)
+    if args.width % 32 != 0:
+        parser.error("--width must be divisible by 32")
+    if args.height % 32 != 0:
+        parser.error("--height must be divisible by 32")
+    if args.num_frames % 8 != 1:
+        parser.error("--num-frames must satisfy num_frames % 8 == 1")
+    if args.frame_rate <= 0:
+        parser.error("--frame-rate must be > 0")
+    if args.num_inference_steps <= 0:
+        parser.error("--num-inference-steps must be > 0")
+    if args.guidance_scale < 1.0:
+        parser.error("--guidance-scale must be >= 1")
+    if args.stg_scale < 0.0:
+        parser.error("--stg-scale must be >= 0")
 
     print("=" * 80)
     print("LTX Video/Audio Generation")

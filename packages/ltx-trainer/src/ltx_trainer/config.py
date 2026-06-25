@@ -166,6 +166,15 @@ class NsyncConfig(ConfigBaseModel):
         ge=0.0,
     )
 
+    anchor_strength: float = Field(
+        default=1.0,
+        description=(
+            "Strength of the NSYNC positive-anchor projection. 0.0 disables the anchor pass, "
+            "1.0 follows the paper's full anchor projection, and values above 1.0 amplify it."
+        ),
+        ge=0.0,
+    )
+
     projection_scope: Literal["layer", "parameter"] = Field(
         default="layer",
         description="Gradient projection granularity. 'layer' groups by transformer block.",
@@ -269,26 +278,31 @@ class OptimizationConfig(ConfigBaseModel):
     learning_rate: float = Field(
         default=5e-4,
         description="Learning rate for optimization",
+        gt=0.0,
     )
 
     steps: int = Field(
         default=3000,
         description="Number of training steps",
+        gt=0,
     )
 
     batch_size: int = Field(
         default=2,
         description="Batch size for training",
+        gt=0,
     )
 
     gradient_accumulation_steps: int = Field(
         default=1,
         description="Number of steps to accumulate gradients",
+        gt=0,
     )
 
     max_grad_norm: float = Field(
         default=1.0,
         description="Maximum gradient norm for clipping",
+        ge=0.0,
     )
 
     optimizer_type: Literal["adamw", "adamw8bit"] = Field(

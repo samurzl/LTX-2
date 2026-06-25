@@ -4,7 +4,7 @@
 #
 # This example enables the new advanced LoRA trainer features together:
 #   - two noise-level LoRA experts (low_noise and high_noise)
-#   - NSYNC layer-wise gradient projection with synthetic negative videos
+#   - NSYNC layer-wise gradient projection with synthetic negative videos and positive anchors
 #   - mixed audio/no-audio training
 #   - optional Comfy-style per-component checkpoint paths
 #
@@ -68,6 +68,9 @@ lora:
     # 1.0 is the default full projection. Lower values soften the negative push;
     # 0.0 disables it, and values above 1.0 push farther away.
     negative_strength: 1.0
+    # Paper-style anchor projection. The trainer samples another positive example
+    # as the anchor and adds the positive-gradient projection onto that anchor.
+    anchor_strength: 1.0
     projection_scope: "layer"
     eps: 1.0e-12
 

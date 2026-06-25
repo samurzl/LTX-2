@@ -14,6 +14,7 @@ class ConfigFingerprint(BaseModel):
     lora_noise_experts: dict[str, tuple[float, float]] | None = None
     nsync_enabled: bool = False
     nsync_negative_strength: float = 1.0
+    nsync_anchor_strength: float = 0.0
 
 
 class RngStates(BaseModel):

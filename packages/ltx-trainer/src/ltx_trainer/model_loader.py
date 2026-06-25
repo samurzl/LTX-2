@@ -44,6 +44,26 @@ def _to_torch_device(device: Device) -> torch.device:
     return torch.device(device) if isinstance(device, str) else device
 
 
+def _validate_safetensors_checkpoint(label: str, path: str | Path) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        raise FileNotFoundError(f"{label} not found: {resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"{label} must be a .safetensors file: {resolved}")
+    if resolved.suffix != ".safetensors":
+        raise ValueError(f"{label} must have a .safetensors extension: {resolved}")
+    return resolved
+
+
+def _validate_existing_file_or_dir(label: str, path: str | Path) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        raise FileNotFoundError(f"{label} not found: {resolved}")
+    if not resolved.is_file() and not resolved.is_dir():
+        raise ValueError(f"{label} must be a file or directory: {resolved}")
+    return resolved
+
+
 def _read_safetensors_header(path: str | Path) -> dict[str, dict]:
     with Path(path).open("rb") as f:
         header_size = struct.unpack("<Q", f.read(8))[0]
@@ -84,7 +104,7 @@ def _build_scaled_fp8_dequant_sd_ops(checkpoint_path: str | Path, base_sd_ops: "
 
     scales: dict[str, torch.Tensor] = {}
     with safe_open(str(checkpoint_path), framework="pt", device="cpu") as f:
-        for key in f.keys():
+        for key in f.keys():  # noqa: SIM118 - safe_open is not iterable.
             if not _is_weight_or_bias_scale_key(key):
                 continue
             parent_raw_key = key.removesuffix("_scale")
@@ -491,8 +511,7 @@ def load_model(  # noqa: PLR0913
 
     # Validate checkpoint exists when used as a component fallback.
     if checkpoint_path is not None:
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint_path = _validate_safetensors_checkpoint("Checkpoint", checkpoint_path)
         logger.info(f"Loading LTX-2 model from {checkpoint_path}")
     else:
         logger.info("Loading LTX-2 model from per-component checkpoint paths")
@@ -506,45 +525,65 @@ def load_model(  # noqa: PLR0913
             return checkpoint_path
         raise ValueError(f"{component_name} path must be provided when checkpoint_path is not set")
 
+    transformer_checkpoint_path = _component_path("transformer", transformer_path)
+    video_vae_encoder_checkpoint_path = (
+        _component_path("video_vae_encoder", video_vae_encoder_path) if with_video_vae_encoder else None
+    )
+    video_vae_decoder_checkpoint_path = (
+        _component_path("video_vae_decoder", video_vae_decoder_path) if with_video_vae_decoder else None
+    )
+    audio_vae_decoder_checkpoint_path = (
+        _component_path("audio_vae_decoder", audio_vae_decoder_path) if with_audio_vae_decoder else None
+    )
+    vocoder_checkpoint_path = _component_path("vocoder", vocoder_path) if with_vocoder else None
+
+    requested_component_paths = [
+        ("Transformer checkpoint", transformer_checkpoint_path),
+        ("Video VAE encoder checkpoint", video_vae_encoder_checkpoint_path),
+        ("Video VAE decoder checkpoint", video_vae_decoder_checkpoint_path),
+        ("Audio VAE decoder checkpoint", audio_vae_decoder_checkpoint_path),
+        ("Vocoder checkpoint", vocoder_checkpoint_path),
+    ]
+    for label, path in requested_component_paths:
+        if path is not None:
+            _validate_safetensors_checkpoint(label, path)
+
+    if with_text_encoder:
+        if text_encoder_path is None:
+            raise ValueError("text_encoder_path must be provided when with_text_encoder=True")
+        _validate_existing_file_or_dir("Text encoder path", text_encoder_path)
+
     # Load transformer
     logger.debug("Loading transformer...")
-    transformer = load_transformer(_component_path("transformer", transformer_path), torch_device, dtype)
+    transformer = load_transformer(transformer_checkpoint_path, torch_device, dtype)
 
     # Load video VAE encoder
     video_vae_encoder = None
     if with_video_vae_encoder:
         logger.debug("Loading video VAE encoder...")
-        video_vae_encoder = load_video_vae_encoder(
-            _component_path("video_vae_encoder", video_vae_encoder_path), torch_device, dtype
-        )
+        video_vae_encoder = load_video_vae_encoder(video_vae_encoder_checkpoint_path, torch_device, dtype)
 
     # Load video VAE decoder
     video_vae_decoder = None
     if with_video_vae_decoder:
         logger.debug("Loading video VAE decoder...")
-        video_vae_decoder = load_video_vae_decoder(
-            _component_path("video_vae_decoder", video_vae_decoder_path), torch_device, dtype
-        )
+        video_vae_decoder = load_video_vae_decoder(video_vae_decoder_checkpoint_path, torch_device, dtype)
 
     # Load audio VAE decoder
     audio_vae_decoder = None
     if with_audio_vae_decoder:
         logger.debug("Loading audio VAE decoder...")
-        audio_vae_decoder = load_audio_vae_decoder(
-            _component_path("audio_vae_decoder", audio_vae_decoder_path), torch_device, dtype
-        )
+        audio_vae_decoder = load_audio_vae_decoder(audio_vae_decoder_checkpoint_path, torch_device, dtype)
 
     # Load vocoder
     vocoder = None
     if with_vocoder:
         logger.debug("Loading vocoder...")
-        vocoder = load_vocoder(_component_path("vocoder", vocoder_path), torch_device, dtype)
+        vocoder = load_vocoder(vocoder_checkpoint_path, torch_device, dtype)
 
     # Load text encoder
     text_encoder = None
     if with_text_encoder:
-        if text_encoder_path is None:
-            raise ValueError("text_encoder_path must be provided when with_text_encoder=True")
         logger.debug("Loading Gemma text encoder...")
         text_encoder = load_text_encoder(text_encoder_path, torch_device, dtype)
 

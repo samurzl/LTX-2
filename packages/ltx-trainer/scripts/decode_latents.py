@@ -47,6 +47,42 @@ app = typer.Typer(
 )
 
 
+def _validate_safetensors_file(label: str, path: str) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise typer.BadParameter(f"{label} not found: {resolved}")
+    if resolved.suffix != ".safetensors":
+        raise typer.BadParameter(f"{label} must have a .safetensors extension: {resolved}")
+    return resolved
+
+
+def _validate_device(device: str) -> None:
+    try:
+        torch_device = torch.device(device)
+    except Exception as e:
+        raise typer.BadParameter(f"Invalid device: {device}") from e
+
+    if torch_device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise typer.BadParameter("CUDA device requested but CUDA is not available")
+        if torch_device.index is not None and torch_device.index >= torch.cuda.device_count():
+            raise typer.BadParameter(
+                f"CUDA device index {torch_device.index} is unavailable; found {torch.cuda.device_count()} device(s)"
+            )
+
+
+def _validate_output_dir_writable(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not output_dir.is_dir():
+        raise typer.BadParameter(f"Output path is not a directory: {output_dir}")
+    probe_path = output_dir / ".ltx_preflight_write_test"
+    try:
+        probe_path.write_text("ok", encoding="utf-8")
+    finally:
+        if probe_path.exists():
+            probe_path.unlink()
+
+
 class LatentsDecoder:
     def __init__(
         self,
@@ -346,23 +382,33 @@ def main(
     if not latents_path.exists() or not latents_path.is_dir():
         raise typer.BadParameter(f"Latents directory does not exist: {latents_path}")
 
+    _validate_safetensors_file("Model checkpoint", model_path)
+    _validate_device(device)
+    _validate_output_dir_writable(output_path)
+
+    latent_files = list(latents_path.rglob("*.pt"))
+    if not latent_files:
+        logger.warning(f"No .pt files found in {latents_path}")
+        return
+
+    audio_path = Path(audio_latents_dir) if audio_latents_dir else latents_path.parent / "audio_latents"
+    decode_audio = with_audio and audio_path.exists()
+    if with_audio and not decode_audio:
+        logger.warning(f"Audio latents directory not found: {audio_path}")
+
     decoder = LatentsDecoder(
         model_path=model_path,
         device=device,
         vae_tiling=vae_tiling,
-        with_audio=with_audio,
+        with_audio=decode_audio,
     )
     decoder.decode(latents_path, output_path, seed=seed)
 
     # Decode audio if requested
-    if with_audio:
-        audio_path = Path(audio_latents_dir) if audio_latents_dir else latents_path.parent / "audio_latents"
-
-        if audio_path.exists():
-            audio_output_path = output_path.parent / "decoded_audio"
-            decoder.decode_audio(audio_path, audio_output_path)
-        else:
-            logger.warning(f"Audio latents directory not found: {audio_path}")
+    if decode_audio:
+        audio_output_path = output_path.parent / "decoded_audio"
+        _validate_output_dir_writable(audio_output_path)
+        decoder.decode_audio(audio_path, audio_output_path)
 
 
 if __name__ == "__main__":

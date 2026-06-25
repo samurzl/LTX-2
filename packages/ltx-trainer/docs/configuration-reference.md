@@ -96,6 +96,7 @@ lora:
   nsync:
     enabled: false
     negative_strength: 1.0
+    anchor_strength: 1.0
 ```
 
 **Key parameters:**
@@ -126,9 +127,9 @@ one Comfy-compatible LoRA per expert, for example `lora_weights_low_noise_step_0
 
 #### NSYNC
 
-NSYNC trains with paired positive and synthetic negative latents. The trainer computes positive and negative gradients
-separately, then projects the positive gradient away from the negative gradient before the optimizer step. Projection is
-layer-wise by default, grouped by transformer block.
+NSYNC trains with positive, synthetic negative, and positive anchor examples. The trainer computes the gradients
+separately, then updates with `positive - negative_projection + anchor_projection` before the optimizer step, matching
+the paper's CTOA variant. Projection is layer-wise by default, grouped by transformer block.
 
 ```yaml
 lora:
@@ -136,11 +137,15 @@ lora:
     enabled: true
     negative_latents_dir: "negative_latents"
     negative_strength: 1.0
+    anchor_strength: 1.0
     projection_scope: "layer"
 ```
 
 Use `negative_strength` to tune how much of the negative-gradient projection is applied: `0.0` disables the negative
 push, `1.0` keeps the default full projection, and values above `1.0` push farther away from the negative direction.
+Use `anchor_strength` to tune the positive anchor projection: `0.0` restores the old two-pass NSYNC behavior, while
+`1.0` follows the paper's full anchor projection. Anchor samples are drawn from the existing positive dataset and use
+their own text conditions, so no separate anchor directory is required.
 NSYNC currently supports `training_mode: "lora"` with the `text_to_video` strategy.
 
 #### Understanding Target Modules

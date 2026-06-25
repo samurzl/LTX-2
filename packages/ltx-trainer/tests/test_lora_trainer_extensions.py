@@ -9,7 +9,10 @@ from typing import Protocol
 
 import pytest
 import torch
+import yaml
+from pydantic import ValidationError
 from safetensors.torch import save_file
+from typer.testing import CliRunner
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CORE_SRC = REPO_ROOT / "packages" / "ltx-core" / "src"
@@ -32,8 +35,10 @@ from ltx_trainer.comfy_negative_backend import (
     build_ltxv_negative_workflow,
     comfy_latent_bytes_to_trainer_payload,
 )
-from ltx_trainer.config import ModelConfig, LoraConfig
+import train as train_script
+from ltx_trainer.config import LoraConfig, LtxTrainerConfig, ModelConfig
 from ltx_trainer.datasets import (
+    AnchorSampleDataset,
     OptionalSourceGroupedBatchSampler,
     PrecomputedDataset,
     collate_precomputed_samples,
@@ -63,6 +68,42 @@ def _write_lora_checkpoint(
     return path
 
 
+def _write_preflight_dataset(root: Path, *, sample_count: int = 1, include_negative: bool = False) -> Path:
+    precomputed_root = root / ".precomputed"
+    for directory in ("latents", "conditions"):
+        (precomputed_root / directory).mkdir(parents=True)
+    if include_negative:
+        (precomputed_root / "negative_latents").mkdir(parents=True)
+
+    for idx in range(sample_count):
+        name = f"sample_{idx}.pt"
+        (precomputed_root / "latents" / name).write_bytes(b"")
+        (precomputed_root / "conditions" / name).write_bytes(b"")
+        if include_negative:
+            (precomputed_root / "negative_latents" / name).write_bytes(b"")
+
+    return root
+
+
+def _write_preflight_file(path: Path) -> str:
+    path.write_bytes(b"")
+    return str(path)
+
+
+def _base_preflight_config(tmp_path: Path, *, sample_count: int = 1) -> LtxTrainerConfig:
+    model_path = _write_preflight_file(tmp_path / "model.safetensors")
+    text_encoder_path = _write_preflight_file(tmp_path / "gemma.safetensors")
+    data_root = _write_preflight_dataset(tmp_path / "data", sample_count=sample_count)
+
+    return LtxTrainerConfig(
+        model={"model_path": model_path, "text_encoder_path": text_encoder_path, "training_mode": "lora"},
+        lora={"rank": 8, "alpha": 8, "target_modules": ["to_q"]},
+        data={"preprocessed_data_root": str(data_root), "num_dataloader_workers": 0},
+        validation={"prompts": [], "interval": None, "generate_audio": False},
+        output_dir=str(tmp_path / "outputs"),
+    )
+
+
 def _lora_rank_config(
     checkpoint_path: Path,
     rank: int,
@@ -85,6 +126,10 @@ def test_noise_expert_config_rejects_overlaps() -> None:
         LoraConfig(noise_experts={"low": (0.0, 0.6), "high": (0.5, 1.0)})
 
 
+def test_nsync_config_uses_anchor_projection_by_default() -> None:
+    assert LoraConfig(nsync={"enabled": True}).nsync.anchor_strength == 1.0
+
+
 def test_component_paths_can_replace_base_model_path() -> None:
     config = ModelConfig(
         model_path=None,
@@ -101,6 +146,156 @@ def test_component_paths_can_replace_base_model_path() -> None:
 
     with pytest.raises(ValueError, match="component paths must be provided"):
         ModelConfig(model_path=None, component_paths={"transformer": "/comfy/diffusion_model.safetensors"})
+
+
+def test_trainer_preflight_accepts_valid_monolithic_config(tmp_path: Path) -> None:
+    config = _base_preflight_config(tmp_path)
+
+    result = LtxvTrainer.preflight_config(config)
+
+    assert result.checkpoint_path is None
+    assert result.resume_state is None
+
+
+def test_trainer_preflight_accepts_split_components_without_unused_audio(tmp_path: Path) -> None:
+    data_root = _write_preflight_dataset(tmp_path / "data")
+    transformer = _write_preflight_file(tmp_path / "transformer.safetensors")
+    embeddings_processor = _write_preflight_file(tmp_path / "embeddings_processor.safetensors")
+    video_vae = _write_preflight_file(tmp_path / "video_vae.safetensors")
+
+    config = LtxTrainerConfig(
+        model={
+            "model_path": None,
+            "training_mode": "lora",
+            "component_paths": {
+                "transformer": transformer,
+                "embeddings_processor": embeddings_processor,
+                "video_vae_decoder": video_vae,
+            },
+        },
+        lora={"rank": 8, "alpha": 8, "target_modules": ["to_q"]},
+        data={"preprocessed_data_root": str(data_root), "num_dataloader_workers": 0},
+        validation={"prompts": [], "interval": None, "generate_audio": False},
+        output_dir=str(tmp_path / "outputs"),
+    )
+
+    result = LtxvTrainer.preflight_config(config)
+
+    assert result.checkpoint_path is None
+
+
+def test_trainer_preflight_requires_used_split_audio_components(tmp_path: Path) -> None:
+    data_root = _write_preflight_dataset(tmp_path / "data")
+    transformer = _write_preflight_file(tmp_path / "transformer.safetensors")
+    embeddings_processor = _write_preflight_file(tmp_path / "embeddings_processor.safetensors")
+    video_vae = _write_preflight_file(tmp_path / "video_vae.safetensors")
+    audio_vae = _write_preflight_file(tmp_path / "audio_vae.safetensors")
+
+    config = LtxTrainerConfig(
+        model={
+            "model_path": None,
+            "training_mode": "lora",
+            "component_paths": {
+                "transformer": transformer,
+                "embeddings_processor": embeddings_processor,
+                "video_vae_decoder": video_vae,
+                "audio_vae_decoder": audio_vae,
+            },
+        },
+        lora={"rank": 8, "alpha": 8, "target_modules": ["to_q"]},
+        data={"preprocessed_data_root": str(data_root), "num_dataloader_workers": 0},
+        validation={"prompts": [], "interval": None, "generate_audio": True},
+        output_dir=str(tmp_path / "outputs"),
+    )
+
+    with pytest.raises(ValueError, match="vocoder"):
+        LtxvTrainer.preflight_config(config)
+
+
+def test_trainer_preflight_rejects_missing_dataset_source(tmp_path: Path) -> None:
+    config = _base_preflight_config(tmp_path)
+    conditions_dir = Path(config.data.preprocessed_data_root) / ".precomputed" / "conditions"
+    for sample in conditions_dir.glob("*.pt"):
+        sample.unlink()
+    conditions_dir.rmdir()
+
+    with pytest.raises(FileNotFoundError, match="conditions"):
+        LtxvTrainer.preflight_config(config)
+
+
+def test_trainer_preflight_rejects_empty_dataset(tmp_path: Path) -> None:
+    config = _base_preflight_config(tmp_path)
+    for sample in (Path(config.data.preprocessed_data_root) / ".precomputed" / "latents").glob("*.pt"):
+        sample.unlink()
+
+    with pytest.raises(ValueError, match="No data files"):
+        LtxvTrainer.preflight_config(config)
+
+
+def test_trainer_preflight_rejects_single_sample_anchor_training(tmp_path: Path) -> None:
+    model_path = _write_preflight_file(tmp_path / "model.safetensors")
+    text_encoder_path = _write_preflight_file(tmp_path / "gemma.safetensors")
+    data_root = _write_preflight_dataset(tmp_path / "data", sample_count=1, include_negative=True)
+
+    config = LtxTrainerConfig(
+        model={"model_path": model_path, "text_encoder_path": text_encoder_path, "training_mode": "lora"},
+        lora={
+            "rank": 8,
+            "alpha": 8,
+            "target_modules": ["to_q"],
+            "nsync": {"enabled": True, "negative_strength": 0.0, "anchor_strength": 1.0},
+        },
+        data={"preprocessed_data_root": str(data_root), "num_dataloader_workers": 0},
+        validation={"prompts": [], "interval": None, "generate_audio": False},
+        output_dir=str(tmp_path / "outputs"),
+    )
+
+    with pytest.raises(ValueError, match="at least two positive samples"):
+        LtxvTrainer.preflight_config(config)
+
+
+def test_trainer_preflight_rejects_bad_output_dir(tmp_path: Path) -> None:
+    config = _base_preflight_config(tmp_path)
+    output_file = tmp_path / "not_a_dir"
+    output_file.write_text("occupied", encoding="utf-8")
+    config.output_dir = str(output_file)
+
+    with pytest.raises(FileExistsError):
+        LtxvTrainer.preflight_config(config)
+
+
+def test_optimization_config_rejects_non_positive_values(tmp_path: Path) -> None:
+    config = _base_preflight_config(tmp_path)
+    data = config.model_dump()
+    data["optimization"]["learning_rate"] = 0.0
+
+    with pytest.raises(ValidationError, match="greater than 0"):
+        LtxTrainerConfig(**data)
+
+
+def test_trainer_preflight_rejects_invalid_scheduler_params(tmp_path: Path) -> None:
+    config = _base_preflight_config(tmp_path)
+    config.optimization.scheduler_params = {"not_a_scheduler_arg": 1}
+
+    with pytest.raises(ValueError, match="Unknown scheduler_params"):
+        LtxvTrainer.preflight_config(config)
+
+
+def test_train_cli_preflight_runs_before_trainer_construction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_preflight_config(tmp_path)
+    config.data.preprocessed_data_root = str(tmp_path / "missing_data")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config.model_dump()), encoding="utf-8")
+
+    def fail_if_constructed(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("trainer constructor should not run after preflight failure")
+
+    monkeypatch.setattr(train_script.LtxvTrainer, "__init__", fail_if_constructed)
+
+    result = CliRunner().invoke(train_script.app, [str(config_path)])
+
+    assert result.exit_code == 1
+    assert "Preflight validation failed" in result.output
 
 
 def test_gemma_single_file_source_resolves_weights_and_tokenizer_ops(tmp_path: Path) -> None:
@@ -188,8 +383,6 @@ def test_comfy_negative_workflow_uses_ltxv_nodes() -> None:
 
 
 def test_comfy_latent_bytes_convert_to_trainer_payload(tmp_path: Path) -> None:
-    from safetensors.torch import save_file
-
     latent_file = tmp_path / "sample.latent"
     save_file(
         {
@@ -209,8 +402,6 @@ def test_comfy_latent_bytes_convert_to_trainer_payload(tmp_path: Path) -> None:
 
 
 def test_transformer_loader_folds_scaled_fp8_weights(tmp_path: Path) -> None:
-    from safetensors.torch import save_file
-
     checkpoint = tmp_path / "ltx_fp8.safetensors"
     save_file(
         {
@@ -364,6 +555,58 @@ def test_optional_audio_dataset_keeps_video_only_samples(tmp_path: Path) -> None
     assert collated["audio_latents"] is None
 
 
+def test_anchor_dataset_adds_different_positive_sample(tmp_path: Path) -> None:
+    root = tmp_path / ".precomputed"
+    for directory in ("latents", "conditions"):
+        (root / directory).mkdir(parents=True)
+
+    for idx, name in enumerate(("a.pt", "b.pt")):
+        latent = {
+            "latents": torch.full((1, 1, 1, 1), float(idx)),
+            "num_frames": 1,
+            "height": 1,
+            "width": 1,
+        }
+        conditions = {
+            "prompt_embeds": torch.full((2, 4), float(idx)),
+            "prompt_attention_mask": torch.ones(2, dtype=torch.bool),
+        }
+        torch.save(latent, root / "latents" / name)
+        torch.save(conditions, root / "conditions" / name)
+
+    dataset = AnchorSampleDataset(PrecomputedDataset(str(tmp_path), data_sources=["latents", "conditions"]))
+    sample = dataset[0]
+
+    assert sample["idx"] == 0
+    assert sample["anchor_idx"] == 1
+    assert sample["latents"]["latents"].item() == 0.0
+    assert sample["anchor_latents"]["latents"].item() == 1.0
+    assert sample["anchor_conditions"]["prompt_embeds"][0, 0].item() == 1.0
+
+
+def test_anchor_dataset_requires_two_positive_samples(tmp_path: Path) -> None:
+    root = tmp_path / ".precomputed"
+    for directory in ("latents", "conditions"):
+        (root / directory).mkdir(parents=True)
+
+    latent = {
+        "latents": torch.zeros(1, 1, 1, 1),
+        "num_frames": 1,
+        "height": 1,
+        "width": 1,
+    }
+    conditions = {
+        "prompt_embeds": torch.zeros(2, 4),
+        "prompt_attention_mask": torch.ones(2, dtype=torch.bool),
+    }
+    torch.save(latent, root / "latents" / "a.pt")
+    torch.save(conditions, root / "conditions" / "a.pt")
+
+    dataset = PrecomputedDataset(str(tmp_path), data_sources=["latents", "conditions"])
+    with pytest.raises(ValueError, match="at least two positive samples"):
+        AnchorSampleDataset(dataset)
+
+
 def test_audio_activity_threshold_rejects_silence_and_accepts_signal() -> None:
     silent = torch.zeros(2, 16_000)
     signal = torch.zeros(2, 16_000)
@@ -418,12 +661,31 @@ def test_nsync_negative_strength_scales_projection() -> None:
     assert torch.allclose(p.grad, torch.tensor([1.5, 1.0]))
 
 
+def test_nsync_anchor_projection_is_added() -> None:
+    p = torch.nn.Parameter(torch.zeros(2))
+    p.grad = torch.tensor([1.0, 1.0])
+    negative_grads = {p: torch.tensor([1.0, 0.0])}
+    anchor_grads = {p: torch.tensor([0.0, 1.0])}
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(
+        lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12, negative_strength=1.0, anchor_strength=1.0))
+    )
+    trainer._gradient_projection_groups = {"all": [p]}
+
+    trainer._apply_nsync_projection(negative_grads, anchor_grads)
+
+    assert torch.allclose(p.grad, torch.tensor([0.0, 2.0]))
+
+
 def test_nsync_zero_negative_strength_skips_negative_batch_requirement() -> None:
     backward_losses: list[torch.Tensor] = []
 
     trainer = object.__new__(LtxvTrainer)
     trainer._accelerator = SimpleNamespace(backward=lambda loss: backward_losses.append(loss.detach()))
-    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12, negative_strength=0.0)))
+    trainer._config = SimpleNamespace(
+        lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12, negative_strength=0.0, anchor_strength=0.0))
+    )
     trainer._training_step = lambda batch, timestep_sampler: SimpleNamespace(  # noqa: ARG005
         loss=torch.ones(1, requires_grad=True),
         sigma=torch.ones(1),
@@ -448,7 +710,7 @@ def test_nsync_reuses_processed_conditions_without_second_backward_error() -> No
         def create_embeddings(
             self,
             video_features: torch.Tensor,
-            audio_features: torch.Tensor | None,
+            _audio_features: torch.Tensor | None,
             _additive_attention_mask: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
             batch_size, seq_len = video_features.shape[:2]
@@ -460,7 +722,13 @@ def test_nsync_reuses_processed_conditions_without_second_backward_error() -> No
             super().__init__()
             self.weight = torch.nn.Parameter(torch.ones(()))
 
-        def forward(self, *, video: SimpleNamespace, audio: None, perturbations: None) -> tuple[torch.Tensor, None]:
+        def forward(
+            self,
+            *,
+            video: SimpleNamespace,
+            audio: None,  # noqa: ARG002
+            perturbations: None,  # noqa: ARG002
+        ) -> tuple[torch.Tensor, None]:
             return video.context * self.weight, None
 
     class FakeStrategy:

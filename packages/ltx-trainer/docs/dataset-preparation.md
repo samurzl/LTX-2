@@ -126,9 +126,11 @@ uv run python scripts/process_dataset.py dataset.json \
 
 ### With NSYNC Synthetic Negatives
 
-For NSYNC training, the trainer expects a generated negative video latent for each positive caption. The full
-preprocessing script writes those latents directly with one-stage distilled-LoRA sampling, reusing the caption
-embeddings from `conditions/` and avoiding intermediate MP4 decode/re-encode work:
+For NSYNC training, the trainer expects a generated negative video latent for each positive caption. It samples the
+positive anchor from the existing positive dataset during training, using that anchor sample's own caption embeddings,
+so no separate anchor directory is needed. The full preprocessing script writes the negative latents directly with
+one-stage distilled-LoRA sampling, reusing the caption embeddings from `conditions/` and avoiding intermediate MP4
+decode/re-encode work:
 
 ```bash
 uv run python scripts/process_dataset.py dataset.json \

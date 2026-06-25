@@ -20,7 +20,15 @@ from typing import TYPE_CHECKING
 import typer
 from decode_latents import LatentsDecoder
 from process_captions import CaptionsDataset, compute_captions_embeddings
-from process_videos import _atomic_save, compute_latents, compute_scaled_resolution_buckets, parse_resolution_buckets
+from process_videos import (
+    _atomic_save,
+    _validate_device,
+    _validate_output_dir_writable,
+    _validate_safetensors_file,
+    compute_latents,
+    compute_scaled_resolution_buckets,
+    parse_resolution_buckets,
+)
 from rich.console import Console
 
 from ltx_core.quantization import QuantizationPolicy
@@ -38,6 +46,15 @@ app = typer.Typer(
     help="Preprocess a video dataset by computing video clips latents and text captions embeddings. "
     "The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.",
 )
+
+
+def _validate_existing_file_or_dir(label: str, path: str) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        raise typer.BadParameter(f"{label} not found: {resolved}")
+    if not resolved.is_file() and not resolved.is_dir():
+        raise typer.BadParameter(f"{label} must be a file or directory: {resolved}")
+    return resolved
 
 
 def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
@@ -87,6 +104,22 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
 
     # Set up output directories
     output_base = Path(output_dir) if output_dir else Path(dataset_file).parent / ".precomputed"
+    _validate_safetensors_file("Model checkpoint", model_path)
+    _validate_existing_file_or_dir("Text encoder path", text_encoder_path)
+    _validate_device(device)
+    _validate_output_dir_writable(str(output_base))
+    if reference_column and reference_downscale_factor > 1 and len(resolution_buckets) > 1:
+        raise ValueError(
+            "When using --reference-downscale-factor > 1, only a single resolution bucket is supported. "
+            "Using multiple buckets with scaled references can cause ambiguous bucket matching."
+        )
+    if reference_column:
+        compute_scaled_resolution_buckets(resolution_buckets, reference_downscale_factor)
+    if generate_negatives:
+        if negative_distilled_lora is None:
+            raise ValueError("negative_distilled_lora is required when generate_negatives=True")
+        _validate_safetensors_file("Distilled LoRA", negative_distilled_lora)
+
     conditions_dir = output_base / "conditions"
     latents_dir = output_base / "latents"
 
@@ -438,7 +471,7 @@ def generate_negative_latents(  # noqa: PLR0913, PLR0915
             )
 
 
-def generate_negative_latents_comfy(  # noqa: PLR0913, PLR0915
+def generate_negative_latents_comfy(  # noqa: PLR0913
     dataset_file: str,
     caption_column: str,
     media_column: str,
@@ -845,6 +878,18 @@ def main(  # noqa: PLR0913
         raise typer.BadParameter("--negative-quantization must be one of: auto, none, fp8-cast, fp8-scaled-mm")
     if comfy_timeout_seconds <= 0:
         raise typer.BadParameter("--comfy-timeout-seconds must be > 0")
+    if reference_column and reference_downscale_factor > 1 and len(parsed_resolution_buckets) > 1:
+        raise typer.BadParameter("--reference-downscale-factor > 1 supports only one resolution bucket")
+    if reference_column:
+        compute_scaled_resolution_buckets(parsed_resolution_buckets, reference_downscale_factor)
+
+    _validate_safetensors_file("Model checkpoint", model_path)
+    _validate_existing_file_or_dir("Text encoder path", text_encoder_path)
+    _validate_device(device)
+    output_base = Path(output_dir) if output_dir else Path(dataset_path).parent / ".precomputed"
+    _validate_output_dir_writable(str(output_base))
+    if generate_negatives and negative_distilled_lora is not None:
+        _validate_safetensors_file("Distilled LoRA", negative_distilled_lora)
 
     preprocess_dataset(
         dataset_file=dataset_path,

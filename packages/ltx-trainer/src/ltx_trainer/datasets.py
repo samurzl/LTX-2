@@ -344,6 +344,39 @@ class PrecomputedDataset(Dataset):
         return data
 
 
+class AnchorSampleDataset(Dataset):
+    """Augment each sample with a second positive sample used as the NSYNC anchor."""
+
+    def __init__(self, dataset: PrecomputedDataset) -> None:
+        if len(dataset) < 2:
+            raise ValueError("NSYNC anchor training requires at least two positive samples")
+
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        sample = self.dataset[index]
+        anchor_index = self._sample_anchor_index(index)
+        anchor_sample = self.dataset[anchor_index]
+
+        sample["anchor_latents"] = anchor_sample["latents"]
+        sample["anchor_conditions"] = anchor_sample["conditions"]
+        sample["anchor_idx"] = anchor_sample["idx"]
+        return sample
+
+    def has_source(self, output_key: str, index: int) -> bool:
+        """Delegate optional-source grouping to the wrapped dataset."""
+        return self.dataset.has_source(output_key, index)
+
+    def _sample_anchor_index(self, index: int) -> int:
+        anchor_index = int(torch.randint(0, len(self.dataset) - 1, ()).item())
+        if anchor_index >= index:
+            anchor_index += 1
+        return anchor_index
+
+
 def collate_precomputed_samples(samples: list[dict]) -> dict:
     """Collate precomputed samples while allowing homogeneous None values."""
     result = {}

@@ -55,7 +55,13 @@ def main(
         typer.echo(f"Error: Invalid configuration data: {e}")
         raise typer.Exit(code=1) from e
 
-    trainer = LtxvTrainer(trainer_config)
+    try:
+        preflight_result = LtxvTrainer.preflight_config(trainer_config)
+    except Exception as e:
+        typer.echo(f"Error: Preflight validation failed: {e}")
+        raise typer.Exit(code=1) from e
+
+    trainer = LtxvTrainer(trainer_config, preflight_result=preflight_result)
     trainer.train(disable_progress_bars=disable_progress_bars)
 
 

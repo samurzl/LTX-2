@@ -86,6 +86,54 @@ app = typer.Typer(
 )
 
 
+def _validate_safetensors_file(label: str, path: str) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise typer.BadParameter(f"{label} not found: {resolved}")
+    if resolved.suffix != ".safetensors":
+        raise typer.BadParameter(f"{label} must have a .safetensors extension: {resolved}")
+    return resolved
+
+
+def _validate_existing_file_or_dir(label: str, path: str) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        raise typer.BadParameter(f"{label} not found: {resolved}")
+    if not resolved.is_file() and not resolved.is_dir():
+        raise typer.BadParameter(f"{label} must be a file or directory: {resolved}")
+    return resolved
+
+
+def _validate_device(device: str) -> None:
+    try:
+        torch_device = torch.device(device)
+    except Exception as e:
+        raise typer.BadParameter(f"Invalid device: {device}") from e
+
+    if torch_device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise typer.BadParameter("CUDA device requested but CUDA is not available")
+        if torch_device.index is not None and torch_device.index >= torch.cuda.device_count():
+            raise typer.BadParameter(
+                f"CUDA device index {torch_device.index} is unavailable; found {torch.cuda.device_count()} device(s)"
+            )
+
+
+def _validate_output_dir_writable(output_dir: str) -> Path:
+    output_path = Path(output_dir).expanduser()
+    output_path.mkdir(parents=True, exist_ok=True)
+    if not output_path.is_dir():
+        raise typer.BadParameter(f"Output path is not a directory: {output_path}")
+
+    probe_path = output_path / ".ltx_preflight_write_test"
+    try:
+        probe_path.write_text("ok", encoding="utf-8")
+    finally:
+        if probe_path.exists():
+            probe_path.unlink()
+    return output_path
+
+
 class CaptionsDataset(Dataset):
     """
     Dataset for processing text captions only.
@@ -463,6 +511,11 @@ def main(  # noqa: PLR0913
     # Validate dataset file
     if not Path(dataset_file).is_file():
         raise typer.BadParameter(f"Dataset file not found: {dataset_file}")
+
+    _validate_safetensors_file("Model checkpoint", model_path)
+    _validate_existing_file_or_dir("Text encoder path", text_encoder_path)
+    _validate_device(device)
+    _validate_output_dir_writable(output_dir)
 
     if lora_trigger:
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')

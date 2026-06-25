@@ -1,4 +1,5 @@
 import contextlib
+import importlib.util
 import math
 import os
 import re
@@ -36,7 +37,12 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
-from ltx_trainer.datasets import OptionalSourceGroupedBatchSampler, PrecomputedDataset, collate_precomputed_samples
+from ltx_trainer.datasets import (
+    AnchorSampleDataset,
+    OptionalSourceGroupedBatchSampler,
+    PrecomputedDataset,
+    collate_precomputed_samples,
+)
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
@@ -100,9 +106,312 @@ class NoiseExpert:
     sampler: TimestepSampler
 
 
+@dataclass(frozen=True)
+class TrainerPreflightResult:
+    """Cheap startup checks that can be reused during trainer initialization."""
+
+    checkpoint_path: Path | None = None
+    resume_state: tuple[int, TrainingState | None] | None = None
+
+
 class LtxvTrainer:
-    def __init__(self, trainer_config: LtxTrainerConfig) -> None:
+    @classmethod
+    def preflight_config(cls, trainer_config: LtxTrainerConfig) -> TrainerPreflightResult:
+        """Run cheap validation before model/text/dataloader-heavy initialization."""
+        cls._preflight_optimization_config(trainer_config)
+        cls._preflight_model_paths(trainer_config)
+        cls._preflight_output_dir(trainer_config)
+        cls._preflight_dataset(trainer_config)
+
+        checkpoint_path = cls._preflight_checkpoint(trainer_config)
+        resume_state = None
+        if checkpoint_path is not None:
+            resume_state = cls._resolve_resume_state_from_checkpoint(trainer_config, checkpoint_path)
+
+        return TrainerPreflightResult(checkpoint_path=checkpoint_path, resume_state=resume_state)
+
+    @classmethod
+    def _preflight_optimization_config(cls, trainer_config: LtxTrainerConfig) -> None:
+        opt_cfg = trainer_config.optimization
+        scheduler_type = opt_cfg.scheduler_type
+        params = opt_cfg.scheduler_params or {}
+
+        allowed_params = {
+            "constant": set(),
+            "linear": {"start_factor", "end_factor", "last_epoch"},
+            "cosine": {"eta_min", "last_epoch"},
+            "cosine_with_restarts": {"T_0", "T_mult", "eta_min", "last_epoch"},
+            "polynomial": {"power", "last_epoch"},
+            "step": {"step_size", "gamma", "last_epoch"},
+        }[scheduler_type]
+
+        unknown = sorted(set(params) - allowed_params)
+        if unknown:
+            unknown_list = ", ".join(unknown)
+            raise ValueError(f"Unknown scheduler_params for scheduler_type={scheduler_type!r}: {unknown_list}")
+
+        if scheduler_type == "linear":
+            cls._validate_number_param(params, "start_factor", gt=0.0, le=1.0)
+            cls._validate_number_param(params, "end_factor", ge=0.0)
+        elif scheduler_type == "cosine":
+            cls._validate_number_param(params, "eta_min", ge=0.0)
+        elif scheduler_type == "cosine_with_restarts":
+            cls._validate_int_param(params, "T_0", gt=0)
+            cls._validate_int_param(params, "T_mult", ge=1)
+            cls._validate_number_param(params, "eta_min", ge=0.0)
+        elif scheduler_type == "polynomial":
+            cls._validate_number_param(params, "power", gt=0.0)
+        elif scheduler_type == "step":
+            cls._validate_int_param(params, "step_size", gt=0)
+            cls._validate_number_param(params, "gamma", ge=0.0)
+
+        cls._validate_int_param(params, "last_epoch", ge=-1)
+
+    @staticmethod
+    def _validate_number_param(
+        params: Mapping[str, Any],
+        name: str,
+        *,
+        gt: float | None = None,
+        ge: float | None = None,
+        le: float | None = None,
+    ) -> None:
+        if name not in params:
+            return
+        value = params[name]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"scheduler_params.{name} must be a number")
+        if gt is not None and value <= gt:
+            raise ValueError(f"scheduler_params.{name} must be > {gt}")
+        if ge is not None and value < ge:
+            raise ValueError(f"scheduler_params.{name} must be >= {ge}")
+        if le is not None and value > le:
+            raise ValueError(f"scheduler_params.{name} must be <= {le}")
+
+    @staticmethod
+    def _validate_int_param(
+        params: Mapping[str, Any],
+        name: str,
+        *,
+        gt: int | None = None,
+        ge: int | None = None,
+    ) -> None:
+        if name not in params:
+            return
+        value = params[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"scheduler_params.{name} must be an integer")
+        if gt is not None and value <= gt:
+            raise ValueError(f"scheduler_params.{name} must be > {gt}")
+        if ge is not None and value < ge:
+            raise ValueError(f"scheduler_params.{name} must be >= {ge}")
+
+    @classmethod
+    def _preflight_model_paths(cls, trainer_config: LtxTrainerConfig) -> None:
+        model_cfg = trainer_config.model
+        if model_cfg.model_path is not None:
+            cls._require_safetensors_file("model.model_path", model_cfg.model_path)
+
+        component_paths = model_cfg.component_paths
+        for name in (
+            "transformer",
+            "embeddings_processor",
+            "video_vae",
+            "video_vae_encoder",
+            "video_vae_decoder",
+            "audio_vae",
+            "audio_vae_encoder",
+            "audio_vae_decoder",
+            "vocoder",
+        ):
+            path = getattr(component_paths, name)
+            if path is not None:
+                cls._require_safetensors_file(f"model.component_paths.{name}", path)
+
+        text_encoder_path = component_paths.text_encoder or model_cfg.text_encoder_path
+        if text_encoder_path is not None:
+            text_encoder_path = cls._require_existing_file_or_dir("model.text_encoder_path", text_encoder_path)
+        elif trainer_config.validation.prompts:
+            raise ValueError("model.text_encoder_path or model.component_paths.text_encoder is required for validation")
+
+        if trainer_config.acceleration.load_text_encoder_in_8bit:
+            if text_encoder_path is None:
+                raise ValueError("load_text_encoder_in_8bit requires a text encoder directory")
+            if not text_encoder_path.is_dir():
+                raise ValueError(
+                    "load_text_encoder_in_8bit currently requires model.text_encoder_path to be a directory"
+                )
+            if importlib.util.find_spec("bitsandbytes") is None:
+                raise ValueError("load_text_encoder_in_8bit requires bitsandbytes to be installed")
+
+        training_strategy = get_training_strategy(trainer_config.training_strategy)
+        need_vae_encoder = (
+            trainer_config.validation.images is not None or trainer_config.validation.reference_videos is not None
+        )
+        load_audio = training_strategy.requires_audio or trainer_config.validation.generate_audio
+
+        required_component_paths = [
+            ("model.component_paths.transformer", cls._component_path_for_config(trainer_config, "transformer")),
+            (
+                "model.component_paths.embeddings_processor",
+                cls._component_path_for_config(trainer_config, "embeddings_processor"),
+            ),
+            (
+                "model.component_paths.video_vae_decoder",
+                cls._video_vae_component_path_for_config(trainer_config, "decoder"),
+            ),
+        ]
+        if need_vae_encoder:
+            required_component_paths.append(
+                (
+                    "model.component_paths.video_vae_encoder",
+                    cls._video_vae_component_path_for_config(trainer_config, "encoder"),
+                )
+            )
+        if load_audio:
+            required_component_paths.extend(
+                [
+                    (
+                        "model.component_paths.audio_vae_decoder",
+                        cls._audio_vae_component_path_for_config(trainer_config, "decoder"),
+                    ),
+                    ("model.component_paths.vocoder", cls._component_path_for_config(trainer_config, "vocoder")),
+                ]
+            )
+
+        for label, path in required_component_paths:
+            cls._require_safetensors_file(label, path)
+
+    @classmethod
+    def _preflight_dataset(cls, trainer_config: LtxTrainerConfig) -> None:
+        training_strategy = get_training_strategy(trainer_config.training_strategy)
+        data_sources = training_strategy.get_data_sources()
+        optional_data_sources = set(training_strategy.get_optional_data_sources())
+
+        if cls._config_nsync_requires_negatives(trainer_config):
+            if isinstance(data_sources, list):
+                data_sources = {source: source for source in data_sources}
+            data_sources[trainer_config.lora.nsync.negative_latents_dir] = "negative_latents"
+
+        dataset = PrecomputedDataset(
+            trainer_config.data.preprocessed_data_root,
+            data_sources=data_sources,
+            optional_data_sources=optional_data_sources,
+        )
+
+        if cls._config_nsync_requires_anchor(trainer_config) and len(dataset) < 2:
+            raise ValueError("NSYNC anchor training requires at least two positive samples")
+
+    @staticmethod
+    def _preflight_output_dir(trainer_config: LtxTrainerConfig) -> None:
+        output_dir = Path(trainer_config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if not output_dir.is_dir():
+            raise ValueError(f"output_dir is not a directory: {output_dir}")
+
+        probe_path = output_dir / ".ltx_preflight_write_test"
+        try:
+            probe_path.write_text("ok", encoding="utf-8")
+        finally:
+            if probe_path.exists():
+                probe_path.unlink()
+
+    @classmethod
+    def _preflight_checkpoint(cls, trainer_config: LtxTrainerConfig) -> Path | None:
+        if not trainer_config.model.load_checkpoint:
+            return None
+
+        checkpoint_path = cls._find_checkpoint(trainer_config.model.load_checkpoint)
+        if checkpoint_path is None:
+            logger.warning(f"⚠️ Could not find checkpoint at {trainer_config.model.load_checkpoint}")
+        return checkpoint_path
+
+    @staticmethod
+    def _expand_path(path: str | Path) -> Path:
+        return Path(path).expanduser()
+
+    @classmethod
+    def _require_existing_file_or_dir(cls, label: str, path: str | Path) -> Path:
+        resolved = cls._expand_path(path)
+        if not resolved.exists():
+            raise FileNotFoundError(f"{label} does not exist: {resolved}")
+        if not resolved.is_file() and not resolved.is_dir():
+            raise ValueError(f"{label} must be a file or directory: {resolved}")
+        return resolved
+
+    @classmethod
+    def _require_safetensors_file(cls, label: str, path: str | Path) -> Path:
+        resolved = cls._expand_path(path)
+        if not resolved.exists():
+            raise FileNotFoundError(f"{label} does not exist: {resolved}")
+        if not resolved.is_file():
+            raise ValueError(f"{label} must be a .safetensors file: {resolved}")
+        if resolved.suffix != ".safetensors":
+            raise ValueError(f"{label} must have a .safetensors extension: {resolved}")
+        return resolved
+
+    @staticmethod
+    def _component_path_for_config(trainer_config: LtxTrainerConfig, name: str) -> str | Path:
+        path = getattr(trainer_config.model.component_paths, name)
+        if path is not None:
+            return path
+        if trainer_config.model.model_path is not None:
+            return trainer_config.model.model_path
+        raise ValueError(f"model.component_paths.{name} or model.model_path must be provided")
+
+    @staticmethod
+    def _video_vae_component_path_for_config(
+        trainer_config: LtxTrainerConfig,
+        direction: Literal["encoder", "decoder"],
+    ) -> str | Path:
+        paths = trainer_config.model.component_paths
+        specific = paths.video_vae_encoder if direction == "encoder" else paths.video_vae_decoder
+        path = specific or paths.video_vae
+        if path is not None:
+            return path
+        if trainer_config.model.model_path is not None:
+            return trainer_config.model.model_path
+        raise ValueError(
+            f"model.component_paths.video_vae_{direction}, model.component_paths.video_vae, "
+            "or model.model_path must be provided"
+        )
+
+    @staticmethod
+    def _audio_vae_component_path_for_config(
+        trainer_config: LtxTrainerConfig,
+        direction: Literal["encoder", "decoder"],
+    ) -> str | Path:
+        paths = trainer_config.model.component_paths
+        specific = paths.audio_vae_encoder if direction == "encoder" else paths.audio_vae_decoder
+        path = specific or paths.audio_vae
+        if path is not None:
+            return path
+        if trainer_config.model.model_path is not None:
+            return trainer_config.model.model_path
+        raise ValueError(
+            f"model.component_paths.audio_vae_{direction}, model.component_paths.audio_vae, "
+            "or model.model_path must be provided"
+        )
+
+    @staticmethod
+    def _config_nsync_enabled(trainer_config: LtxTrainerConfig) -> bool:
+        return trainer_config.lora is not None and trainer_config.lora.nsync.enabled
+
+    @classmethod
+    def _config_nsync_requires_negatives(cls, trainer_config: LtxTrainerConfig) -> bool:
+        return cls._config_nsync_enabled(trainer_config) and trainer_config.lora.nsync.negative_strength > 0.0
+
+    @classmethod
+    def _config_nsync_requires_anchor(cls, trainer_config: LtxTrainerConfig) -> bool:
+        return cls._config_nsync_enabled(trainer_config) and trainer_config.lora.nsync.anchor_strength > 0.0
+
+    def __init__(
+        self,
+        trainer_config: LtxTrainerConfig,
+        preflight_result: TrainerPreflightResult | None = None,
+    ) -> None:
         self._config = trainer_config
+        self._preflight_result = preflight_result
         self._loaded_checkpoint_path: Path | None = None
         self._resolve_lora_rank_from_checkpoint()
         if IS_MAIN_PROCESS:
@@ -367,8 +676,24 @@ class LtxvTrainer:
         return self._config.lora is not None and self._config.lora.nsync.enabled
 
     @property
+    def _nsync_negative_strength(self) -> float:
+        if self._config.lora is None:
+            return 0.0
+        return self._config.lora.nsync.negative_strength
+
+    @property
+    def _nsync_anchor_strength(self) -> float:
+        if self._config.lora is None:
+            return 0.0
+        return getattr(self._config.lora.nsync, "anchor_strength", 0.0)
+
+    @property
     def _nsync_requires_negatives(self) -> bool:
-        return self._nsync_enabled and self._config.lora.nsync.negative_strength > 0.0
+        return self._nsync_enabled and self._nsync_negative_strength > 0.0
+
+    @property
+    def _nsync_requires_anchor(self) -> bool:
+        return self._nsync_enabled and self._nsync_anchor_strength > 0.0
 
     def _training_step(
         self,
@@ -425,28 +750,44 @@ class LtxvTrainer:
         timestep_sampler: TimestepSampler,
     ) -> TrainingStepOutput:
         """Run NSYNC positive/negative gradient projection for one micro-batch."""
-        if self._config.lora.nsync.negative_strength <= 0.0:
+        if self._nsync_negative_strength <= 0.0 and self._nsync_anchor_strength <= 0.0:
             positive_output = self._training_step(batch, timestep_sampler)
             self._accelerator.backward(positive_output.loss.mean())
             return positive_output
 
-        if batch.get("negative_latents") is None:
-            raise ValueError("NSYNC is enabled, but the batch does not contain negative_latents")
-
         accumulated_grads = self._clone_current_grads()
+        negative_grads: dict[torch.nn.Parameter, Tensor] = {}
+        anchor_grads: dict[torch.nn.Parameter, Tensor] = {}
 
-        self._clear_trainable_grads()
-        negative_batch = dict(batch)
-        negative_batch["latents"] = batch["negative_latents"]
-        negative_batch["_force_video_only"] = True
-        negative_output = self._training_step(negative_batch, timestep_sampler)
-        self._accelerator.backward(negative_output.loss.mean())
-        negative_grads = self._clone_current_grads()
+        if self._nsync_negative_strength > 0.0:
+            if batch.get("negative_latents") is None:
+                raise ValueError("NSYNC is enabled, but the batch does not contain negative_latents")
+
+            self._clear_trainable_grads()
+            negative_batch = dict(batch)
+            negative_batch["latents"] = batch["negative_latents"]
+            negative_batch["_force_video_only"] = True
+            negative_output = self._training_step(negative_batch, timestep_sampler)
+            self._accelerator.backward(negative_output.loss.mean())
+            negative_grads = self._clone_current_grads()
+
+        if self._nsync_anchor_strength > 0.0:
+            if batch.get("anchor_latents") is None or batch.get("anchor_conditions") is None:
+                raise ValueError("NSYNC anchor training is enabled, but the batch does not contain anchor data")
+
+            self._clear_trainable_grads()
+            anchor_batch = dict(batch)
+            anchor_batch["latents"] = batch["anchor_latents"]
+            anchor_batch["conditions"] = batch["anchor_conditions"]
+            anchor_batch["_force_video_only"] = True
+            anchor_output = self._training_step(anchor_batch, timestep_sampler)
+            self._accelerator.backward(anchor_output.loss.mean())
+            anchor_grads = self._clone_current_grads()
 
         self._clear_trainable_grads()
         positive_output = self._training_step(batch, timestep_sampler)
         self._accelerator.backward(positive_output.loss.mean())
-        self._apply_nsync_projection(negative_grads)
+        self._apply_nsync_projection(negative_grads, anchor_grads)
         self._add_grads(accumulated_grads)
 
         return positive_output
@@ -468,36 +809,62 @@ class LtxvTrainer:
             else:
                 param.grad.add_(grad.to(device=param.grad.device, dtype=param.grad.dtype))
 
-    def _apply_nsync_projection(self, negative_grads: dict[torch.nn.Parameter, Tensor]) -> None:
-        """Project positive gradients away from negative gradients per configured group."""
+    def _apply_nsync_projection(
+        self,
+        negative_grads: dict[torch.nn.Parameter, Tensor],
+        anchor_grads: dict[torch.nn.Parameter, Tensor] | None = None,
+    ) -> None:
+        """Refine positive gradients with negative and anchor projections per configured group."""
         eps = self._config.lora.nsync.eps
-        negative_strength = self._config.lora.nsync.negative_strength
-        if negative_strength <= 0.0:
+        negative_strength = self._nsync_negative_strength
+        anchor_strength = self._nsync_anchor_strength if anchor_grads else 0.0
+        anchor_grads = anchor_grads or {}
+        if negative_strength <= 0.0 and anchor_strength <= 0.0:
             return
 
         for params in self._gradient_projection_groups.values():
-            dot = None
-            denom = None
-            for param in params:
-                if param.grad is None or param not in negative_grads:
-                    continue
-                pos_grad = param.grad.detach().float()
-                neg_grad = negative_grads[param].to(device=param.grad.device).float()
-                group_dot = torch.sum(pos_grad * neg_grad)
-                group_denom = torch.sum(neg_grad * neg_grad)
-                dot = group_dot if dot is None else dot + group_dot
-                denom = group_denom if denom is None else denom + group_denom
-
-            if dot is None or denom is None or denom.item() <= 0.0:
+            negative_scale = (
+                self._nsync_projection_scale(params, negative_grads, eps) if negative_strength > 0.0 else None
+            )
+            anchor_scale = self._nsync_projection_scale(params, anchor_grads, eps) if anchor_strength > 0.0 else None
+            if negative_scale is None and anchor_scale is None:
                 continue
 
-            scale = dot / (denom + eps)
             for param in params:
-                if param.grad is None or param not in negative_grads:
+                if param.grad is None:
                     continue
-                neg_grad = negative_grads[param].to(device=param.grad.device, dtype=param.grad.dtype)
-                projection = scale.to(device=param.grad.device, dtype=param.grad.dtype) * neg_grad
-                param.grad.sub_(negative_strength * projection)
+                if negative_scale is not None and param in negative_grads:
+                    neg_grad = negative_grads[param].to(device=param.grad.device, dtype=param.grad.dtype)
+                    projection = negative_scale.to(device=param.grad.device, dtype=param.grad.dtype) * neg_grad
+                    param.grad.sub_(negative_strength * projection)
+                if anchor_scale is not None and param in anchor_grads:
+                    anchor_grad = anchor_grads[param].to(device=param.grad.device, dtype=param.grad.dtype)
+                    projection = anchor_scale.to(device=param.grad.device, dtype=param.grad.dtype) * anchor_grad
+                    param.grad.add_(anchor_strength * projection)
+
+    @staticmethod
+    def _nsync_projection_scale(
+        params: list[torch.nn.Parameter],
+        reference_grads: dict[torch.nn.Parameter, Tensor],
+        eps: float,
+    ) -> Tensor | None:
+        """Return the group projection scale of positive gradients onto reference gradients."""
+        dot = None
+        denom = None
+        for param in params:
+            if param.grad is None or param not in reference_grads:
+                continue
+            pos_grad = param.grad.detach().float()
+            ref_grad = reference_grads[param].to(device=param.grad.device).float()
+            group_dot = torch.sum(pos_grad * ref_grad)
+            group_denom = torch.sum(ref_grad * ref_grad)
+            dot = group_dot if dot is None else dot + group_dot
+            denom = group_denom if denom is None else denom + group_denom
+
+        if dot is None or denom is None or denom.item() <= 0.0:
+            return None
+
+        return dot / (denom + eps)
 
     @property
     def _text_encoder_path(self) -> str | Path:
@@ -549,22 +916,14 @@ class LtxvTrainer:
         """Load text encoder + embeddings processor, compute and cache validation embeddings."""
 
         # This method:
-        #   1. Loads the pure Gemma text encoder on GPU
-        #   2. Loads the embeddings processor (feature extractor + connectors)
-        #   3. If validation prompts are configured, computes and caches their embeddings
-        #   4. Unloads the Gemma model entirely, keeps the embeddings processor for training
+        #   1. Loads the embeddings processor (feature extractor + connectors)
+        #   2. Loads the pure Gemma text encoder only when validation prompts need caching
+        #   3. Computes and caches validation embeddings when prompts are configured
+        #   4. Unloads Gemma/feature extractor, keeps the connectors for training
 
-        # Load text encoder (pure Gemma LLM) on GPU — LOCAL_RANK before Accelerator exists
+        # LOCAL_RANK before Accelerator exists
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-
-        logger.debug("Loading text encoder...")
-        text_encoder = load_text_encoder(
-            gemma_model_path=self._text_encoder_path,
-            device=init_device,
-            dtype=torch.bfloat16,
-            load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
-        )
 
         # Load embeddings processor (feature extractor + connectors)
         logger.debug("Loading embeddings processor...")
@@ -577,6 +936,13 @@ class LtxvTrainer:
         # Cache validation embeddings if prompts are configured
         cached_embeddings = None
         if self._config.validation.prompts:
+            logger.debug("Loading text encoder...")
+            text_encoder = load_text_encoder(
+                gemma_model_path=self._text_encoder_path,
+                device=init_device,
+                dtype=torch.bfloat16,
+                load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+            )
             logger.info(f"Pre-computing embeddings for {len(self._config.validation.prompts)} validation prompts...")
             cached_embeddings = []
             with torch.inference_mode():
@@ -597,14 +963,17 @@ class LtxvTrainer:
                             ),
                         )
                     )
+            del text_encoder
 
-        # Unload Gemma model and feature extractor, keep only connectors for training
-        del text_encoder
+        # Unload feature extractor, keep only connectors for training
         self._embeddings_processor.feature_extractor = None
         self._embeddings_processor.requires_grad_(False)
         self._embeddings_processor.eval()
 
-        logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
+        if cached_embeddings is None:
+            logger.debug("No validation prompts configured. Gemma text encoder load skipped")
+        else:
+            logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
 
     def _load_models(self) -> None:
@@ -620,6 +989,9 @@ class LtxvTrainer:
         )
 
         # Load all model components (except text encoder - already handled)
+        video_vae_encoder_path = self._video_vae_component_path("encoder") if need_vae_encoder else None
+        audio_vae_decoder_path = self._audio_vae_component_path("decoder") if load_audio else None
+        vocoder_path = self._component_path("vocoder") if load_audio else None
         components = load_ltx_model(
             checkpoint_path=self._config.model.model_path,
             device="cpu",
@@ -630,10 +1002,10 @@ class LtxvTrainer:
             with_vocoder=load_audio,
             with_text_encoder=False,  # Text encoder handled separately
             transformer_path=self._component_path("transformer"),
-            video_vae_encoder_path=self._video_vae_component_path("encoder"),
+            video_vae_encoder_path=video_vae_encoder_path,
             video_vae_decoder_path=self._video_vae_component_path("decoder"),
-            audio_vae_decoder_path=self._audio_vae_component_path("decoder"),
-            vocoder_path=self._component_path("vocoder"),
+            audio_vae_decoder_path=audio_vae_decoder_path,
+            vocoder_path=vocoder_path,
         )
 
         # Extract components
@@ -783,7 +1155,12 @@ class LtxvTrainer:
             self._resume_state: tuple[int, TrainingState | None] = (0, None)
             return
 
-        checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
+        preflight_result = getattr(self, "_preflight_result", None)
+        checkpoint_path = (
+            preflight_result.checkpoint_path
+            if preflight_result is not None
+            else self._find_checkpoint(self._config.model.load_checkpoint)
+        )
         if not checkpoint_path:
             logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
             self._resume_state = (0, None)
@@ -797,7 +1174,10 @@ class LtxvTrainer:
         else:  # LoRA mode
             self._load_lora_checkpoint(checkpoint_path)
 
-        self._resume_state = self._resolve_resume_state()
+        if preflight_result is not None and preflight_result.resume_state is not None:
+            self._resume_state = preflight_result.resume_state
+        else:
+            self._resume_state = self._resolve_resume_state()
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
@@ -848,7 +1228,12 @@ class LtxvTrainer:
         ):
             return
 
-        checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
+        preflight_result = getattr(self, "_preflight_result", None)
+        checkpoint_path = (
+            preflight_result.checkpoint_path
+            if preflight_result is not None
+            else self._find_checkpoint(self._config.model.load_checkpoint)
+        )
         if checkpoint_path is None:
             return
 
@@ -941,12 +1326,39 @@ class LtxvTrainer:
         if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
             return 0, None
 
-        state = self._load_training_state(self._loaded_checkpoint_path)
+        return self._resolve_resume_state_from_checkpoint(self._config, self._loaded_checkpoint_path)
+
+    @classmethod
+    def _resolve_resume_state_from_checkpoint(
+        cls,
+        trainer_config: LtxTrainerConfig,
+        checkpoint_path: Path,
+    ) -> tuple[int, TrainingState | None]:
+        if trainer_config.checkpoints.no_resume:
+            return 0, None
+
+        state = cls._load_training_state(checkpoint_path)
         if state is None:
             return 0, None
 
+        mismatches = cls._training_state_mismatches(trainer_config, state)
+        if mismatches:
+            logger.warning(
+                f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
+                "Starting from step 0. Set checkpoints.no_resume=true to silence this warning."
+            )
+            return 0, None
+
+        if state.global_step < 0:
+            logger.warning(f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0.")
+            return 0, None
+        logger.info(f"📌 Resuming from step {state.global_step}")
+        return state.global_step, state
+
+    @staticmethod
+    def _training_state_mismatches(trainer_config: LtxTrainerConfig, state: TrainingState) -> list[str]:
         fp = state.config_fingerprint
-        cfg = self._config
+        cfg = trainer_config
         mismatches: list[str] = []
         if fp.optimizer_type != cfg.optimization.optimizer_type:
             mismatches.append(f"optimizer_type: {fp.optimizer_type} → {cfg.optimization.optimizer_type}")
@@ -973,18 +1385,13 @@ class LtxvTrainer:
                 mismatches.append(
                     f"nsync_negative_strength: {fp.nsync_negative_strength} → {cfg.lora.nsync.negative_strength}"
                 )
-        if mismatches:
-            logger.warning(
-                f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
-                "Starting from step 0. Set checkpoints.no_resume=true to silence this warning."
-            )
-            return 0, None
-
-        if state.global_step < 0:
-            logger.warning(f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0.")
-            return 0, None
-        logger.info(f"📌 Resuming from step {state.global_step}")
-        return state.global_step, state
+            if (fp.nsync_enabled or cfg.lora.nsync.enabled) and (
+                fp.nsync_anchor_strength != cfg.lora.nsync.anchor_strength
+            ):
+                mismatches.append(
+                    f"nsync_anchor_strength: {fp.nsync_anchor_strength} → {cfg.lora.nsync.anchor_strength}"
+                )
+        return mismatches
 
     @staticmethod
     def _load_training_state(checkpoint_path: Path) -> TrainingState | None:
@@ -1117,6 +1524,8 @@ class LtxvTrainer:
                 data_sources=data_sources,
                 optional_data_sources=optional_data_sources,
             )
+            if self._nsync_requires_anchor:
+                self._dataset = AnchorSampleDataset(self._dataset)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         num_workers = self._config.data.num_dataloader_workers
@@ -1220,7 +1629,7 @@ class LtxvTrainer:
         """Create learning rate scheduler based on config."""
         scheduler_type = self._config.optimization.scheduler_type
         steps = self._config.optimization.steps
-        params = self._config.optimization.scheduler_params or {}
+        params = dict(self._config.optimization.scheduler_params or {})
 
         if scheduler_type is None:
             return None
@@ -1638,6 +2047,9 @@ class LtxvTrainer:
                 nsync_negative_strength=(
                     self._config.lora.nsync.negative_strength if self._config.lora is not None else 1.0
                 ),
+                nsync_anchor_strength=(
+                    self._config.lora.nsync.anchor_strength if self._config.lora is not None else 0.0
+                ),
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
@@ -1705,6 +2117,7 @@ class LtxvTrainer:
             raw_metadata["nsync_enabled"] = True
             raw_metadata["nsync_projection_scope"] = self._config.lora.nsync.projection_scope
             raw_metadata["nsync_negative_strength"] = self._config.lora.nsync.negative_strength
+            raw_metadata["nsync_anchor_strength"] = self._config.lora.nsync.anchor_strength
         # Convert all values to strings for safetensors compatibility
         metadata = {k: str(v) for k, v in raw_metadata.items()}
         if metadata:

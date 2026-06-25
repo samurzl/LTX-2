@@ -73,6 +73,45 @@ app = typer.Typer(
 )
 
 
+def _validate_safetensors_file(label: str, path: str) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise typer.BadParameter(f"{label} not found: {resolved}")
+    if resolved.suffix != ".safetensors":
+        raise typer.BadParameter(f"{label} must have a .safetensors extension: {resolved}")
+    return resolved
+
+
+def _validate_device(device: str) -> None:
+    try:
+        torch_device = torch.device(device)
+    except Exception as e:
+        raise typer.BadParameter(f"Invalid device: {device}") from e
+
+    if torch_device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise typer.BadParameter("CUDA device requested but CUDA is not available")
+        if torch_device.index is not None and torch_device.index >= torch.cuda.device_count():
+            raise typer.BadParameter(
+                f"CUDA device index {torch_device.index} is unavailable; found {torch.cuda.device_count()} device(s)"
+            )
+
+
+def _validate_output_dir_writable(output_dir: str) -> Path:
+    output_path = Path(output_dir).expanduser()
+    output_path.mkdir(parents=True, exist_ok=True)
+    if not output_path.is_dir():
+        raise typer.BadParameter(f"Output path is not a directory: {output_path}")
+
+    probe_path = output_path / ".ltx_preflight_write_test"
+    try:
+        probe_path.write_text("ok", encoding="utf-8")
+    finally:
+        if probe_path.exists():
+            probe_path.unlink()
+    return output_path
+
+
 class MediaDataset(Dataset):
     """
     Dataset for processing video and image files.
@@ -1158,9 +1197,15 @@ def main(  # noqa: PLR0913
     if not Path(dataset_file).is_file():
         raise typer.BadParameter(f"Dataset file not found: {dataset_file}")
 
+    _validate_safetensors_file("Model checkpoint", model_path)
+    _validate_device(device)
+    _validate_output_dir_writable(output_dir)
+
     # Validate audio parameters
     if with_audio and audio_output_dir is None:
         raise typer.BadParameter("--audio-output-dir is required when --with-audio is set")
+    if audio_output_dir is not None:
+        _validate_output_dir_writable(audio_output_dir)
 
     # Parse resolution buckets
     parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets)
