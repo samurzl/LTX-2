@@ -57,6 +57,7 @@ def print_config(config: LtxTrainerConfig) -> None:
                     ("Target Modules", fmt(cfg.lora.target_modules)),
                     ("Noise Experts", fmt(list((cfg.lora.noise_experts or {"default": (0.0, 1.0)}).keys()))),
                     ("NSYNC", fmt(cfg.lora.nsync.enabled)),
+                    ("NSYNC Negative Strength", str(cfg.lora.nsync.negative_strength)),
                 ],
             )
         )

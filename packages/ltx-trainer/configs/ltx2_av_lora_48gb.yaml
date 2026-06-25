@@ -1,0 +1,120 @@
+# =============================================================================
+# LTX-2 Audio-Video LoRA Training Configuration (48 GB VRAM)
+# =============================================================================
+#
+# Memory-balanced single-GPU example for 48 GB cards using a 640x352x41 bucket.
+# It keeps the memory safeguards from the low-VRAM config while restoring LoRA
+# rank 32 for the extra headroom.
+#
+# Preprocess with the same bucket used by validation:
+#
+# uv run python scripts/process_dataset.py dataset.json \
+#   --resolution-buckets "640x352x41" \
+#   --model-path /path/to/ltx-2-model.safetensors \
+#   --text-encoder-path /path/to/gemma.safetensors \
+#   --with-audio \
+#   --load-text-encoder-in-8bit
+#
+# Memory optimizations applied:
+#   - 8-bit AdamW optimizer
+#   - INT8 trainer quantization
+#   - 8-bit text encoder loading
+#   - Gradient checkpointing
+#   - Optimizer offload during validation
+#
+# =============================================================================
+
+model:
+  # Path to the LTX-2 single-file checkpoint (.safetensors)
+  model_path: "path/to/ltx-2-model.safetensors"
+
+  # Path to the Gemma single-file checkpoint (.safetensors) or a model directory
+  text_encoder_path: "path/to/gemma.safetensors"
+
+  # LoRA is recommended for 48 GB single-GPU training.
+  training_mode: "lora"
+
+  # Optional checkpoint file or directory to resume from.
+  load_checkpoint: null
+
+lora:
+  # 48 GB has enough room for rank 32 at 640x352x41 with the safeguards below.
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "text_to_video"
+  first_frame_conditioning_p: 0.5
+  with_audio: true
+  audio_latents_dir: "audio_latents"
+
+optimization:
+  learning_rate: 1e-4
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw8bit"
+  scheduler_type: "linear"
+  scheduler_params: { }
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+  offload_optimizer_during_validation: true
+
+data:
+  preprocessed_data_root: "/path/to/preprocessed/data"
+  num_dataloader_workers: 2
+
+validation:
+  prompts:
+    - "A cinematic close-up of an artisan arranging small tools on a wooden bench, hands moving carefully as soft window light shifts across the scene. The audio captures quiet tool taps, cloth movement, and a natural room tone."
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  images: null
+
+  # Match the recommended preprocessing bucket: width, height, frames.
+  # Width and height are divisible by 32, and 41 satisfies frames % 8 == 1.
+  video_dims: [ 640, 352, 41 ]
+
+  frame_rate: 25.0
+  seed: 42
+  inference_steps: 24
+  interval: 250
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [ 29 ]
+  stg_mode: "stg_av"
+  generate_audio: true
+  skip_initial_validation: false
+
+checkpoints:
+  interval: 250
+  keep_last_n: -1
+  precision: "bfloat16"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: { }
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: false
+  project: "ltx-2-trainer"
+  entity: null
+  tags: [ "ltx2", "lora", "48gb", "640x352x41" ]
+  log_validation_videos: true
+
+seed: 42
+output_dir: "outputs/ltx2_av_lora_48gb_640x352x41"

@@ -65,6 +65,9 @@ lora:
   nsync:
     enabled: true
     negative_latents_dir: "negative_latents"
+    # 1.0 is the default full projection. Lower values soften the negative push;
+    # 0.0 disables it, and values above 1.0 push farther away.
+    negative_strength: 1.0
     projection_scope: "layer"
     eps: 1.0e-12
 

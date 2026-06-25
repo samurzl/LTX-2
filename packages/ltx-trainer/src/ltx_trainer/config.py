@@ -157,6 +157,15 @@ class NsyncConfig(ConfigBaseModel):
         description="Directory name containing generated negative video latents",
     )
 
+    negative_strength: float = Field(
+        default=1.0,
+        description=(
+            "Strength of the NSYNC negative-gradient projection. 0.0 disables the negative push, "
+            "1.0 preserves the default full projection, and values above 1.0 push farther away."
+        ),
+        ge=0.0,
+    )
+
     projection_scope: Literal["layer", "parameter"] = Field(
         default="layer",
         description="Gradient projection granularity. 'layer' groups by transformer block.",

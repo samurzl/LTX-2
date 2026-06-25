@@ -27,9 +27,10 @@ All detailed guides and technical documentation are in the [docs](./docs/) direc
 - **LTX-2 Model Checkpoint** - Local `.safetensors` file
 - **Gemma Text Encoder** - Local Gemma `.safetensors` file or model directory (required for LTX-2)
 - **Linux with CUDA** - CUDA 13+ recommended for optimal performance
-- **Nvidia GPU with 80GB+ VRAM** - Recommended for the standard config. For GPUs with 32GB VRAM (e.g., RTX 5090),
-  use the [low VRAM config](configs/ltx2_av_lora_low_vram.yaml) which enables INT8 quantization and other
-  memory optimizations
+- **Nvidia GPU with 80GB+ VRAM** - Recommended for the standard config. For GPUs with 48GB VRAM, use the
+  [48GB config](configs/ltx2_av_lora_48gb.yaml) with 640x352x41 buckets. For GPUs with 32GB VRAM (e.g., RTX 5090),
+  use the [low VRAM config](configs/ltx2_av_lora_low_vram.yaml) which enables INT8 quantization and other memory
+  optimizations
 
 ---
 

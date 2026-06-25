@@ -25,6 +25,8 @@ sub-configurations:
 Check out our example configurations in the `configs` directory:
 
 - 📄 [Audio-Video LoRA Training](../configs/ltx2_av_lora.yaml) - Joint audio-video generation training
+- 📄 [Audio-Video LoRA Training (48 GB)](../configs/ltx2_av_lora_48gb.yaml) - Memory-balanced config for 48GB
+  GPUs using 640x352x41 buckets
 - 📄 [Audio-Video LoRA Training (Low VRAM)](../configs/ltx2_av_lora_low_vram.yaml) - Memory-optimized config for 32GB
   GPUs (uses 8-bit optimizer, INT8 quantization, and reduced LoRA rank)
 - 📄 [IC-LoRA Training](../configs/ltx2_v2v_ic_lora.yaml) - Video-to-video transformation training
@@ -93,6 +95,7 @@ lora:
   noise_experts: null
   nsync:
     enabled: false
+    negative_strength: 1.0
 ```
 
 **Key parameters:**
@@ -132,9 +135,12 @@ lora:
   nsync:
     enabled: true
     negative_latents_dir: "negative_latents"
+    negative_strength: 1.0
     projection_scope: "layer"
 ```
 
+Use `negative_strength` to tune how much of the negative-gradient projection is applied: `0.0` disables the negative
+push, `1.0` keeps the default full projection, and values above `1.0` push farther away from the negative direction.
 NSYNC currently supports `training_mode: "lora"` with the `text_to_video` strategy.
 
 #### Understanding Target Modules

@@ -11,9 +11,10 @@ Before you begin, ensure you have:
 2. **Gemma Text Encoder** - A local Gemma `.safetensors` file or model directory (required for LTX-2).
    Download from: [HuggingFace Hub](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized/)
 3. **Linux with CUDA** - The trainer requires `triton` which is Linux-only
-4. **GPU with sufficient VRAM** - 80GB recommended for the standard config. For GPUs with 32GB VRAM (e.g., RTX 5090),
-   use the [low VRAM config](../configs/ltx2_av_lora_low_vram.yaml) which enables INT8 quantization and other
-   memory optimizations
+4. **GPU with sufficient VRAM** - 80GB recommended for the standard config. For GPUs with 48GB VRAM, use the
+   [48GB config](../configs/ltx2_av_lora_48gb.yaml) with 640x352x41 buckets. For GPUs with 32GB VRAM
+   (e.g., RTX 5090), use the [low VRAM config](../configs/ltx2_av_lora_low_vram.yaml) which enables INT8
+   quantization and other memory optimizations
 
 ## ⚡ Installation
 
@@ -64,6 +65,8 @@ See [Dataset Preparation](dataset-preparation.md) for detailed instructions.
 Create or modify a configuration YAML file. Start with one of the example configs:
 
 - [`configs/ltx2_av_lora.yaml`](../configs/ltx2_av_lora.yaml) - Audio-video LoRA training
+- [`configs/ltx2_av_lora_48gb.yaml`](../configs/ltx2_av_lora_48gb.yaml) - Audio-video LoRA training (optimized
+  for 48GB VRAM with 640x352x41 buckets)
 - [`configs/ltx2_av_lora_low_vram.yaml`](../configs/ltx2_av_lora_low_vram.yaml) - Audio-video LoRA training (optimized for 32GB VRAM)
 - [`configs/ltx2_v2v_ic_lora.yaml`](../configs/ltx2_v2v_ic_lora.yaml) - IC-LoRA video-to-video
 

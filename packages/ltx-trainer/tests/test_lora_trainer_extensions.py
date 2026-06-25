@@ -5,9 +5,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Protocol
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CORE_SRC = REPO_ROOT / "packages" / "ltx-core" / "src"
@@ -40,6 +42,42 @@ from ltx_trainer.model_loader import _transformer_sd_ops_for_checkpoint
 from ltx_trainer.timestep_samplers import RangeScaledTimestepSampler, UniformTimestepSampler
 from ltx_trainer.trainer import LtxvTrainer
 from process_videos import _audio_has_activity
+
+
+class _PeftLoraConfigLike(Protocol):
+    r: int
+
+
+def _write_lora_checkpoint(
+    path: Path,
+    rank: int,
+    prefix: str = "diffusion_model.transformer_blocks.0.attn1.to_q",
+) -> Path:
+    save_file(
+        {
+            f"{prefix}.lora_A.weight": torch.zeros(rank, 3),
+            f"{prefix}.lora_B.weight": torch.zeros(5, rank),
+        },
+        path,
+    )
+    return path
+
+
+def _lora_rank_config(
+    checkpoint_path: Path,
+    rank: int,
+    noise_experts: dict[str, tuple[float, float]] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=SimpleNamespace(training_mode="lora", load_checkpoint=checkpoint_path),
+        lora=SimpleNamespace(
+            rank=rank,
+            alpha=rank,
+            dropout=0.0,
+            target_modules=["to_q"],
+            noise_experts=noise_experts,
+        ),
+    )
 
 
 def test_noise_expert_config_rejects_overlaps() -> None:
@@ -206,6 +244,86 @@ def test_transformer_loader_rejects_native_fp4_files(tmp_path: Path) -> None:
         _transformer_sd_ops_for_checkpoint(checkpoint, LTXV_MODEL_COMFY_RENAMING_MAP)
 
 
+def test_lora_rank_detection_accepts_comfy_and_internal_keys() -> None:
+    state_dict = {
+        "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight": torch.zeros(384, 3),
+        "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight": torch.zeros(5, 384),
+        "transformer_blocks.0.attn1.to_k.lora_A.weight": torch.zeros(384, 7),
+        "transformer_blocks.0.attn1.to_k.lora_B.weight": torch.zeros(11, 384),
+    }
+
+    assert LtxvTrainer._detect_lora_rank_from_state_dict(state_dict, "checkpoint.safetensors") == 384
+
+
+def test_lora_rank_detection_rejects_inconsistent_pair() -> None:
+    state_dict = {
+        "transformer_blocks.0.attn1.to_q.lora_A.weight": torch.zeros(8, 3),
+        "transformer_blocks.0.attn1.to_q.lora_B.weight": torch.zeros(5, 4),
+    }
+
+    with pytest.raises(ValueError, match="inconsistent rank"):
+        LtxvTrainer._detect_lora_rank_from_state_dict(state_dict, "checkpoint.safetensors")
+
+
+def test_lora_checkpoint_rank_overrides_config_before_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint = _write_lora_checkpoint(tmp_path / "lora_weights_step_00001.safetensors", rank=384)
+    captured: dict[str, object] = {}
+
+    class FakeTransformer:
+        def set_adapter(self, adapter_name: str) -> None:
+            self.adapter_name = adapter_name
+
+        def named_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
+            return []
+
+    def fake_get_peft_model(
+        transformer: FakeTransformer,
+        lora_config: _PeftLoraConfigLike,
+        adapter_name: str,
+    ) -> FakeTransformer:
+        captured["rank"] = lora_config.r
+        captured["adapter"] = adapter_name
+        return transformer
+
+    monkeypatch.setattr("ltx_trainer.trainer.get_peft_model", fake_get_peft_model)
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = _lora_rank_config(checkpoint, rank=64)
+    trainer._transformer = FakeTransformer()
+
+    trainer._resolve_lora_rank_from_checkpoint()
+    trainer._setup_lora()
+
+    assert trainer._config.lora.rank == 384
+    assert captured == {"rank": 384, "adapter": "default"}
+
+
+def test_lora_checkpoint_matching_rank_keeps_config_rank(tmp_path: Path) -> None:
+    checkpoint = _write_lora_checkpoint(tmp_path / "lora_weights_step_00001.safetensors", rank=64)
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = _lora_rank_config(checkpoint, rank=64)
+
+    trainer._resolve_lora_rank_from_checkpoint()
+
+    assert trainer._config.lora.rank == 64
+
+
+def test_lora_multi_expert_rank_detection_requires_matching_ranks(tmp_path: Path) -> None:
+    low = _write_lora_checkpoint(tmp_path / "lora_weights_low_step_00010.safetensors", rank=32)
+    _write_lora_checkpoint(tmp_path / "lora_weights_high_step_00010.safetensors", rank=32)
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = _lora_rank_config(low, rank=64, noise_experts={"low": (0.0, 0.5), "high": (0.5, 1.0)})
+
+    trainer._resolve_lora_rank_from_checkpoint()
+
+    assert trainer._config.lora.rank == 32
+
+    _write_lora_checkpoint(tmp_path / "lora_weights_high_step_00010.safetensors", rank=16)
+    trainer._config = _lora_rank_config(low, rank=64, noise_experts={"low": (0.0, 0.5), "high": (0.5, 1.0)})
+
+    with pytest.raises(ValueError, match="must all use the same rank"):
+        trainer._resolve_lora_rank_from_checkpoint()
+
+
 def test_range_scaled_timestep_sampler_maps_into_expert_range() -> None:
     torch.manual_seed(0)
     sampler = RangeScaledTimestepSampler(UniformTimestepSampler(), 0.25, 0.5)
@@ -272,7 +390,7 @@ def test_nsync_projection_is_layer_wise() -> None:
     }
 
     trainer = object.__new__(LtxvTrainer)
-    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12)))
+    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12, negative_strength=1.0)))
     trainer._gradient_projection_groups = {
         "transformer_blocks.0": [p1, p2],
         "transformer_blocks.1": [p3],
@@ -284,6 +402,37 @@ def test_nsync_projection_is_layer_wise() -> None:
     layer1_dot = torch.dot(p3.grad, negative_grads[p3])
     assert layer0_dot.abs() < 1e-6
     assert layer1_dot.abs() < 1e-6
+
+
+def test_nsync_negative_strength_scales_projection() -> None:
+    p = torch.nn.Parameter(torch.zeros(2))
+    p.grad = torch.tensor([2.0, 1.0])
+    negative_grads = {p: torch.tensor([2.0, 0.0])}
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12, negative_strength=0.25)))
+    trainer._gradient_projection_groups = {"all": [p]}
+
+    trainer._apply_nsync_projection(negative_grads)
+
+    assert torch.allclose(p.grad, torch.tensor([1.5, 1.0]))
+
+
+def test_nsync_zero_negative_strength_skips_negative_batch_requirement() -> None:
+    backward_losses: list[torch.Tensor] = []
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._accelerator = SimpleNamespace(backward=lambda loss: backward_losses.append(loss.detach()))
+    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12, negative_strength=0.0)))
+    trainer._training_step = lambda batch, timestep_sampler: SimpleNamespace(  # noqa: ARG005
+        loss=torch.ones(1, requires_grad=True),
+        sigma=torch.ones(1),
+    )
+
+    output = trainer._nsync_training_step({"latents": {"latents": torch.zeros(1)}}, timestep_sampler=object())
+
+    assert output.loss.shape == (1,)
+    assert len(backward_losses) == 1
 
 
 def test_nsync_reuses_processed_conditions_without_second_backward_error() -> None:
@@ -333,7 +482,7 @@ def test_nsync_reuses_processed_conditions_without_second_backward_error() -> No
     transformer = FakeTransformer()
     trainer = object.__new__(LtxvTrainer)
     trainer._accelerator = FakeAccelerator()
-    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12)))
+    trainer._config = SimpleNamespace(lora=SimpleNamespace(nsync=SimpleNamespace(eps=1e-12, negative_strength=1.0)))
     trainer._embeddings_processor = FakeEmbeddingsProcessor()
     trainer._training_strategy = FakeStrategy()
     trainer._transformer = transformer

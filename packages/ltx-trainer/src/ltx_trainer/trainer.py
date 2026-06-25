@@ -4,7 +4,7 @@ import os
 import re
 import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -103,14 +103,15 @@ class NoiseExpert:
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
+        self._loaded_checkpoint_path: Path | None = None
+        self._resolve_lora_rank_from_checkpoint()
         if IS_MAIN_PROCESS:
-            print_config(trainer_config)
+            print_config(self._config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
         self._setup_accelerator()
         self._collect_trainable_params()
-        self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
         self._prepare_models_for_training()
         self._dataset = None
@@ -365,6 +366,10 @@ class LtxvTrainer:
     def _nsync_enabled(self) -> bool:
         return self._config.lora is not None and self._config.lora.nsync.enabled
 
+    @property
+    def _nsync_requires_negatives(self) -> bool:
+        return self._nsync_enabled and self._config.lora.nsync.negative_strength > 0.0
+
     def _training_step(
         self,
         batch: dict[str, dict[str, Tensor]],
@@ -420,6 +425,11 @@ class LtxvTrainer:
         timestep_sampler: TimestepSampler,
     ) -> TrainingStepOutput:
         """Run NSYNC positive/negative gradient projection for one micro-batch."""
+        if self._config.lora.nsync.negative_strength <= 0.0:
+            positive_output = self._training_step(batch, timestep_sampler)
+            self._accelerator.backward(positive_output.loss.mean())
+            return positive_output
+
         if batch.get("negative_latents") is None:
             raise ValueError("NSYNC is enabled, but the batch does not contain negative_latents")
 
@@ -461,6 +471,9 @@ class LtxvTrainer:
     def _apply_nsync_projection(self, negative_grads: dict[torch.nn.Parameter, Tensor]) -> None:
         """Project positive gradients away from negative gradients per configured group."""
         eps = self._config.lora.nsync.eps
+        negative_strength = self._config.lora.nsync.negative_strength
+        if negative_strength <= 0.0:
+            return
 
         for params in self._gradient_projection_groups.values():
             dot = None
@@ -483,7 +496,8 @@ class LtxvTrainer:
                 if param.grad is None or param not in negative_grads:
                     continue
                 neg_grad = negative_grads[param].to(device=param.grad.device, dtype=param.grad.dtype)
-                param.grad.sub_(scale.to(device=param.grad.device, dtype=param.grad.dtype) * neg_grad)
+                projection = scale.to(device=param.grad.device, dtype=param.grad.dtype) * neg_grad
+                param.grad.sub_(negative_strength * projection)
 
     @property
     def _text_encoder_path(self) -> str | Path:
@@ -825,6 +839,100 @@ class LtxvTrainer:
 
         logger.info(f"✅ LoRA checkpoint loaded successfully for adapter '{adapter_name}'")
 
+    def _resolve_lora_rank_from_checkpoint(self) -> None:
+        """Use the checkpoint LoRA rank as the effective training rank when resuming LoRA weights."""
+        if (
+            self._config.model.training_mode != "lora"
+            or self._config.lora is None
+            or not self._config.model.load_checkpoint
+        ):
+            return
+
+        checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
+        if checkpoint_path is None:
+            return
+
+        ranks_by_path = {
+            path: self._detect_lora_rank_from_checkpoint(path)
+            for path in self._lora_rank_detection_checkpoint_paths(checkpoint_path)
+        }
+        if not ranks_by_path:
+            return
+
+        ranks = set(ranks_by_path.values())
+        if len(ranks) > 1:
+            details = ", ".join(f"{path.name}: rank {rank}" for path, rank in sorted(ranks_by_path.items()))
+            raise ValueError(f"LoRA expert checkpoints must all use the same rank, but found {details}")
+
+        checkpoint_rank = ranks.pop()
+        config_rank = self._config.lora.rank
+        if checkpoint_rank != config_rank:
+            logger.info(
+                f"Using LoRA rank {checkpoint_rank} detected from checkpoint instead of configured rank {config_rank}"
+            )
+            self._config.lora.rank = checkpoint_rank
+
+    def _lora_rank_detection_checkpoint_paths(self, checkpoint_path: Path) -> list[Path]:
+        """Return existing LoRA files whose ranks should agree for this training run."""
+        expert_names = list(self._configured_noise_expert_ranges())
+        if len(expert_names) <= 1:
+            return [checkpoint_path]
+
+        step_match = re.search(r"step_(\d+)", checkpoint_path.name)
+        if step_match is None:
+            return [checkpoint_path]
+
+        step_suffix = step_match.group(1)
+        expert_paths = [
+            checkpoint_path.parent / f"lora_weights_{adapter_name}_step_{step_suffix}.safetensors"
+            for adapter_name in expert_names
+        ]
+        existing_paths = [path for path in expert_paths if path.exists()]
+        return existing_paths or [checkpoint_path]
+
+    @classmethod
+    def _detect_lora_rank_from_checkpoint(cls, checkpoint_path: Path) -> int:
+        """Detect the single LoRA rank encoded in a safetensors checkpoint."""
+        state_dict = load_file(checkpoint_path)
+        return cls._detect_lora_rank_from_state_dict(state_dict, checkpoint_path)
+
+    @staticmethod
+    def _detect_lora_rank_from_state_dict(state_dict: Mapping[str, Tensor], checkpoint_path: Path | str) -> int:
+        """Infer LoRA rank from paired ``lora_A``/``lora_B`` factor tensors."""
+        suffix_a = ".lora_A.weight"
+        ranks_by_prefix: dict[str, int] = {}
+
+        for key, lora_a in state_dict.items():
+            if not key.endswith(suffix_a):
+                continue
+
+            prefix = key[: -len(suffix_a)]
+            key_b = f"{prefix}.lora_B.weight"
+            lora_b = state_dict.get(key_b)
+            if lora_b is None:
+                raise ValueError(f"LoRA checkpoint {checkpoint_path} is missing paired tensor {key_b}")
+            if lora_a.ndim != 2 or lora_b.ndim != 2:
+                raise ValueError(f"LoRA checkpoint {checkpoint_path} has non-matrix LoRA tensors for {prefix}")
+
+            rank_a = lora_a.shape[0]
+            rank_b = lora_b.shape[1]
+            if rank_a != rank_b:
+                raise ValueError(
+                    f"LoRA checkpoint {checkpoint_path} has inconsistent rank for {prefix}: "
+                    f"lora_A rank {rank_a}, lora_B rank {rank_b}"
+                )
+            ranks_by_prefix[prefix] = rank_a
+
+        if not ranks_by_prefix:
+            raise ValueError(f"Could not detect LoRA rank from checkpoint {checkpoint_path}: no lora_A tensors found")
+
+        ranks = set(ranks_by_prefix.values())
+        if len(ranks) > 1:
+            details = ", ".join(f"{prefix}: rank {rank}" for prefix, rank in sorted(ranks_by_prefix.items()))
+            raise ValueError(f"LoRA checkpoint {checkpoint_path} contains mixed ranks: {details}")
+
+        return ranks.pop()
+
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
         """Determine resume state by looking for a training state file next to the loaded checkpoint.
         Returns (initial_step, TrainingState or None).
@@ -859,6 +967,12 @@ class LtxvTrainer:
                 mismatches.append(f"lora_noise_experts: {fp.lora_noise_experts} → {current_experts}")
             if fp.nsync_enabled != cfg.lora.nsync.enabled:
                 mismatches.append(f"nsync_enabled: {fp.nsync_enabled} → {cfg.lora.nsync.enabled}")
+            if (fp.nsync_enabled or cfg.lora.nsync.enabled) and (
+                fp.nsync_negative_strength != cfg.lora.nsync.negative_strength
+            ):
+                mismatches.append(
+                    f"nsync_negative_strength: {fp.nsync_negative_strength} → {cfg.lora.nsync.negative_strength}"
+                )
         if mismatches:
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
@@ -993,7 +1107,7 @@ class LtxvTrainer:
             data_sources = self._training_strategy.get_data_sources()
             optional_data_sources = set(self._training_strategy.get_optional_data_sources())
 
-            if self._nsync_enabled:
+            if self._nsync_requires_negatives:
                 if isinstance(data_sources, list):
                     data_sources = {source: source for source in data_sources}
                 data_sources[self._config.lora.nsync.negative_latents_dir] = "negative_latents"
@@ -1521,6 +1635,9 @@ class LtxvTrainer:
                 lora_rank=self._config.lora.rank if self._config.lora is not None else None,
                 lora_noise_experts=self._config.lora.noise_experts if self._config.lora is not None else None,
                 nsync_enabled=self._config.lora.nsync.enabled if self._config.lora is not None else False,
+                nsync_negative_strength=(
+                    self._config.lora.nsync.negative_strength if self._config.lora is not None else 1.0
+                ),
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
@@ -1587,6 +1704,7 @@ class LtxvTrainer:
         if self._nsync_enabled:
             raw_metadata["nsync_enabled"] = True
             raw_metadata["nsync_projection_scope"] = self._config.lora.nsync.projection_scope
+            raw_metadata["nsync_negative_strength"] = self._config.lora.nsync.negative_strength
         # Convert all values to strings for safetensors compatibility
         metadata = {k: str(v) for k, v in raw_metadata.items()}
         if metadata:
