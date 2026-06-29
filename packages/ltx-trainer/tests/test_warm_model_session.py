@@ -35,7 +35,7 @@ import warm_server
 from ltx_trainer.model_pool import ModelCacheKey, ModelStatus, WarmModelPool
 from ltx_trainer.trainer import LtxvTrainer
 from ltx_trainer.warm_client import SOCKET_ENV, submit_if_running
-from ltx_trainer.warm_console import WarmConsoleDashboard, WarmServerState
+from ltx_trainer.warm_console import MemorySegment, MemoryUsage, WarmConsoleDashboard, WarmServerState
 
 
 class _TrackingModule(torch.nn.Linear):
@@ -75,13 +75,17 @@ def test_warm_model_pool_reports_model_lifecycle(tmp_path: Path) -> None:
     source = tmp_path / "model.safetensors"
     source.write_bytes(b"weights")
     key = ModelCacheKey.create("text_encoder", source, torch.bfloat16, quantization="8bit")
-    statuses: list[str] = []
-    pool = WarmModelPool(status_listener=lambda status: statuses.append(status.status))
+    events: list[ModelStatus] = []
+    pool = WarmModelPool(status_listener=events.append)
 
-    pool.get_or_load(key, lambda _device: _TrackingModule(), "cpu", offloadable=False)
+    model = pool.get_or_load(key, lambda _device: _TrackingModule(), "cpu", offloadable=False)
+    model.double()
+    assert pool.statuses[0].memory_bytes == (("cpu", 16),)
     pool.offload(key)
 
-    assert statuses == ["loading", "loaded", "unloaded"]
+    assert [event.status for event in events] == ["loading", "loaded", "unloaded"]
+    assert events[1].memory_bytes == (("cpu", 8),)
+    assert events[2].memory_bytes == ()
     snapshot = pool.statuses[0].as_dict()
     assert snapshot["component"] == "text_encoder"
     assert snapshot["name"] == "model.safetensors"
@@ -272,9 +276,38 @@ def test_warm_console_dashboard_renders_model_status(tmp_path: Path) -> None:
     state = WarmServerState()
     output = StringIO()
     render_console = Console(file=output, width=160, force_terminal=False)
+    resources = (
+        MemoryUsage(
+            "VRAM",
+            total=100,
+            used=60,
+            segments=(
+                MemorySegment("cached models", 40, "green"),
+                MemorySegment("server other", 10, "cyan"),
+                MemorySegment("other GPU use", 10, "orange3"),
+                MemorySegment("free", 40, "grey23"),
+            ),
+            detail="GPU 0 · Test GPU",
+            peak_hint=75,
+        ),
+        MemoryUsage(
+            "RAM",
+            total=200,
+            used=100,
+            segments=(
+                MemorySegment("cached models", 40, "green"),
+                MemorySegment("server other", 20, "cyan"),
+                MemorySegment("system other", 40, "orange3"),
+                MemorySegment("available", 100, "grey23"),
+            ),
+            detail="warm server RSS 60 B",
+            peak_hint=120,
+        ),
+    )
     dashboard = WarmConsoleDashboard(
         state,
         render_console,
+        resource_provider=lambda _models: resources,
     )
     pool = WarmModelPool(status_listener=dashboard.update_model)
     pool.get_or_load(key, lambda _device: _TrackingModule(), "cpu")
@@ -289,6 +322,12 @@ def test_warm_console_dashboard_renders_model_status(tmp_path: Path) -> None:
     assert "VIDEO VAE ENCODER" in rendered
     assert "1 loaded" in rendered
     assert "1 loading" in rendered
+    assert "MEMORY" in rendered
+    assert "VRAM" in rendered
+    assert "RAM" in rendered
+    assert "cached models 40 B" in rendered
+    assert "peak 75 B" in rendered
+    assert "peak 120 B" in rendered
 
 
 def test_train_cli_uses_warm_server_without_changing_command(

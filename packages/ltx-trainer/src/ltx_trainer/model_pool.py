@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from pathlib import Path
 from typing import Any, Callable, Hashable, TypeVar
@@ -83,6 +83,7 @@ class ModelStatus:
     detail: str | None = None
     error: str | None = None
     offloadable: bool = True
+    memory_bytes: tuple[tuple[str, int], ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -99,6 +100,7 @@ class ModelStatus:
             "detail": self.detail,
             "error": self.error,
             "offloadable": self.offloadable,
+            "memory_bytes": dict(self.memory_bytes),
         }
 
 
@@ -115,6 +117,7 @@ class WarmModelPool:
         self._entries: dict[ModelCacheKey, _CacheEntry] = {}
         self._artifacts: dict[Hashable, object] = {}
         self._statuses: dict[ModelCacheKey, ModelStatus] = {}
+        self._status_snapshot: tuple[ModelStatus, ...] = ()
         self._status_listener = status_listener
         self._lock = threading.RLock()
 
@@ -152,6 +155,7 @@ class WarmModelPool:
                     device=self._model_device(model),
                     detail="Ready",
                     offloadable=offloadable,
+                    memory_bytes=self._model_memory(model),
                 )
                 return model
 
@@ -163,6 +167,7 @@ class WarmModelPool:
                     device=self._model_device(entry.model),
                     detail=f"Moving to {target}",
                     offloadable=entry.offloadable,
+                    memory_bytes=self._model_memory(entry.model),
                 )
                 try:
                     self.move_model(entry.model, target)
@@ -181,6 +186,7 @@ class WarmModelPool:
                 device=self._model_device(entry.model),
                 detail="Ready",
                 offloadable=entry.offloadable,
+                memory_bytes=self._model_memory(entry.model),
             )
             return entry.model
 
@@ -194,6 +200,7 @@ class WarmModelPool:
                 device=self._model_device(model),
                 detail="Ready",
                 offloadable=offloadable,
+                memory_bytes=self._model_memory(model),
             )
 
     def offload_all(self, *, exclude: set[ModelCacheKey] | None = None) -> None:
@@ -211,6 +218,7 @@ class WarmModelPool:
                         device=self._model_device(entry.model),
                         detail="Moving to CPU",
                         offloadable=True,
+                        memory_bytes=self._model_memory(entry.model),
                     )
                     self.move_model(entry.model, torch.device("cpu"))
                     self._set_status(
@@ -219,6 +227,7 @@ class WarmModelPool:
                         device=self._model_device(entry.model),
                         detail="Ready",
                         offloadable=True,
+                        memory_bytes=self._model_memory(entry.model),
                     )
                 else:
                     logger.info("Evicting non-offloadable warm model: %s", key.label)
@@ -243,6 +252,7 @@ class WarmModelPool:
                     device=self._model_device(entry.model),
                     detail="Moving to CPU",
                     offloadable=True,
+                    memory_bytes=self._model_memory(entry.model),
                 )
                 self.move_model(entry.model, torch.device("cpu"))
                 self._set_status(
@@ -251,6 +261,7 @@ class WarmModelPool:
                     device=self._model_device(entry.model),
                     detail="Ready",
                     offloadable=True,
+                    memory_bytes=self._model_memory(entry.model),
                 )
             else:
                 del self._entries[key]
@@ -308,8 +319,26 @@ class WarmModelPool:
     @property
     def statuses(self) -> tuple[ModelStatus, ...]:
         """Return the latest state of every model encountered by this pool."""
-        with self._lock:
-            return tuple(self._statuses.values())
+        if not self._lock.acquire(blocking=False):
+            return self._status_snapshot
+        try:
+            current: list[ModelStatus] = []
+            for key, status in self._statuses.items():
+                entry = self._entries.get(key)
+                if entry is None:
+                    current.append(status)
+                    continue
+                current.append(
+                    replace(
+                        status,
+                        device=self._model_device(entry.model),
+                        memory_bytes=self._model_memory(entry.model),
+                    )
+                )
+            self._status_snapshot = tuple(current)
+            return self._status_snapshot
+        finally:
+            self._lock.release()
 
     def _set_status(
         self,
@@ -320,6 +349,7 @@ class WarmModelPool:
         detail: str | None = None,
         error: str | None = None,
         offloadable: bool = True,
+        memory_bytes: tuple[tuple[str, int], ...] = (),
     ) -> None:
         snapshot = ModelStatus(
             key=key,
@@ -328,8 +358,10 @@ class WarmModelPool:
             detail=detail,
             error=error,
             offloadable=offloadable,
+            memory_bytes=memory_bytes,
         )
         self._statuses[key] = snapshot
+        self._status_snapshot = tuple(self._statuses.values())
         if self._status_listener is not None:
             self._status_listener(snapshot)
 
@@ -344,6 +376,20 @@ class WarmModelPool:
         if device is not None:
             return str(device)
         return None
+
+    @staticmethod
+    def _model_memory(model: object) -> tuple[tuple[str, int], ...]:
+        if not isinstance(model, torch.nn.Module):
+            return ()
+        totals: dict[str, int] = {}
+        seen: set[int] = set()
+        for tensor in chain(model.parameters(), model.buffers()):
+            if tensor.device.type == "meta" or id(tensor) in seen:
+                continue
+            seen.add(id(tensor))
+            device = str(tensor.device)
+            totals[device] = totals.get(device, 0) + tensor.numel() * tensor.element_size()
+        return tuple(sorted(totals.items()))
 
     @staticmethod
     def move_model(model: object, device: torch.device | str) -> None:

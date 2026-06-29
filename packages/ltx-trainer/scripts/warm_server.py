@@ -82,7 +82,11 @@ class WarmModelServer:
 
         self._socket_path = socket_path
         self._state = WarmServerState()
-        self._dashboard = WarmConsoleDashboard(self._state, console)
+        self._dashboard = WarmConsoleDashboard(
+            self._state,
+            console,
+            model_status_provider=lambda: self._model_pool.statuses,
+        )
         self._model_pool = WarmModelPool(status_listener=self._dashboard.update_model)
         self._mixed_precision_mode: str | None = None
         self._stop_requested = False

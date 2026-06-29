@@ -37,6 +37,10 @@ component type, checkpoint, size, dtype, options, and current device. Green mode
 or evicted, and orange models are currently loading or moving between devices. Since the underlying model loaders do
 not report byte-level progress, the green loading bar pulses rather than displaying a fabricated percentage.
 
+Live VRAM and system RAM meters break usage into cached model tensors, other warm-server allocations, other
+processes/system usage, and free capacity. A red marker on each bar records peak usage for the server lifetime. The
+VRAM peak also uses PyTorch's allocator high-water mark so brief model or training spikes remain visible.
+
 Inspect or stop the server with:
 
 ```bash
