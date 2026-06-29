@@ -16,7 +16,7 @@ The trainer will:
 1. **Load your configuration** and validate all parameters
 2. **Initialize models** and apply optimizations
 3. **Run the training loop** with progress tracking
-4. **Generate validation videos** (if configured)
+4. **Evaluate held-out loss and generate validation videos** (if configured)
 5. **Save the trained weights** in your output directory
 
 ### Output Files
@@ -26,12 +26,14 @@ The trainer will:
 - `lora_weights.safetensors` - Main LoRA weights file
 - `training_config.yaml` - Copy of training configuration
 - `validation_samples/` - Generated validation videos (if enabled)
+- `tensorboard/` - TensorBoard event files (if enabled with the default log directory)
 
 **For full model fine-tuning:**
 
 - `model_weights.safetensors` - Full model weights
 - `training_config.yaml` - Copy of training configuration
 - `validation_samples/` - Generated validation videos (if enabled)
+- `tensorboard/` - TensorBoard event files (if enabled with the default log directory)
 
 ## 🖥️ Distributed / Multi-GPU Training
 
@@ -172,9 +174,32 @@ wandb:
 This will log:
 
 - Training loss and learning rate
+- Held-out validation loss (when configured)
 - Validation videos
 - Model configuration
 - Training progress
+
+## 📈 Held-Out Validation Loss and TensorBoard
+
+Preprocess a separate validation split in the same format as the training dataset, then configure its root and loss
+interval:
+
+```yaml
+data:
+  preprocessed_data_root: "/path/to/preprocessed/train"
+  validation_data_root: "/path/to/preprocessed/validation"
+
+validation:
+  loss_interval: 100
+  max_loss_batches: null  # Evaluate the full held-out split
+
+tensorboard:
+  enabled: true
+  log_dir: null  # Defaults to <output_dir>/tensorboard
+```
+
+The trainer evaluates the same flow-matching objective without gradients, aggregates it across distributed workers,
+and restores the training RNG state afterward. Start TensorBoard with `tensorboard --logdir outputs`.
 
 ## 🚀 Next Steps
 

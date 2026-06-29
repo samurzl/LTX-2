@@ -368,6 +368,11 @@ class DataConfig(ConfigBaseModel):
         description="Path to folder containing preprocessed training data",
     )
 
+    validation_data_root: str | None = Field(
+        default=None,
+        description="Optional path to a separate preprocessed held-out validation dataset",
+    )
+
     num_dataloader_workers: int = Field(
         default=2,
         description="Number of background processes for data loading (0 means synchronous loading)",
@@ -437,7 +442,7 @@ class ValidationConfig(ConfigBaseModel):
 
     seed: int = Field(
         default=42,
-        description="Random seed used when sampling validation videos",
+        description="Random seed used for validation sample generation and held-out loss evaluation",
     )
 
     inference_steps: int = Field(
@@ -448,7 +453,20 @@ class ValidationConfig(ConfigBaseModel):
 
     interval: int | None = Field(
         default=100,
-        description="Number of steps between validation runs. If None, validation is disabled.",
+        description="Number of steps between validation sample generation runs. If None, sampling is disabled.",
+        gt=0,
+    )
+
+    loss_interval: int | None = Field(
+        default=None,
+        description="Number of training steps between held-out validation loss evaluations. "
+        "Requires data.validation_data_root. If None, validation loss is disabled.",
+        gt=0,
+    )
+
+    max_loss_batches: int | None = Field(
+        default=None,
+        description="Maximum held-out batches to evaluate per validation run. If None, evaluate the full dataset.",
         gt=0,
     )
 
@@ -486,7 +504,7 @@ class ValidationConfig(ConfigBaseModel):
 
     skip_initial_validation: bool = Field(
         default=False,
-        description="Skip validation video sampling at step 0 (beginning of training)",
+        description="Skip held-out loss evaluation and validation sample generation at step 0",
     )
 
     include_reference_in_output: bool = Field(
@@ -646,6 +664,26 @@ class WandbConfig(ConfigBaseModel):
     )
 
 
+class TensorBoardConfig(ConfigBaseModel):
+    """Configuration for TensorBoard logging."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to enable TensorBoard scalar logging",
+    )
+
+    log_dir: str | None = Field(
+        default=None,
+        description="TensorBoard event directory. Defaults to <output_dir>/tensorboard.",
+    )
+
+    flush_secs: int = Field(
+        default=120,
+        description="How often the TensorBoard writer flushes pending events",
+        gt=0,
+    )
+
+
 class FlowMatchingConfig(ConfigBaseModel):
     """Configuration for flow matching training"""
 
@@ -678,6 +716,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+    tensorboard: TensorBoardConfig = Field(default_factory=TensorBoardConfig)
 
     # General configuration
     seed: int = Field(
@@ -724,5 +763,8 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        if self.validation.loss_interval is not None and self.data.validation_data_root is None:
+            raise ValueError("data.validation_data_root is required when validation.loss_interval is enabled")
 
         return self

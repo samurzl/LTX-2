@@ -31,6 +31,7 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import functional as F
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
@@ -302,6 +303,13 @@ class LtxvTrainer:
         if cls._config_nsync_requires_anchor(trainer_config) and len(dataset) < 2:
             raise ValueError("NSYNC anchor training requires at least two positive samples")
 
+        if trainer_config.data.validation_data_root is not None:
+            PrecomputedDataset(
+                trainer_config.data.validation_data_root,
+                data_sources=training_strategy.get_data_sources(),
+                optional_data_sources=set(training_strategy.get_optional_data_sources()),
+            )
+
     @staticmethod
     def _preflight_output_dir(trainer_config: LtxTrainerConfig) -> None:
         output_dir = Path(trainer_config.output_dir)
@@ -424,11 +432,14 @@ class LtxvTrainer:
         self._load_checkpoint()
         self._prepare_models_for_training()
         self._dataset = None
+        self._validation_dataset = None
+        self._validation_dataloader = None
         self._global_step = -1
         self._checkpoint_paths: list[Path] = []
         self._training_state_paths: list[Path] = []
         self._training_state_size_warned = False
         self._wandb_run = None
+        self._tensorboard_writer: SummaryWriter | None = None
         self._sigma_tracker = SigmaBucketTracker()
         self._noise_experts: list[NoiseExpert] = []
         self._active_noise_expert: NoiseExpert | None = None
@@ -464,9 +475,10 @@ class LtxvTrainer:
             initial_step = 0
             resuming = False
 
-        # Initialize W&B after restore so we only resume the run when state restore succeeds.
+        # Initialize loggers after restore so we only resume W&B when state restore succeeds.
         resume_run_id = training_state.wandb_run_id if resuming and training_state is not None else None
         self._init_wandb(resume_run_id=resume_run_id)
+        self._init_tensorboard()
 
         self._init_dataloader()
         data_iter = iter(self._dataloader)
@@ -511,6 +523,9 @@ class LtxvTrainer:
         sampled_videos_paths = None
 
         with progress:
+            if cfg.validation.loss_interval and not cfg.validation.skip_initial_validation:
+                self._run_validation_loss()
+
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
                 with self._offloaded_optimizer_state():
                     sampled_videos_paths = self._run_distributed_validation(progress)
@@ -552,7 +567,16 @@ class LtxvTrainer:
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
 
-                    # Run validation if needed
+                    # Evaluate held-out loss if needed
+                    if (
+                        cfg.validation.loss_interval
+                        and self._global_step > 0
+                        and self._global_step % cfg.validation.loss_interval == 0
+                        and is_optimization_step
+                    ):
+                        self._run_validation_loss()
+
+                    # Generate validation samples if needed
                     if (
                         cfg.validation.interval
                         and self._global_step > 0
@@ -591,7 +615,7 @@ class LtxvTrainer:
                         advance=is_optimization_step,
                     )
 
-                    # Log metrics to W&B (only on main process and optimization steps)
+                    # Log metrics (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
                         # Track per-element loss by sigma bucket
                         self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
@@ -654,17 +678,20 @@ class LtxvTrainer:
             if cfg.hub.push_to_hub:
                 push_to_hub(saved_path, sampled_videos_paths, self._config)
 
-            # Log final stats to W&B
+            # Log final stats and close experiment loggers.
+            self._log_metrics(
+                {
+                    "stats/total_time_minutes": stats.total_time_seconds / 60,
+                    "stats/steps_per_second": stats.steps_per_second,
+                    "stats/samples_per_second": stats.samples_per_second,
+                    "stats/peak_gpu_memory_gb": stats.peak_gpu_memory_gb,
+                }
+            )
             if self._wandb_run is not None:
-                self._log_metrics(
-                    {
-                        "stats/total_time_minutes": stats.total_time_seconds / 60,
-                        "stats/steps_per_second": stats.steps_per_second,
-                        "stats/samples_per_second": stats.samples_per_second,
-                        "stats/peak_gpu_memory_gb": stats.peak_gpu_memory_gb,
-                    }
-                )
                 self._wandb_run.finish()
+            if self._tensorboard_writer is not None:
+                self._tensorboard_writer.close()
+                self._tensorboard_writer = None
 
         self._accelerator.wait_for_everyone()
         self._accelerator.end_training()
@@ -1508,7 +1535,7 @@ class LtxvTrainer:
             raise ValueError(f"Invalid checkpoint path: {checkpoint_path}. Must be a file or directory.")
 
     def _init_dataloader(self) -> None:
-        """Initialize the training data loader using the strategy's data sources."""
+        """Initialize training and optional held-out validation data loaders."""
         if self._dataset is None:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
@@ -1528,17 +1555,46 @@ class LtxvTrainer:
                 self._dataset = AnchorSampleDataset(self._dataset)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
+        dataloader = self._create_dataloader(self._dataset, shuffle=True, drop_last=True)
+        self._dataloader = self._accelerator.prepare(dataloader)
+
+        validation_root = self._config.data.validation_data_root
+        if validation_root is None or self._config.validation.loss_interval is None:
+            self._validation_dataloader = None
+            return
+
+        self._validation_dataset = PrecomputedDataset(
+            validation_root,
+            data_sources=self._training_strategy.get_data_sources(),
+            optional_data_sources=set(self._training_strategy.get_optional_data_sources()),
+        )
+        validation_dataloader = self._create_dataloader(
+            self._validation_dataset,
+            shuffle=False,
+            drop_last=False,
+        )
+        self._validation_dataloader = self._accelerator.prepare(validation_dataloader)
+        logger.info(f"Loaded held-out validation dataset with {len(self._validation_dataset):,} samples")
+
+    def _create_dataloader(
+        self,
+        dataset: PrecomputedDataset | AnchorSampleDataset,
+        *,
+        shuffle: bool,
+        drop_last: bool,
+    ) -> DataLoader:
+        """Create a training-compatible dataloader for a precomputed dataset."""
         num_workers = self._config.data.num_dataloader_workers
         if self._is_mixed_audio_training:
             batch_sampler = OptionalSourceGroupedBatchSampler(
-                self._dataset,
+                dataset,
                 output_key="audio_latents",
                 batch_size=self._config.optimization.batch_size,
-                drop_last=True,
-                shuffle=True,
+                drop_last=drop_last,
+                shuffle=shuffle,
             )
-            dataloader = DataLoader(
-                self._dataset,
+            return DataLoader(
+                dataset,
                 batch_sampler=batch_sampler,
                 num_workers=num_workers,
                 pin_memory=num_workers > 0,
@@ -1546,18 +1602,16 @@ class LtxvTrainer:
                 collate_fn=collate_precomputed_samples,
             )
         else:
-            dataloader = DataLoader(
-                self._dataset,
+            return DataLoader(
+                dataset,
                 batch_size=self._config.optimization.batch_size,
-                shuffle=True,
-                drop_last=True,
+                shuffle=shuffle,
+                drop_last=drop_last,
                 num_workers=num_workers,
                 pin_memory=num_workers > 0,
                 persistent_workers=num_workers > 0,
                 collate_fn=collate_precomputed_samples,
             )
-
-        self._dataloader = self._accelerator.prepare(dataloader)
 
     @property
     def _is_mixed_audio_training(self) -> bool:
@@ -1724,6 +1778,68 @@ class LtxvTrainer:
                 f"FSDP with quantization ({self._config.acceleration.quantization}) may have compatibility issues."
                 "Monitor training stability and consider disabling quantization if issues arise."
             )
+
+    @torch.no_grad()
+    def _run_validation_loss(self) -> dict[str, float]:
+        """Evaluate the training objective on the held-out dataset across all ranks."""
+        if self._validation_dataloader is None:
+            return {}
+
+        was_training = self._transformer.training
+        previous_expert = self._active_noise_expert
+        self._transformer.eval()
+
+        device = self._accelerator.device
+        cuda_devices = []
+        if device.type == "cuda":
+            cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+
+        expert_losses: dict[str, float] = {}
+        try:
+            # Restore training RNG state on exit so evaluation never changes subsequent training batches.
+            with torch.random.fork_rng(devices=cuda_devices):
+                for expert_index, expert in enumerate(self._noise_experts):
+                    validation_seed = self._config.validation.seed + self._accelerator.process_index + expert_index
+                    torch.manual_seed(validation_seed)
+                    self._active_noise_expert = expert
+                    self._set_active_lora_adapter(expert.name)
+
+                    total_loss = 0.0
+                    total_samples = 0
+                    max_batches = self._config.validation.max_loss_batches
+                    for batch_index, batch in enumerate(self._validation_dataloader):
+                        if max_batches is not None and batch_index >= max_batches:
+                            break
+
+                        output = self._training_step(batch, expert.sampler)
+                        gathered_loss = self._accelerator.gather_for_metrics(output.loss.detach().float())
+                        total_loss += gathered_loss.sum().item()
+                        total_samples += gathered_loss.numel()
+
+                    if total_samples == 0:
+                        raise RuntimeError("Held-out validation dataloader produced no samples")
+                    expert_losses[expert.name] = total_loss / total_samples
+        finally:
+            if previous_expert is not None:
+                self._active_noise_expert = previous_expert
+                self._set_active_lora_adapter(previous_expert.name)
+            self._transformer.train(was_training)
+
+        if len(expert_losses) == 1:
+            metrics = {"validation/loss": next(iter(expert_losses.values()))}
+        else:
+            metrics = {
+                "validation/loss": sum(expert_losses.values()) / len(expert_losses),
+                **{f"validation/loss/{name}": loss for name, loss in expert_losses.items()},
+            }
+
+        if self._accelerator.is_main_process:
+            loss_summary = ", ".join(f"{name}={loss:.6f}" for name, loss in expert_losses.items())
+            logger.info(f"Held-out validation loss at step {self._global_step}: {loss_summary}")
+            self._log_metrics(metrics, step=self._global_step)
+
+        self._accelerator.wait_for_everyone()
+        return metrics
 
     def _run_distributed_validation(self, progress: TrainingProgress) -> list[Path]:
         """Run validation across all ranks and log gathered results on rank 0.
@@ -2155,10 +2271,36 @@ class LtxvTrainer:
         run = wandb.init(**init_kwargs)
         self._wandb_run = run
 
-    def _log_metrics(self, metrics: dict[str, float]) -> None:
-        """Log metrics to Weights & Biases."""
+    def _init_tensorboard(self) -> None:
+        """Initialize the TensorBoard writer on the main process."""
+        if not self._config.tensorboard.enabled or not IS_MAIN_PROCESS:
+            self._tensorboard_writer = None
+            return
+
+        tensorboard_config = self._config.tensorboard
+        log_dir = (
+            Path(tensorboard_config.log_dir).expanduser()
+            if tensorboard_config.log_dir is not None
+            else Path(self._config.output_dir) / "tensorboard"
+        )
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self._tensorboard_writer = SummaryWriter(
+            log_dir=str(log_dir),
+            flush_secs=tensorboard_config.flush_secs,
+        )
+        logger.info(f"TensorBoard logging enabled: {log_dir}")
+
+    def _log_metrics(self, metrics: dict[str, float], step: int | None = None) -> None:
+        """Log scalar metrics to enabled experiment trackers."""
         if self._wandb_run is not None:
-            self._wandb_run.log(metrics)
+            if step is None:
+                self._wandb_run.log(metrics)
+            else:
+                self._wandb_run.log(metrics, step=step, commit=False)
+        if self._tensorboard_writer is not None:
+            global_step = self._global_step if step is None else step
+            for name, value in metrics.items():
+                self._tensorboard_writer.add_scalar(name, value, global_step)
 
     def _log_validation_samples(self, sample_paths: list[Path], prompts: list[str]) -> None:
         """Log validation samples (videos or images) to Weights & Biases."""

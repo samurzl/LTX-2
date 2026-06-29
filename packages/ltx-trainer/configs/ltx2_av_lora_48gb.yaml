@@ -73,6 +73,7 @@ acceleration:
 
 data:
   preprocessed_data_root: "/path/to/preprocessed/data"
+  validation_data_root: null
   num_dataloader_workers: 2
 
 validation:
@@ -89,6 +90,8 @@ validation:
   seed: 42
   inference_steps: 24
   interval: 250
+  loss_interval: null
+  max_loss_batches: null
   guidance_scale: 4.0
   stg_scale: 1.0
   stg_blocks: [ 29 ]
@@ -115,6 +118,11 @@ wandb:
   entity: null
   tags: [ "ltx2", "lora", "48gb", "640x352x41" ]
   log_validation_videos: true
+
+tensorboard:
+  enabled: false
+  log_dir: null
+  flush_secs: 120
 
 seed: 42
 output_dir: "outputs/ltx2_av_lora_48gb_640x352x41"

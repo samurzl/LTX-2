@@ -306,16 +306,18 @@ Data loading and processing configuration.
 
 ```yaml
 data:
-  preprocessed_data_root: "/path/to/preprocessed/data"  # Path to precomputed dataset
-  num_dataloader_workers: 2                             # Background data loading workers
+  preprocessed_data_root: "/path/to/preprocessed/data"       # Training dataset
+  validation_data_root: "/path/to/preprocessed/held-out-data" # Optional held-out dataset
+  num_dataloader_workers: 2                                  # Background data loading workers
 ```
 
 **Key parameters:**
 
-| Parameter                | Description                                                                                |
-|--------------------------|--------------------------------------------------------------------------------------------|
-| `preprocessed_data_root` | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.)               |
-| `num_dataloader_workers` | Number of parallel data loading processes (0 = synchronous loading, useful when debugging) |
+| Parameter                  | Description                                                                                |
+|----------------------------|--------------------------------------------------------------------------------------------|
+| `preprocessed_data_root`   | Path to your preprocessed training dataset (contains `latents/`, `conditions/`, etc.)      |
+| `validation_data_root`     | Path to a separately preprocessed held-out dataset; required when `loss_interval` is set   |
+| `num_dataloader_workers`   | Number of parallel data loading processes (0 = synchronous loading, useful when debugging) |
 
 ### ValidationConfig
 
@@ -333,13 +335,15 @@ validation:
   frame_rate: 25.0                    # Frame rate for generated videos
   seed: 42                            # Random seed for reproducibility
   inference_steps: 30                 # Number of inference steps
-  interval: 100                       # Steps between validation runs
+  interval: 100                       # Steps between generated validation samples
+  loss_interval: 100                  # Steps between held-out loss evaluations
+  max_loss_batches: null              # null evaluates the full held-out dataset
   guidance_scale: 4.0                 # CFG guidance strength
   stg_scale: 1.0                      # STG guidance strength (0.0 to disable)
   stg_blocks: [ 29 ]                  # Transformer blocks to perturb for STG
   stg_mode: "stg_av"                  # "stg_av" or "stg_v" (video only)
   generate_audio: true                # Whether to generate audio
-  skip_initial_validation: false      # Skip validation at step 0
+  skip_initial_validation: false      # Skip held-out loss and sample generation at step 0
   include_reference_in_output: false  # Include reference video side-by-side (IC-LoRA)
 ```
 
@@ -351,7 +355,9 @@ validation:
 | `images`                      | List of image paths for image-to-video validation (must match number of prompts)                                         |
 | `reference_videos`            | List of reference video paths for IC-LoRA validation (must match number of prompts)                                      |
 | `video_dims`                  | Output dimensions `[width, height, frames]`. Width/height must be divisible by 32, frames must satisfy `frames % 8 == 1` |
-| `interval`                    | Steps between validation runs (set to `null` to disable)                                                                 |
+| `interval`                    | Steps between generated validation sample runs (set to `null` to disable)                                                |
+| `loss_interval`               | Steps between held-out loss evaluations (set to `null` to disable); requires `data.validation_data_root`                 |
+| `max_loss_batches`            | Maximum batches evaluated per held-out loss run (`null` evaluates the full dataset)                                      |
 | `guidance_scale`              | CFG (Classifier-Free Guidance) scale. Recommended: 4.0                                                                   |
 | `stg_scale`                   | STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. Recommended: 1.0                                                 |
 | `stg_blocks`                  | Transformer blocks to perturb for STG. Recommended: `[29]` (single block)                                                |
@@ -416,6 +422,30 @@ wandb:
 | `project`               | W&B project name                                 |
 | `entity`                | W&B username or team (null uses default account) |
 | `log_validation_videos` | Whether to log validation videos to W&B          |
+
+### TensorBoardConfig
+
+TensorBoard scalar logging can be enabled independently of W&B. It records training loss, learning rate, timing,
+held-out validation loss, sigma-bucket losses, and final run statistics.
+
+```yaml
+tensorboard:
+  enabled: true
+  log_dir: null    # Defaults to <output_dir>/tensorboard
+  flush_secs: 120
+```
+
+Launch TensorBoard with:
+
+```bash
+tensorboard --logdir outputs
+```
+
+| Parameter    | Description                                                        |
+|--------------|--------------------------------------------------------------------|
+| `enabled`    | Whether to write TensorBoard event files                           |
+| `log_dir`    | Event directory (`null` uses `<output_dir>/tensorboard`)            |
+| `flush_secs` | Maximum interval in seconds between event-file flushes              |
 
 ### FlowMatchingConfig
 

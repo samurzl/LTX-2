@@ -195,6 +195,9 @@ data:
   # Should contain: latents/, conditions/, and optionally audio_latents/
   preprocessed_data_root: "/path/to/preprocessed/data"
 
+  # Separate preprocessed dataset for held-out loss (required when loss_interval is set)
+  validation_data_root: null
+
   # Number of worker processes for data loading
   # Used for parallel data loading to speed up data loading
   num_dataloader_workers: 2
@@ -239,6 +242,12 @@ validation:
   # Set to null to disable validation during training
   interval: 100
 
+  # Evaluate held-out loss every N steps (null disables held-out loss)
+  loss_interval: null
+
+  # Limit held-out evaluation cost (null evaluates the full validation dataset)
+  max_loss_batches: null
+
   # Classifier-free guidance scale
   # Higher values = stronger adherence to prompt but may introduce artifacts
   guidance_scale: 4.0
@@ -254,7 +263,7 @@ validation:
   # in validation even when not training the audio branch
   generate_audio: true
 
-  # Skip validation at the beginning of training (step 0)
+  # Skip held-out loss and validation sample generation at step 0
   skip_initial_validation: false
 
 # -----------------------------------------------------------------------------
@@ -317,6 +326,11 @@ wandb:
 
   # Log validation videos to W&B
   log_validation_videos: true
+
+tensorboard:
+  enabled: false
+  log_dir: null  # Defaults to <output_dir>/tensorboard
+  flush_secs: 120
 
 # -----------------------------------------------------------------------------
 # General Configuration

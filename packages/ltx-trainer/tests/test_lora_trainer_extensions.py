@@ -45,7 +45,7 @@ from ltx_trainer.datasets import (
 )
 from ltx_trainer.model_loader import _transformer_sd_ops_for_checkpoint
 from ltx_trainer.timestep_samplers import RangeScaledTimestepSampler, UniformTimestepSampler
-from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.trainer import LtxvTrainer, NoiseExpert, TrainingStepOutput
 from process_videos import _audio_has_activity
 
 
@@ -155,6 +155,111 @@ def test_trainer_preflight_accepts_valid_monolithic_config(tmp_path: Path) -> No
 
     assert result.checkpoint_path is None
     assert result.resume_state is None
+
+
+def test_validation_loss_requires_held_out_dataset(tmp_path: Path) -> None:
+    config_data = _base_preflight_config(tmp_path).model_dump()
+    config_data["validation"]["loss_interval"] = 10
+
+    with pytest.raises(ValidationError, match="validation_data_root is required"):
+        LtxTrainerConfig(**config_data)
+
+
+def test_trainer_preflight_accepts_held_out_dataset(tmp_path: Path) -> None:
+    config = _base_preflight_config(tmp_path)
+    validation_root = _write_preflight_dataset(tmp_path / "validation_data", sample_count=2)
+    config.data.validation_data_root = str(validation_root)
+    config.validation.loss_interval = 10
+
+    result = LtxvTrainer.preflight_config(config)
+
+    assert result.checkpoint_path is None
+
+
+def test_held_out_validation_loss_aggregates_batches_and_restores_mode() -> None:
+    class FakeAccelerator:
+        device = torch.device("cpu")
+        process_index = 0
+        is_main_process = True
+
+        @staticmethod
+        def gather_for_metrics(value: torch.Tensor) -> torch.Tensor:
+            return value
+
+        @staticmethod
+        def wait_for_everyone() -> None:
+            return None
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(validation=SimpleNamespace(seed=42, max_loss_batches=2))
+    trainer._accelerator = FakeAccelerator()
+    trainer._transformer = torch.nn.Linear(1, 1)
+    trainer._transformer.train()
+    trainer._validation_dataloader = [
+        {"loss": torch.tensor([1.0, 3.0])},
+        {"loss": torch.tensor([5.0])},
+        {"loss": torch.tensor([100.0])},
+    ]
+    expert = NoiseExpert("default", 0.0, 1.0, UniformTimestepSampler())
+    trainer._noise_experts = [expert]
+    trainer._active_noise_expert = expert
+    trainer._global_step = 7
+    trainer._set_active_lora_adapter = lambda _name: None
+    trainer._training_step = lambda batch, _sampler: TrainingStepOutput(
+        loss=batch["loss"],
+        sigma=torch.zeros_like(batch["loss"]),
+    )
+    logged: list[tuple[dict[str, float], int | None]] = []
+    trainer._log_metrics = lambda metrics, step=None: logged.append((metrics, step))
+
+    rng_state = torch.random.get_rng_state()
+    metrics = trainer._run_validation_loss()
+
+    assert metrics == {"validation/loss": pytest.approx(3.0)}
+    assert logged == [(metrics, 7)]
+    assert trainer._transformer.training
+    assert torch.equal(torch.random.get_rng_state(), rng_state)
+
+
+def test_metric_logging_writes_tensorboard_scalars_at_global_step() -> None:
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.scalars: list[tuple[str, float, int]] = []
+
+        def add_scalar(self, name: str, value: float, step: int) -> None:
+            self.scalars.append((name, value, step))
+
+    trainer = object.__new__(LtxvTrainer)
+    writer = FakeWriter()
+    trainer._wandb_run = None
+    trainer._tensorboard_writer = writer
+    trainer._global_step = 12
+
+    trainer._log_metrics({"train/loss": 1.25, "validation/loss": 2.5})
+
+    assert writer.scalars == [
+        ("train/loss", 1.25, 12),
+        ("validation/loss", 2.5, 12),
+    ]
+
+
+def test_validation_metric_logging_does_not_advance_wandb_step() -> None:
+    class FakeWandbRun:
+        def __init__(self) -> None:
+            self.calls: list[tuple[dict[str, float], int, bool]] = []
+
+        def log(self, metrics: dict[str, float], *, step: int, commit: bool) -> None:
+            self.calls.append((metrics, step, commit))
+
+    trainer = object.__new__(LtxvTrainer)
+    run = FakeWandbRun()
+    trainer._wandb_run = run
+    trainer._tensorboard_writer = None
+    trainer._global_step = 12
+
+    trainer._log_metrics({"validation/loss": 2.5}, step=12)
+
+    assert run.calls == [({"validation/loss": 2.5}, 12, False)]
 
 
 def test_trainer_preflight_accepts_split_components_without_unused_audio(tmp_path: Path) -> None:

@@ -102,7 +102,12 @@ def print_config(config: LtxTrainerConfig) -> None:
                 "🎥 Validation",
                 [
                     ("Prompts", f"{len(val.prompts)} prompt(s)" if val.prompts else "[dim]—[/]"),
-                    ("Interval", f"Every {val.interval} steps" if val.interval else "[dim]Disabled[/]"),
+                    ("Sample Interval", f"Every {val.interval} steps" if val.interval else "[dim]Disabled[/]"),
+                    (
+                        "Loss Interval",
+                        f"Every {val.loss_interval} steps" if val.loss_interval else "[dim]Disabled[/]",
+                    ),
+                    ("Max Loss Batches", str(val.max_loss_batches) if val.max_loss_batches else "[dim]All[/]"),
                     ("Video Dims", f"{val.video_dims[0]}x{val.video_dims[1]}, {val.video_dims[2]} frames"),
                     ("Frame Rate", f"{val.frame_rate} fps"),
                     ("Inference Steps", str(val.inference_steps)),
@@ -119,7 +124,8 @@ def print_config(config: LtxTrainerConfig) -> None:
             (
                 "📂 Data & Output",
                 [
-                    ("Dataset", fmt(cfg.data.preprocessed_data_root)),
+                    ("Training Dataset", fmt(cfg.data.preprocessed_data_root)),
+                    ("Validation Dataset", fmt(cfg.data.validation_data_root)),
                     ("Dataloader Workers", str(cfg.data.num_dataloader_workers)),
                     ("Output Dir", fmt(cfg.output_dir)),
                     ("Seed", str(cfg.seed)),
@@ -135,6 +141,12 @@ def print_config(config: LtxTrainerConfig) -> None:
                         else "[dim]Disabled[/]",
                     ),
                     ("W&B", f"{cfg.wandb.project}" if cfg.wandb.enabled else "[dim]Disabled[/]"),
+                    (
+                        "TensorBoard",
+                        fmt(cfg.tensorboard.log_dir or f"{cfg.output_dir}/tensorboard")
+                        if cfg.tensorboard.enabled
+                        else "[dim]Disabled[/]",
+                    ),
                     ("HF Hub", cfg.hub.hub_model_id if cfg.hub.push_to_hub else "[dim]Disabled[/]"),
                 ],
             ),
