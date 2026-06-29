@@ -1996,6 +1996,45 @@ class LtxvTrainer:
             for state, k in offloaded:
                 state[k] = state[k].to(device)
 
+    @contextlib.contextmanager
+    def _offloaded_transformer_blocks_for_validation_decode(self) -> Iterator[None]:
+        """Temporarily move trailing transformer blocks to CPU during validation decode."""
+        requested = self._config.acceleration.offload_transformer_blocks_during_validation
+        enabled = requested > 0 and self._accelerator.distributed_type != DistributedType.FSDP
+        if not enabled:
+            yield
+            return
+
+        unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+        transformer = unwrapped.get_base_model() if hasattr(unwrapped, "get_base_model") else unwrapped
+        blocks = getattr(transformer, "transformer_blocks", None)
+        if blocks is None:
+            logger.warning("Cannot offload validation decode blocks: transformer_blocks was not found")
+            yield
+            return
+        if len(blocks) == 0:
+            logger.warning("Cannot offload validation decode blocks: transformer_blocks is empty")
+            yield
+            return
+
+        count = min(requested, len(blocks))
+        selected_blocks = list(blocks[-count:])
+        logger.info(f"Offloading {count} transformer blocks to CPU for validation decode")
+        offloaded_blocks: list[torch.nn.Module] = []
+        try:
+            for block in selected_blocks:
+                block.to("cpu")
+                offloaded_blocks.append(block)
+            free_gpu_memory()
+            yield
+        finally:
+            # Decoder modules move themselves back to CPU before this context exits.
+            # Clear their cached allocations before restoring the transformer slice.
+            free_gpu_memory()
+            device = self._accelerator.device
+            for block in offloaded_blocks:
+                block.to(device)
+
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
         scheduler_type = self._config.optimization.scheduler_type
@@ -2229,6 +2268,7 @@ class LtxvTrainer:
             audio_decoder=self._audio_vae if generate_audio else None,
             vocoder=self._vocoder if generate_audio else None,
             sampling_context=sampling_ctx,
+            decode_context=self._offloaded_transformer_blocks_for_validation_decode,
         )
 
         output_dir = Path(self._config.output_dir) / "samples"

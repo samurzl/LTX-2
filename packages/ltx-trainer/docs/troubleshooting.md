@@ -101,6 +101,20 @@ acceleration:
 The offload + reload happens once per validation interval, not per step.
 No effect for FSDP (sharded state).
 
+#### 8. Offload Transformer Blocks During Validation Decode
+
+If validation denoising succeeds but loading the VAE decoder OOMs, temporarily
+offload part of the transformer after denoising:
+
+```yaml
+acceleration:
+  offload_transformer_blocks_during_validation: 8
+```
+
+The trailing blocks move to CPU only for video/audio decoding and return to the
+GPU before the next validation sample. Start with 8 and increase it only if the
+decoder still does not fit. No effect for FSDP.
+
 ---
 
 ## ⚠️ Common Usage Issues

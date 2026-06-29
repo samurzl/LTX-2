@@ -359,6 +359,15 @@ class AccelerationConfig(ConfigBaseModel):
         "for FSDP (sharded state). Disabled by default.",
     )
 
+    offload_transformer_blocks_during_validation: int = Field(
+        default=0,
+        ge=0,
+        description="Number of trailing transformer blocks to temporarily offload to CPU while "
+        "validation outputs are decoded by the VAE and audio decoders. The blocks are restored "
+        "before the next validation sample or training step. Useful when denoising fits but loading "
+        "the validation decoders causes an OOM. Has no effect for FSDP. Disabled by default.",
+    )
+
 
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""

@@ -3,8 +3,10 @@ This module provides a simplified validation pipeline for generating samples dur
 using the new ltx-core components (VideoLatentTools, AudioLatentTools, LatentState, etc.).
 """
 
+import contextlib
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 import torch
 from einops import rearrange
@@ -130,6 +132,7 @@ class ValidationSampler:
         vocoder: "Vocoder | None" = None,
         sampling_context: SamplingContext | None = None,
         embeddings_processor: "EmbeddingsProcessor | None" = None,
+        decode_context: Callable[[], AbstractContextManager[None]] | None = None,
     ):
         """Initialize the validation sampler.
         Args:
@@ -141,6 +144,7 @@ class ValidationSampler:
             vocoder: Optional vocoder (for audio generation)
             sampling_context: Optional SamplingContext for progress display during denoising
             embeddings_processor: Optional embeddings processor (required if text_encoder provided)
+            decode_context: Optional context entered only while validation outputs are decoded
         """
         self._transformer = transformer
         self._vae_decoder = vae_decoder
@@ -150,6 +154,7 @@ class ValidationSampler:
         self._audio_decoder = audio_decoder
         self._vocoder = vocoder
         self._sampling_context = sampling_context
+        self._decode_context = decode_context or contextlib.nullcontext
 
         # Patchifiers
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
@@ -222,16 +227,18 @@ class ValidationSampler:
             device=device,
         )
 
-        # Decode outputs
-        video_state = video_tools.clear_conditioning(video_state)
-        video_state = video_tools.unpatchify(video_state)
-        video_output = self._decode_video(video_state, device, config.tiled_decoding)
+        # Decode outputs. The trainer can use this narrow context to temporarily
+        # offload transformer blocks now that denoising has finished.
+        with self._decode_context():
+            video_state = video_tools.clear_conditioning(video_state)
+            video_state = video_tools.unpatchify(video_state)
+            video_output = self._decode_video(video_state, device, config.tiled_decoding)
 
-        audio_output = None
-        if audio_state is not None and audio_tools is not None:
-            audio_state = audio_tools.clear_conditioning(audio_state)
-            audio_state = audio_tools.unpatchify(audio_state)
-            audio_output = self._decode_audio(audio_state, device)
+            audio_output = None
+            if audio_state is not None and audio_tools is not None:
+                audio_state = audio_tools.clear_conditioning(audio_state)
+                audio_state = audio_tools.unpatchify(audio_state)
+                audio_output = self._decode_audio(audio_state, device)
 
         return video_output, audio_output
 
@@ -309,25 +316,26 @@ class ValidationSampler:
             device=device,
         )
 
-        # Extract target portion and decode
-        target_latent = combined_state.latent[:, ref_seq_len:]
-        video_output = self._decode_video_latent(target_latent, config, device)
+        with self._decode_context():
+            # Extract target portion and decode
+            target_latent = combined_state.latent[:, ref_seq_len:]
+            video_output = self._decode_video_latent(target_latent, config, device)
 
-        # Optionally concatenate original reference video side-by-side
-        if config.include_reference_in_output:
-            # Use preprocessed reference (already resized/cropped, in pixel space)
-            # Convert from [B, C, F, H, W] to [C, F, H, W]
-            ref_video_pixels = ref_video_preprocessed[0].cpu()
-            # Normalize from [-1, 1] to [0, 1]
-            ref_video_pixels = ((ref_video_pixels + 1.0) / 2.0).clamp(0.0, 1.0)
-            video_output = self._concatenate_videos_side_by_side(ref_video_pixels, video_output)
+            # Optionally concatenate original reference video side-by-side
+            if config.include_reference_in_output:
+                # Use preprocessed reference (already resized/cropped, in pixel space)
+                # Convert from [B, C, F, H, W] to [C, F, H, W]
+                ref_video_pixels = ref_video_preprocessed[0].cpu()
+                # Normalize from [-1, 1] to [0, 1]
+                ref_video_pixels = ((ref_video_pixels + 1.0) / 2.0).clamp(0.0, 1.0)
+                video_output = self._concatenate_videos_side_by_side(ref_video_pixels, video_output)
 
-        # Decode audio
-        audio_output = None
-        if audio_state is not None and audio_tools is not None:
-            audio_state = audio_tools.clear_conditioning(audio_state)
-            audio_state = audio_tools.unpatchify(audio_state)
-            audio_output = self._decode_audio(audio_state, device)
+            # Decode audio
+            audio_output = None
+            if audio_state is not None and audio_tools is not None:
+                audio_state = audio_tools.clear_conditioning(audio_state)
+                audio_state = audio_tools.unpatchify(audio_state)
+                audio_output = self._decode_audio(audio_state, device)
 
         return video_output, audio_output
 
@@ -634,36 +642,37 @@ class ValidationSampler:
 
         # Decode - ensure bfloat16 to match decoder weights
         self._vae_decoder.to(device)
-        unpatchified = unpatchified.to(dtype=torch.bfloat16)
-        tiled_config = config.tiled_decoding
+        try:
+            unpatchified = unpatchified.to(dtype=torch.bfloat16)
+            tiled_config = config.tiled_decoding
 
-        if tiled_config is not None and tiled_config.enabled:
-            # Use tiled decoding for reduced VRAM
-            tiling_config = TilingConfig(
-                spatial_config=SpatialTilingConfig(
-                    tile_size_in_pixels=tiled_config.tile_size_pixels,
-                    tile_overlap_in_pixels=tiled_config.tile_overlap_pixels,
-                ),
-                temporal_config=TemporalTilingConfig(
-                    tile_size_in_frames=tiled_config.tile_size_frames,
-                    tile_overlap_in_frames=tiled_config.tile_overlap_frames,
-                ),
-            )
-            chunks = []
-            for video_chunk in self._vae_decoder.tiled_decode(
-                unpatchified,
-                tiling_config=tiling_config,
-            ):
-                chunks.append(video_chunk)
-            decoded_video = torch.cat(chunks, dim=2)
-        else:
-            # Standard full decoding
-            decoded_video = self._vae_decoder(unpatchified)
+            if tiled_config is not None and tiled_config.enabled:
+                # Use tiled decoding for reduced VRAM
+                tiling_config = TilingConfig(
+                    spatial_config=SpatialTilingConfig(
+                        tile_size_in_pixels=tiled_config.tile_size_pixels,
+                        tile_overlap_in_pixels=tiled_config.tile_overlap_pixels,
+                    ),
+                    temporal_config=TemporalTilingConfig(
+                        tile_size_in_frames=tiled_config.tile_size_frames,
+                        tile_overlap_in_frames=tiled_config.tile_overlap_frames,
+                    ),
+                )
+                chunks = []
+                for video_chunk in self._vae_decoder.tiled_decode(
+                    unpatchified,
+                    tiling_config=tiling_config,
+                ):
+                    chunks.append(video_chunk)
+                decoded_video = torch.cat(chunks, dim=2)
+            else:
+                # Standard full decoding
+                decoded_video = self._vae_decoder(unpatchified)
 
-        decoded_video = ((decoded_video + 1.0) / 2.0).clamp(0.0, 1.0)
-        self._vae_decoder.to("cpu")
-
-        return decoded_video[0].float().cpu()
+            decoded_video = ((decoded_video + 1.0) / 2.0).clamp(0.0, 1.0)
+            return decoded_video[0].float().cpu()
+        finally:
+            self._vae_decoder.to("cpu")
 
     def _validate_config(self, config: GenerationConfig) -> None:
         """Validate generation configuration."""
@@ -734,50 +743,55 @@ class ValidationSampler:
             Decoded video tensor [C, F, H, W] in [0, 1] range
         """
         self._vae_decoder.to(device)
-        # Ensure latent is bfloat16 to match decoder weights
-        latent = video_state.latent.to(dtype=torch.bfloat16)
+        try:
+            # Ensure latent is bfloat16 to match decoder weights
+            latent = video_state.latent.to(dtype=torch.bfloat16)
 
-        if tiled_config is not None and tiled_config.enabled:
-            # Use tiled decoding for reduced VRAM
-            tiling_config = TilingConfig(
-                spatial_config=SpatialTilingConfig(
-                    tile_size_in_pixels=tiled_config.tile_size_pixels,
-                    tile_overlap_in_pixels=tiled_config.tile_overlap_pixels,
-                ),
-                temporal_config=TemporalTilingConfig(
-                    tile_size_in_frames=tiled_config.tile_size_frames,
-                    tile_overlap_in_frames=tiled_config.tile_overlap_frames,
-                ),
-            )
-            chunks = []
-            for video_chunk in self._vae_decoder.tiled_decode(
-                latent,
-                tiling_config=tiling_config,
-            ):
-                chunks.append(video_chunk)
-            decoded_video = torch.cat(chunks, dim=2)
-        else:
-            # Standard full decoding
-            decoded_video = self._vae_decoder(latent)
+            if tiled_config is not None and tiled_config.enabled:
+                # Use tiled decoding for reduced VRAM
+                tiling_config = TilingConfig(
+                    spatial_config=SpatialTilingConfig(
+                        tile_size_in_pixels=tiled_config.tile_size_pixels,
+                        tile_overlap_in_pixels=tiled_config.tile_overlap_pixels,
+                    ),
+                    temporal_config=TemporalTilingConfig(
+                        tile_size_in_frames=tiled_config.tile_size_frames,
+                        tile_overlap_in_frames=tiled_config.tile_overlap_frames,
+                    ),
+                )
+                chunks = []
+                for video_chunk in self._vae_decoder.tiled_decode(
+                    latent,
+                    tiling_config=tiling_config,
+                ):
+                    chunks.append(video_chunk)
+                decoded_video = torch.cat(chunks, dim=2)
+            else:
+                # Standard full decoding
+                decoded_video = self._vae_decoder(latent)
 
-        decoded_video = ((decoded_video + 1.0) / 2.0).clamp(0.0, 1.0)
-        self._vae_decoder.to("cpu")
-        return decoded_video[0].float().cpu()
+            decoded_video = ((decoded_video + 1.0) / 2.0).clamp(0.0, 1.0)
+            return decoded_video[0].float().cpu()
+        finally:
+            self._vae_decoder.to("cpu")
 
     def _decode_audio(self, audio_state: LatentState, device: torch.device) -> Tensor:
         """Decode audio latents to waveform."""
         self._audio_decoder.to(device)
-        first_param = next(self._audio_decoder.parameters(), None)
-        decoder_dtype = first_param.dtype if first_param is not None else audio_state.latent.dtype
-        latent = audio_state.latent.to(dtype=decoder_dtype, device=device)
-        decoded_audio = self._audio_decoder(latent)
-        self._audio_decoder.to("cpu")
+        try:
+            first_param = next(self._audio_decoder.parameters(), None)
+            decoder_dtype = first_param.dtype if first_param is not None else audio_state.latent.dtype
+            latent = audio_state.latent.to(dtype=decoder_dtype, device=device)
+            decoded_audio = self._audio_decoder(latent)
+        finally:
+            self._audio_decoder.to("cpu")
 
         self._vocoder.to(device)
-        audio_waveform = self._vocoder(decoded_audio)
-        self._vocoder.to("cpu")
-
-        return audio_waveform.squeeze(0).float().cpu()
+        try:
+            audio_waveform = self._vocoder(decoded_audio)
+            return audio_waveform.squeeze(0).float().cpu()
+        finally:
+            self._vocoder.to("cpu")
 
     @staticmethod
     def _concatenate_videos_side_by_side(left_video: Tensor, right_video: Tensor) -> Tensor:

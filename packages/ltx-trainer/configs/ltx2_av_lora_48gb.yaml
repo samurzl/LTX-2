@@ -21,6 +21,7 @@
 #   - 8-bit text encoder loading
 #   - Gradient checkpointing
 #   - Optimizer offload during validation
+#   - 8 transformer blocks offloaded while validation samples are decoded
 #
 # =============================================================================
 
@@ -70,6 +71,7 @@ acceleration:
   quantization: "int8-quanto"
   load_text_encoder_in_8bit: true
   offload_optimizer_during_validation: true
+  offload_transformer_blocks_during_validation: 8
 
 data:
   preprocessed_data_root: "/path/to/preprocessed/data"

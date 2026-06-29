@@ -289,6 +289,7 @@ acceleration:
   quantization: null                            # Optional post-load trainer quantization
   load_text_encoder_in_8bit: false              # Load text encoder in 8-bit
   offload_optimizer_during_validation: false    # Offload optimizer state to CPU during validation
+  offload_transformer_blocks_during_validation: 0 # Blocks to offload while validation outputs decode
 ```
 
 **Key parameters:**
@@ -299,6 +300,7 @@ acceleration:
 | `quantization`                        | Optional post-load trainer quantization: `null`, `"int8-quanto"`, `"int4-quanto"`, `"fp8-quanto"`, etc. Scaled FP8 transformer checkpoints are dequantized safely on load; FP4/NVFP4 transformer checkpoints are not supported for native training. |
 | `load_text_encoder_in_8bit`           | Load the Gemma text encoder in 8-bit to save GPU memory                                                                                                                                  |
 | `offload_optimizer_during_validation` | Move optimizer state to CPU before validation video sampling and back afterwards. Useful when validation OOMs because VAE decoder + transformer + optimizer state can't coexist on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP. |
+| `offload_transformer_blocks_during_validation` | Number of trailing transformer blocks to move to CPU only while validation outputs are decoded. Use this when denoising fits but loading the VAE or audio decoders OOMs. The blocks are restored before the next sample; no effect for FSDP. |
 
 ### DataConfig
 

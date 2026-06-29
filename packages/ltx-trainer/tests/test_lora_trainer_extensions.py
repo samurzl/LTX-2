@@ -10,6 +10,7 @@ from typing import Protocol
 import pytest
 import torch
 import yaml
+from accelerate import DistributedType
 from pydantic import ValidationError
 from safetensors.torch import save_file
 from typer.testing import CliRunner
@@ -36,7 +37,7 @@ from ltx_trainer.comfy_negative_backend import (
     comfy_latent_bytes_to_trainer_payload,
 )
 import train as train_script
-from ltx_trainer.config import LoraConfig, LtxTrainerConfig, ModelConfig
+from ltx_trainer.config import AccelerationConfig, LoraConfig, LtxTrainerConfig, ModelConfig
 from ltx_trainer.datasets import (
     AnchorSampleDataset,
     OptionalSourceGroupedBatchSampler,
@@ -128,6 +129,55 @@ def test_noise_expert_config_rejects_overlaps() -> None:
 
 def test_nsync_config_uses_anchor_projection_by_default() -> None:
     assert LoraConfig(nsync={"enabled": True}).nsync.anchor_strength == 1.0
+
+
+def test_validation_decode_block_offload_config_is_nonnegative() -> None:
+    assert AccelerationConfig().offload_transformer_blocks_during_validation == 0
+    config = AccelerationConfig(offload_transformer_blocks_during_validation=8)
+    assert config.offload_transformer_blocks_during_validation == 8
+
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        AccelerationConfig(offload_transformer_blocks_during_validation=-1)
+
+
+def test_validation_decode_offload_moves_only_requested_trailing_blocks_and_restores_on_error() -> None:
+    class TrackingBlock(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.moves: list[torch.device] = []
+
+        def to(self, device: torch.device | str, *args, **kwargs) -> "TrackingBlock":
+            del args, kwargs
+            self.moves.append(torch.device(device))
+            return self
+
+    class FakeAccelerator:
+        device = torch.device("cuda:0")
+        distributed_type = DistributedType.NO
+
+        @staticmethod
+        def unwrap_model(model: torch.nn.Module, keep_torch_compile: bool = False) -> torch.nn.Module:
+            del keep_torch_compile
+            return model
+
+    transformer = torch.nn.Module()
+    transformer.transformer_blocks = torch.nn.ModuleList([TrackingBlock() for _ in range(4)])
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = SimpleNamespace(acceleration=SimpleNamespace(offload_transformer_blocks_during_validation=2))
+    trainer._accelerator = FakeAccelerator()
+    trainer._transformer = transformer
+
+    with (
+        pytest.raises(RuntimeError, match="decode failed"),
+        trainer._offloaded_transformer_blocks_for_validation_decode(),
+    ):
+        raise RuntimeError("decode failed")
+
+    blocks = list(transformer.transformer_blocks)
+    assert blocks[0].moves == []
+    assert blocks[1].moves == []
+    assert blocks[2].moves == [torch.device("cpu"), torch.device("cuda:0")]
+    assert blocks[3].moves == [torch.device("cpu"), torch.device("cuda:0")]
 
 
 def test_component_paths_can_replace_base_model_path() -> None:
