@@ -34,6 +34,7 @@ from rich.console import Console
 from ltx_core.quantization import QuantizationPolicy
 from ltx_trainer import logger
 from ltx_trainer.gpu_utils import free_gpu_memory_context
+from ltx_trainer.warm_client import submit_if_running
 
 if TYPE_CHECKING:
     import torch
@@ -675,7 +676,7 @@ def _build_negative_quantization_policy(kind: str, checkpoint_path: str) -> Quan
 
 
 @app.command()
-def main(  # noqa: PLR0913
+def main(  # noqa: PLR0912, PLR0913
     dataset_path: str = typer.Argument(
         ...,
         help="Path to metadata file (CSV/JSON/JSONL) containing captions and video paths",
@@ -903,47 +904,50 @@ def main(  # noqa: PLR0913
     if generate_negatives and negative_distilled_lora is not None:
         _validate_safetensors_file("Distilled LoRA", negative_distilled_lora)
 
-    preprocess_dataset(
-        dataset_file=dataset_path,
-        caption_column=caption_column,
-        video_column=video_column,
-        resolution_buckets=parsed_resolution_buckets,
-        batch_size=batch_size,
-        output_dir=output_dir,
-        lora_trigger=lora_trigger,
-        vae_tiling=vae_tiling,
-        decode=decode,
-        model_path=model_path,
-        text_encoder_path=text_encoder_path,
-        device=device,
-        remove_llm_prefixes=remove_llm_prefixes,
-        reference_column=reference_column,
-        reference_downscale_factor=reference_downscale_factor,
-        with_audio=with_audio,
-        mixed_audio=mixed_audio,
-        audio_min_rms_db=audio_min_rms_db,
-        audio_min_active_ratio=audio_min_active_ratio,
-        audio_activity_window_ms=audio_activity_window_ms,
-        generate_negatives=generate_negatives,
-        negative_videos_dir=negative_videos_dir,
-        negative_latents_dir=negative_latents_dir,
-        negative_prompt=negative_prompt,
-        negative_distilled_lora=negative_distilled_lora,
-        negative_distilled_lora_strength=negative_distilled_lora_strength,
-        negative_inference_steps=negative_inference_steps,
-        negative_guidance_scale=negative_guidance_scale,
-        negative_backend=negative_backend,
-        negative_quantization=negative_quantization,
-        comfy_server=comfy_server,
-        comfy_checkpoint_name=comfy_checkpoint_name,
-        comfy_text_encoder_name=comfy_text_encoder_name,
-        comfy_distilled_lora_name=comfy_distilled_lora_name,
-        comfy_sampler_name=comfy_sampler_name,
-        comfy_timeout_seconds=comfy_timeout_seconds,
-        negative_seed=negative_seed,
-        load_text_encoder_in_8bit=load_text_encoder_in_8bit,
-        overwrite=overwrite,
-    )
+    preprocess_args = {
+        "dataset_file": dataset_path,
+        "caption_column": caption_column,
+        "video_column": video_column,
+        "resolution_buckets": parsed_resolution_buckets,
+        "batch_size": batch_size,
+        "output_dir": output_dir,
+        "lora_trigger": lora_trigger,
+        "vae_tiling": vae_tiling,
+        "decode": decode,
+        "model_path": model_path,
+        "text_encoder_path": text_encoder_path,
+        "device": device,
+        "remove_llm_prefixes": remove_llm_prefixes,
+        "reference_column": reference_column,
+        "reference_downscale_factor": reference_downscale_factor,
+        "with_audio": with_audio,
+        "mixed_audio": mixed_audio,
+        "audio_min_rms_db": audio_min_rms_db,
+        "audio_min_active_ratio": audio_min_active_ratio,
+        "audio_activity_window_ms": audio_activity_window_ms,
+        "generate_negatives": generate_negatives,
+        "negative_videos_dir": negative_videos_dir,
+        "negative_latents_dir": negative_latents_dir,
+        "negative_prompt": negative_prompt,
+        "negative_distilled_lora": negative_distilled_lora,
+        "negative_distilled_lora_strength": negative_distilled_lora_strength,
+        "negative_inference_steps": negative_inference_steps,
+        "negative_guidance_scale": negative_guidance_scale,
+        "negative_backend": negative_backend,
+        "negative_quantization": negative_quantization,
+        "comfy_server": comfy_server,
+        "comfy_checkpoint_name": comfy_checkpoint_name,
+        "comfy_text_encoder_name": comfy_text_encoder_name,
+        "comfy_distilled_lora_name": comfy_distilled_lora_name,
+        "comfy_sampler_name": comfy_sampler_name,
+        "comfy_timeout_seconds": comfy_timeout_seconds,
+        "negative_seed": negative_seed,
+        "load_text_encoder_in_8bit": load_text_encoder_in_8bit,
+        "overwrite": overwrite,
+    }
+    if submit_if_running("preprocess", preprocess_args):
+        return
+    preprocess_dataset(**preprocess_args)
 
 
 if __name__ == "__main__":

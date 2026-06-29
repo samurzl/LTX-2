@@ -3,10 +3,15 @@ from __future__ import annotations
 # ruff: noqa: E402, I001
 
 import sys
+import json
+import os
+import socket
+import threading
 from pathlib import Path
 
 import pytest
 import torch
+from typer.testing import CliRunner
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CORE_SRC = REPO_ROOT / "packages" / "ltx-core" / "src"
@@ -17,8 +22,10 @@ sys.path.insert(0, str(TRAINER_SRC))
 sys.path.insert(0, str(TRAINER_SCRIPTS))
 
 import process_dataset
+import train as train_script
 from ltx_trainer.model_pool import ModelCacheKey, WarmModelPool
 from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.warm_client import SOCKET_ENV, submit_if_running
 
 
 class _TrackingModule(torch.nn.Linear):
@@ -142,3 +149,88 @@ def test_release_warm_models_removes_adapters_without_merging(tmp_path: Path) ->
     assert trainer._accelerator.freed
     assert not base.weight.requires_grad
     assert checkpointing == [False]
+
+
+def test_warm_client_submits_to_running_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    socket_path = Path("/tmp") / f"ltx-warm-test-{os.getpid()}.sock"
+    socket_path.unlink(missing_ok=True)
+    monkeypatch.setenv(SOCKET_ENV, str(socket_path))
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    received: list[dict] = []
+
+    def serve_one() -> None:
+        connection, _ = listener.accept()
+        with connection, connection.makefile("r", encoding="utf-8") as request_file:
+            received.append(json.loads(request_file.readline()))
+            connection.sendall(b'{"status":"accepted"}\n{"status":"ok","result":{}}\n')
+        listener.close()
+
+    thread = threading.Thread(target=serve_one)
+    thread.start()
+    assert submit_if_running("preprocess", {"dataset_file": "dataset.json"})
+    thread.join(timeout=2)
+    socket_path.unlink(missing_ok=True)
+
+    assert received[0]["command"] == "preprocess"
+    assert received[0]["args"] == {"dataset_file": "dataset.json"}
+
+
+def test_train_cli_uses_warm_server_without_changing_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("not parsed by client: true", encoding="utf-8")
+    submitted: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        train_script,
+        "submit_if_running",
+        lambda command, args: submitted.append((command, args)) or True,
+    )
+
+    result = CliRunner().invoke(train_script.app, [str(config_path)])
+
+    assert result.exit_code == 0
+    assert submitted[0][0] == "train"
+    assert submitted[0][1]["config_path"] == str(config_path.resolve())
+
+
+def test_process_dataset_cli_uses_warm_server_without_changing_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset.json"
+    dataset.write_text("[]", encoding="utf-8")
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model")
+    text_encoder = tmp_path / "gemma.safetensors"
+    text_encoder.write_bytes(b"gemma")
+    submitted: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        process_dataset,
+        "submit_if_running",
+        lambda command, args: submitted.append((command, args)) or True,
+    )
+
+    result = CliRunner().invoke(
+        process_dataset.app,
+        [
+            str(dataset),
+            "--resolution-buckets",
+            "64x64x9",
+            "--model-path",
+            str(model),
+            "--text-encoder-path",
+            str(text_encoder),
+            "--device",
+            "cpu",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert submitted[0][0] == "preprocess"
+    assert submitted[0][1]["resolution_buckets"] == [(9, 64, 64)]

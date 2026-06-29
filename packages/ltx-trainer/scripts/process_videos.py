@@ -51,6 +51,7 @@ from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
+from ltx_trainer.warm_client import submit_if_running
 
 if TYPE_CHECKING:
     from ltx_trainer.model_pool import WarmModelPool
@@ -1252,25 +1253,28 @@ def main(  # noqa: PLR0913
             "When training with multiple resolution buckets, you must use a batch size of 1."
         )
 
-    # Process latents
-    compute_latents(
-        dataset_file=dataset_file,
-        video_column=video_column,
-        resolution_buckets=parsed_resolution_buckets,
-        output_dir=output_dir,
-        model_path=model_path,
-        reshape_mode=reshape_mode,
-        batch_size=batch_size,
-        device=device,
-        vae_tiling=vae_tiling,
-        with_audio=with_audio,
-        audio_output_dir=audio_output_dir,
-        audio_min_rms_db=audio_min_rms_db,
-        audio_min_active_ratio=audio_min_active_ratio,
-        audio_activity_window_ms=audio_activity_window_ms,
-        allow_missing_audio=allow_missing_audio,
-        overwrite=overwrite,
-    )
+    # Process latents locally or in the persistent warm-model server.
+    job_args = {
+        "dataset_file": dataset_file,
+        "video_column": video_column,
+        "resolution_buckets": parsed_resolution_buckets,
+        "output_dir": output_dir,
+        "model_path": model_path,
+        "reshape_mode": reshape_mode,
+        "batch_size": batch_size,
+        "device": device,
+        "vae_tiling": vae_tiling,
+        "with_audio": with_audio,
+        "audio_output_dir": audio_output_dir,
+        "audio_min_rms_db": audio_min_rms_db,
+        "audio_min_active_ratio": audio_min_active_ratio,
+        "audio_activity_window_ms": audio_activity_window_ms,
+        "allow_missing_audio": allow_missing_audio,
+        "overwrite": overwrite,
+    }
+    if submit_if_running("latents", job_args):
+        return
+    compute_latents(**job_args)
 
 
 if __name__ == "__main__":

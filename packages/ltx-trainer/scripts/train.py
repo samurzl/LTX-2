@@ -22,6 +22,7 @@ from rich.console import Console
 
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.warm_client import submit_if_running
 
 console = Console()
 app = typer.Typer(
@@ -45,6 +46,15 @@ def main(
     if not config_path.exists():
         typer.echo(f"Error: Configuration file {config_path} does not exist.")
         raise typer.Exit(code=1)
+
+    if submit_if_running(
+        "train",
+        {
+            "config_path": str(config_path.expanduser().resolve()),
+            "disable_progress_bars": disable_progress_bars,
+        },
+    ):
+        return
 
     with open(config_path, "r") as file:
         config_data = yaml.safe_load(file)

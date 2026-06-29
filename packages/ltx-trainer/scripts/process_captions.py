@@ -39,6 +39,7 @@ from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+from ltx_trainer.warm_client import submit_if_running
 
 if TYPE_CHECKING:
     from ltx_trainer.model_pool import WarmModelPool
@@ -555,21 +556,24 @@ def main(  # noqa: PLR0913
     if lora_trigger:
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
 
-    # Process embeddings
-    compute_captions_embeddings(
-        dataset_file=dataset_file,
-        output_dir=output_dir,
-        model_path=model_path,
-        text_encoder_path=text_encoder_path,
-        caption_column=caption_column,
-        media_column=media_column,
-        lora_trigger=lora_trigger,
-        remove_llm_prefixes=remove_llm_prefixes,
-        batch_size=batch_size,
-        device=device,
-        load_in_8bit=load_text_encoder_in_8bit,
-        overwrite=overwrite,
-    )
+    # Process embeddings locally or in the persistent warm-model server.
+    job_args = {
+        "dataset_file": dataset_file,
+        "output_dir": output_dir,
+        "model_path": model_path,
+        "text_encoder_path": text_encoder_path,
+        "caption_column": caption_column,
+        "media_column": media_column,
+        "lora_trigger": lora_trigger,
+        "remove_llm_prefixes": remove_llm_prefixes,
+        "batch_size": batch_size,
+        "device": device,
+        "load_in_8bit": load_text_encoder_in_8bit,
+        "overwrite": overwrite,
+    }
+    if submit_if_running("captions", job_args):
+        return
+    compute_captions_embeddings(**job_args)
 
 
 if __name__ == "__main__":
