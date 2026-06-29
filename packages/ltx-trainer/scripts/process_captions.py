@@ -11,11 +11,13 @@ Can be used as a standalone script:
         --model-source /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma.safetensors
 """
 
+from __future__ import annotations
+
 import json
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import torch
@@ -37,6 +39,9 @@ from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+
+if TYPE_CHECKING:
+    from ltx_trainer.model_pool import WarmModelPool
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -283,6 +288,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
     device: str = "cuda",
     load_in_8bit: bool = False,
     overwrite: bool = False,
+    model_pool: WarmModelPool | None = None,
 ) -> None:
     """
     Process captions and save text embeddings.
@@ -338,19 +344,48 @@ def compute_captions_embeddings(  # noqa: PLR0913
     if dataloader is None:
         return
 
-    # Load text encoder and embeddings processor
+    # Load text encoder and embeddings processor. A warm session retains both
+    # objects and only changes their device placement between jobs.
     with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
-        text_encoder = load_text_encoder(
-            text_encoder_path,
-            device=device,
-            dtype=torch.bfloat16,
-            load_in_8bit=load_in_8bit,
-        )
-        embeddings_processor = load_embeddings_processor(
-            model_path,
-            device=device,
-            dtype=torch.bfloat16,
-        )
+        if model_pool is None:
+            text_encoder = load_text_encoder(
+                text_encoder_path,
+                device=device,
+                dtype=torch.bfloat16,
+                load_in_8bit=load_in_8bit,
+            )
+            embeddings_processor = load_embeddings_processor(
+                model_path,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        else:
+            from ltx_trainer.model_pool import ModelCacheKey  # noqa: PLC0415
+
+            text_key = ModelCacheKey.create(
+                "text_encoder",
+                text_encoder_path,
+                torch.bfloat16,
+                load_in_8bit=load_in_8bit,
+            )
+            embeddings_key = ModelCacheKey.create("embeddings_processor", model_path, torch.bfloat16)
+            model_pool.offload_all(exclude={text_key, embeddings_key})
+            text_encoder = model_pool.get_or_load(
+                text_key,
+                lambda target: load_text_encoder(
+                    text_encoder_path,
+                    device=target,
+                    dtype=torch.bfloat16,
+                    load_in_8bit=load_in_8bit,
+                ),
+                device,
+                offloadable=not load_in_8bit,
+            )
+            embeddings_processor = model_pool.get_or_load(
+                embeddings_key,
+                lambda target: load_embeddings_processor(model_path, device=target, dtype=torch.bfloat16),
+                device,
+            )
 
     logger.info("Text encoder and embeddings processor loaded successfully")
     logger.info(f"Processing captions in {len(dataloader):,} batches...")

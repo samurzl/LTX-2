@@ -38,6 +38,8 @@ from ltx_trainer.gpu_utils import free_gpu_memory_context
 if TYPE_CHECKING:
     import torch
 
+    from ltx_trainer.model_pool import WarmModelPool
+
 console = Console()
 
 app = typer.Typer(
@@ -97,6 +99,7 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
     negative_seed: int = 42,
     load_text_encoder_in_8bit: bool = False,
     overwrite: bool = False,
+    model_pool: WarmModelPool | None = None,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -141,6 +144,7 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
             device=device,
             load_in_8bit=load_text_encoder_in_8bit,
             overwrite=overwrite,
+            model_pool=model_pool,
         )
 
     # Process videos using the dedicated function
@@ -166,9 +170,14 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
             audio_activity_window_ms=audio_activity_window_ms,
             allow_missing_audio=mixed_audio,
             overwrite=overwrite,
+            model_pool=model_pool,
         )
 
         if generate_negatives:
+            if model_pool is not None:
+                # The native negative pipeline owns its transformer lifecycle and can
+                # consume most of the GPU. Keep warm models on CPU while it runs.
+                model_pool.offload_all()
             logger.info("Generating synthetic negative latents with one-stage distilled-LoRA sampling...")
             if negative_videos_dir is not None:
                 logger.warning(
@@ -258,10 +267,13 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                 device=device,
                 vae_tiling=vae_tiling,
                 overwrite=overwrite,
+                model_pool=model_pool,
             )
 
     # Handle decoding if requested (for verification)
     if decode:
+        if model_pool is not None:
+            model_pool.offload_all()
         logger.info("Decoding latents for verification...")
 
         decoder = LatentsDecoder(

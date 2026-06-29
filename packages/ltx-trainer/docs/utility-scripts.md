@@ -109,6 +109,9 @@ Set one of these to use Gemini Flash without passing `--api-key`:
 
 The `scripts/process_dataset.py` script processes videos and caches latents for training.
 
+When running several preprocessing or LoRA training jobs with the same checkpoints, use a
+[warm model session](warm-sessions.md) to retain loaded components between jobs.
+
 To inspect a dataset and get a copy-pasteable bucket string first:
 
 ```bash

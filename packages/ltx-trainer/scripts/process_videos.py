@@ -12,12 +12,14 @@ Can be used as a standalone script:
         --output-dir /path/to/output --model-source /path/to/ltx2.safetensors
 """
 
+from __future__ import annotations
+
 import json
 import math
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -49,6 +51,9 @@ from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
+
+if TYPE_CHECKING:
+    from ltx_trainer.model_pool import WarmModelPool
 
 disable_progress_bar()
 
@@ -504,7 +509,7 @@ class MediaDataset(Dataset):
         return media_tensor
 
 
-def compute_latents(  # noqa: PLR0913, PLR0915
+def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     dataset_file: str | Path,
     video_column: str,
     resolution_buckets: list[tuple[int, int, int]],
@@ -522,6 +527,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     audio_activity_window_ms: float = 100.0,
     allow_missing_audio: bool = False,
     overwrite: bool = False,
+    model_pool: WarmModelPool | None = None,
 ) -> None:
     """
     Process videos and save latent representations.
@@ -600,20 +606,50 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     if dataloader is None:
         return
 
+    video_vae_key = None
+    audio_vae_key = None
+    if model_pool is not None:
+        from ltx_trainer.model_pool import ModelCacheKey  # noqa: PLC0415
+
+        video_vae_key = ModelCacheKey.create("video_vae_encoder", model_path, torch.bfloat16)
+        active_keys = {video_vae_key}
+        if with_audio:
+            audio_vae_key = ModelCacheKey.create("audio_vae_encoder", model_path, torch.float32)
+            active_keys.add(audio_vae_key)
+        model_pool.offload_all(exclude=active_keys)
+
     # Load video VAE encoder
     with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
-        vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
+        if model_pool is None:
+            vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
+        else:
+            vae = model_pool.get_or_load(
+                video_vae_key,
+                lambda target: load_video_vae_encoder(model_path, device=target, dtype=torch.bfloat16),
+                torch_device,
+            )
 
     # Load audio VAE encoder and audio processor if needed
     audio_vae_encoder = None
     audio_processor = None
     if with_audio:
         with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
-            audio_vae_encoder = load_audio_vae_encoder(
-                checkpoint_path=model_path,
-                device=torch_device,
-                dtype=torch.float32,  # Audio VAE needs float32 for quality. TODO: re-test with bfloat16.
-            )
+            if model_pool is None:
+                audio_vae_encoder = load_audio_vae_encoder(
+                    checkpoint_path=model_path,
+                    device=torch_device,
+                    dtype=torch.float32,  # Audio VAE needs float32 for quality. TODO: re-test with bfloat16.
+                )
+            else:
+                audio_vae_encoder = model_pool.get_or_load(
+                    audio_vae_key,
+                    lambda target: load_audio_vae_encoder(
+                        checkpoint_path=model_path,
+                        device=target,
+                        dtype=torch.float32,
+                    ),
+                    torch_device,
+                )
             # Create audio processor for waveform-to-spectrogram conversion
             audio_processor = AudioProcessor(
                 target_sample_rate=audio_vae_encoder.sample_rate,

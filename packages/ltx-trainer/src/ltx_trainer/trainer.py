@@ -34,6 +34,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import functional as F
 
+from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
@@ -46,8 +47,17 @@ from ltx_trainer.datasets import (
 )
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
-from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+from ltx_trainer.model_loader import (
+    load_audio_vae_decoder,
+    load_embeddings_processor,
+    load_text_encoder,
+    load_transformer,
+    load_video_vae_decoder,
+    load_video_vae_encoder,
+    load_vocoder,
+)
 from ltx_trainer.model_loader import load_model as load_ltx_model
+from ltx_trainer.model_pool import ModelCacheKey, WarmModelPool
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -417,9 +427,15 @@ class LtxvTrainer:
         self,
         trainer_config: LtxTrainerConfig,
         preflight_result: TrainerPreflightResult | None = None,
+        model_pool: WarmModelPool | None = None,
     ) -> None:
         self._config = trainer_config
         self._preflight_result = preflight_result
+        self._model_pool = model_pool
+        self._warm_transformer_key: ModelCacheKey | None = None
+        self._warm_embeddings_key: ModelCacheKey | None = None
+        self._training_ended = False
+        self._released = False
         self._loaded_checkpoint_path: Path | None = None
         self._resolve_lora_rank_from_checkpoint()
         if IS_MAIN_PROCESS:
@@ -695,8 +711,64 @@ class LtxvTrainer:
 
         self._accelerator.wait_for_everyone()
         self._accelerator.end_training()
+        self._training_ended = True
 
         return saved_path, stats
+
+    def release_warm_models(self) -> None:
+        """Return a pooled LoRA base model to a clean, reusable state.
+
+        Per-run objects (PEFT adapters, optimizer, scheduler, dataloaders and
+        Accelerate wrappers) are discarded. Frozen base weights and inference
+        components remain owned by the warm model pool.
+        """
+        if self._released or self._model_pool is None or self._warm_transformer_key is None:
+            return
+
+        accelerator = getattr(self, "_accelerator", None)
+        wrapped_transformer = getattr(self, "_transformer", None)
+        if wrapped_transformer is None:
+            return
+
+        unwrapped = (
+            accelerator.unwrap_model(wrapped_transformer, keep_torch_compile=False)
+            if accelerator is not None
+            else wrapped_transformer
+        )
+
+        transient_objects = [wrapped_transformer]
+        for name in ("_optimizer", "_lr_scheduler", "_dataloader", "_validation_dataloader"):
+            value = getattr(self, name, None)
+            if value is not None:
+                transient_objects.append(value)
+        if accelerator is not None:
+            accelerator.free_memory(*transient_objects)
+
+        # PeftModel.base_model is the tuner object; unload() removes all injected
+        # LoRA layers without merging their trained values into the frozen base.
+        tuner = getattr(unwrapped, "base_model", None)
+        base_transformer = tuner.unload() if tuner is not None and hasattr(tuner, "unload") else unwrapped
+
+        base_transformer.requires_grad_(False)
+        base_transformer.eval()
+        if hasattr(base_transformer, "set_gradient_checkpointing"):
+            base_transformer.set_gradient_checkpointing(False)
+        for parameter in base_transformer.parameters():
+            parameter.grad = None
+
+        self._transformer = base_transformer
+        self._model_pool.replace(self._warm_transformer_key, base_transformer)
+        for name in ("_optimizer", "_lr_scheduler", "_dataloader", "_validation_dataloader"):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
+        if accelerator is not None and not self._training_ended:
+            with contextlib.suppress(Exception):
+                accelerator.end_training()
+            self._training_ended = True
+
+        free_gpu_memory()
+        self._released = True
 
     @property
     def _nsync_enabled(self) -> bool:
@@ -939,7 +1011,7 @@ class LtxvTrainer:
         )
 
     @free_gpu_memory_context(after=True)
-    def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
+    def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:  # noqa: PLR0912
         """Load text encoder + embeddings processor, compute and cache validation embeddings."""
 
         # This method:
@@ -954,22 +1026,67 @@ class LtxvTrainer:
 
         # Load embeddings processor (feature extractor + connectors)
         logger.debug("Loading embeddings processor...")
-        self._embeddings_processor = load_embeddings_processor(
-            checkpoint_path=self._component_path("embeddings_processor"),
-            device=init_device,
-            dtype=torch.bfloat16,
-        )
+        embeddings_path = self._component_path("embeddings_processor")
+        text_key = None
+        if self._model_pool is None:
+            self._embeddings_processor = load_embeddings_processor(
+                checkpoint_path=embeddings_path,
+                device=init_device,
+                dtype=torch.bfloat16,
+            )
+        else:
+            self._warm_embeddings_key = ModelCacheKey.create(
+                "embeddings_processor",
+                embeddings_path,
+                torch.bfloat16,
+            )
+            active_keys = {self._warm_embeddings_key}
+            if self._config.validation.prompts:
+                text_key = ModelCacheKey.create(
+                    "text_encoder",
+                    self._text_encoder_path,
+                    torch.bfloat16,
+                    load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+                )
+                active_keys.add(text_key)
+            # Gemma needs substantial VRAM, so clear other cached components only
+            # when prompts actually require it. With no prompts, this preserves a
+            # transformer already warm on GPU between consecutive LoRA jobs.
+            if self._config.validation.prompts:
+                self._model_pool.offload_all(exclude=active_keys)
+            self._embeddings_processor = self._model_pool.get_or_load(
+                self._warm_embeddings_key,
+                lambda target: load_embeddings_processor(
+                    checkpoint_path=embeddings_path,
+                    device=target,
+                    dtype=torch.bfloat16,
+                ),
+                init_device,
+            )
 
         # Cache validation embeddings if prompts are configured
         cached_embeddings = None
         if self._config.validation.prompts:
             logger.debug("Loading text encoder...")
-            text_encoder = load_text_encoder(
-                gemma_model_path=self._text_encoder_path,
-                device=init_device,
-                dtype=torch.bfloat16,
-                load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
-            )
+            if self._model_pool is None:
+                text_encoder = load_text_encoder(
+                    gemma_model_path=self._text_encoder_path,
+                    device=init_device,
+                    dtype=torch.bfloat16,
+                    load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+                )
+            else:
+                text_encoder = self._model_pool.get_or_load(
+                    text_key,
+                    lambda target: load_text_encoder(
+                        gemma_model_path=self._text_encoder_path,
+                        device=target,
+                        dtype=torch.bfloat16,
+                        load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+                    ),
+                    init_device,
+                    offloadable=not self._config.acceleration.load_text_encoder_in_8bit,
+                )
             logger.info(f"Pre-computing embeddings for {len(self._config.validation.prompts)} validation prompts...")
             cached_embeddings = []
             with torch.inference_mode():
@@ -991,9 +1108,16 @@ class LtxvTrainer:
                         )
                     )
             del text_encoder
+            if self._model_pool is not None:
+                self._model_pool.offload(text_key)
 
         # Unload feature extractor, keep only connectors for training
-        self._embeddings_processor.feature_extractor = None
+        if self._model_pool is None:
+            self._embeddings_processor.feature_extractor = None
+        elif self._embeddings_processor.feature_extractor is not None:
+            # Preserve it for later preprocessing/validation jobs while keeping
+            # only the small connector modules resident on the training device.
+            self._embeddings_processor.feature_extractor.to("cpu")
         self._embeddings_processor.requires_grad_(False)
         self._embeddings_processor.eval()
 
@@ -1014,6 +1138,10 @@ class LtxvTrainer:
         need_vae_encoder = (
             self._config.validation.images is not None or self._config.validation.reference_videos is not None
         )
+
+        if self._model_pool is not None and self._config.model.training_mode == "lora":
+            self._load_warm_lora_models(load_audio=load_audio, need_vae_encoder=need_vae_encoder)
+            return
 
         # Load all model components (except text encoder - already handled)
         video_vae_encoder_path = self._video_vae_component_path("encoder") if need_vae_encoder else None
@@ -1064,6 +1192,80 @@ class LtxvTrainer:
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
+        self._vae_decoder.requires_grad_(False)
+        if self._vae_encoder is not None:
+            self._vae_encoder.requires_grad_(False)
+        self._transformer.requires_grad_(False)
+        if self._audio_vae is not None:
+            self._audio_vae.requires_grad_(False)
+        if self._vocoder is not None:
+            self._vocoder.requires_grad_(False)
+
+    def _load_warm_lora_models(self, *, load_audio: bool, need_vae_encoder: bool) -> None:
+        """Load or reuse frozen components for a compatible LoRA training job."""
+        pool = self._model_pool
+        transformer_path = self._component_path("transformer")
+        quantization = self._config.acceleration.quantization
+        self._warm_transformer_key = ModelCacheKey.create(
+            "training_transformer",
+            transformer_path,
+            torch.bfloat16,
+            quantization=quantization or "none",
+        )
+
+        def _load_base_transformer(target: torch.device) -> torch.nn.Module:
+            transformer = load_transformer(transformer_path, device=target, dtype=torch.bfloat16)
+            if quantization is not None:
+                logger.info(f'Quantizing model with "{quantization}". This may take a while...')
+                transformer = quantize_model(transformer, precision=quantization)
+            return transformer
+
+        # A cache hit deliberately retains its current device. This avoids a needless
+        # GPU -> CPU -> GPU round trip between consecutive LoRA jobs.
+        self._transformer = pool.get_or_load(
+            self._warm_transformer_key,
+            _load_base_transformer,
+            "cpu",
+            move_cached=False,
+        )
+
+        decoder_path = self._video_vae_component_path("decoder")
+        decoder_key = ModelCacheKey.create("video_vae_decoder", decoder_path, torch.bfloat16)
+        self._vae_decoder = pool.get_or_load(
+            decoder_key,
+            lambda target: load_video_vae_decoder(decoder_path, device=target, dtype=torch.bfloat16),
+            "cpu",
+        )
+
+        self._vae_encoder = None
+        if need_vae_encoder:
+            encoder_path = self._video_vae_component_path("encoder")
+            encoder_key = ModelCacheKey.create("video_vae_encoder", encoder_path, torch.bfloat16)
+            self._vae_encoder = pool.get_or_load(
+                encoder_key,
+                lambda target: load_video_vae_encoder(encoder_path, device=target, dtype=torch.bfloat16),
+                "cpu",
+            )
+
+        self._audio_vae = None
+        self._vocoder = None
+        if load_audio:
+            audio_path = self._audio_vae_component_path("decoder")
+            audio_key = ModelCacheKey.create("audio_vae_decoder", audio_path, torch.bfloat16)
+            self._audio_vae = pool.get_or_load(
+                audio_key,
+                lambda target: load_audio_vae_decoder(audio_path, device=target, dtype=torch.bfloat16),
+                "cpu",
+            )
+            vocoder_path = self._component_path("vocoder")
+            vocoder_key = ModelCacheKey.create("vocoder", vocoder_path, torch.bfloat16)
+            self._vocoder = pool.get_or_load(
+                vocoder_key,
+                lambda target: load_vocoder(vocoder_path, device=target, dtype=torch.bfloat16),
+                "cpu",
+            )
+
+        self._scheduler = LTX2Scheduler()
         self._vae_decoder.requires_grad_(False)
         if self._vae_encoder is not None:
             self._vae_encoder.requires_grad_(False)
@@ -1473,6 +1675,12 @@ class LtxvTrainer:
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
+
+        if self._model_pool is not None and self._warm_transformer_key is not None:
+            keep_warm = {self._warm_transformer_key}
+            if self._warm_embeddings_key is not None:
+                keep_warm.add(self._warm_embeddings_key)
+            self._model_pool.offload_all(exclude=keep_warm)
 
         # For FSDP + LoRA: Cast entire model to FP32.
         # FSDP requires uniform dtype across all parameters in wrapped modules.

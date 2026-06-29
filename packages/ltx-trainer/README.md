@@ -15,6 +15,7 @@ All detailed guides and technical documentation are in the [docs](./docs/) direc
 - [🛠️ Training Modes](docs/training-modes.md)
 - [⚙️ Configuration Reference](docs/configuration-reference.md)
 - [🚀 Training Guide](docs/training-guide.md)
+- [🔥 Warm Model Sessions](docs/warm-sessions.md)
 - [🧪 Inference Guide](../ltx-pipelines/README.md)
 - [🔧 Utility Scripts](docs/utility-scripts.md)
 - [📚 LTX-Core Documentation](../ltx-core/README.md)
