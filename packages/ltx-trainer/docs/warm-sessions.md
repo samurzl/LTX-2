@@ -29,7 +29,13 @@ uv run python scripts/train.py configs/my_lora.yaml
 
 `process_dataset.py`, `process_captions.py`, `process_videos.py`, and `train.py` automatically use the server when it
 is running. If it is not running, they retain their original one-shot behavior. The client command waits for its job
-to finish; detailed live progress appears in the server terminal.
+to finish. Logs, warnings, and Rich progress displays are streamed back to the terminal where that client command was
+started.
+
+The server terminal becomes a live model dashboard. It shows every model the pool has encountered, including its
+component type, checkpoint, size, dtype, options, and current device. Green models are loaded, red models are unloaded
+or evicted, and orange models are currently loading or moving between devices. Since the underlying model loaders do
+not report byte-level progress, the green loading bar pulses rather than displaying a fabricated percentage.
 
 Inspect or stop the server with:
 
@@ -39,6 +45,22 @@ uv run python scripts/warm_server.py stop
 ```
 
 Set `LTX_TRAINER_DISABLE_WARM_SERVER=1` for a command that should deliberately bypass a running server.
+
+## Additional startup and throughput caches
+
+- Video frame counts are persisted in `.precomputed/.media_metadata.json` and invalidated by source size/mtime.
+  Completed latent outputs are filtered before any video metadata probe.
+- Discovered training/validation `.pt` indexes are reused between preflight, dataloader creation, and later server
+  jobs. A preprocessing write invalidates the corresponding in-memory dataset indexes.
+- Validation prompt embeddings are retained in memory by checkpoint and exact prompt set. The shared negative prompt
+  is encoded only once.
+- Video/audio decoders and the vocoder are not loaded when validation sampling has no interval or prompts.
+- TorchInductor uses `~/.cache/ltx-trainer/torchinductor` by default, allowing compatible compiled kernels and FX
+  graphs to survive later jobs and server restarts. Override it with `TORCHINDUCTOR_CACHE_DIR`.
+
+Caption preprocessing now performs one Gemma forward per batch. `process_captions.py` defaults to batch size 8;
+`process_dataset.py` keeps the conservative default of 1. Increase `--batch-size` for throughput when VRAM permits,
+or reduce it if Gemma runs out of memory.
 
 ## Comfy negative generation
 

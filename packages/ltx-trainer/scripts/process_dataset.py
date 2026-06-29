@@ -13,6 +13,19 @@ The dataset must be a CSV, JSON, or JSONL file with columns for captions and vid
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    import sys as _sys
+
+    from ltx_trainer.warm_client import submit_argv_if_running as _submit_argv_if_running
+
+    _local_only_flags = {"--help", "-h", "--install-completion", "--show-completion"}
+    if (
+        len(_sys.argv) > 1
+        and not _local_only_flags.intersection(_sys.argv[1:])
+        and _submit_argv_if_running("preprocess_cli", _sys.argv[1:])
+    ):
+        raise SystemExit(0)
+
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING

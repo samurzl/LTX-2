@@ -14,6 +14,21 @@ For multi-GPU/FSDP training, configure and launch via Accelerate:
     accelerate launch scripts/train.py CONFIG_PATH
 """
 
+from __future__ import annotations
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    from ltx_trainer.warm_client import submit_argv_if_running as _submit_argv_if_running
+
+    _local_only_flags = {"--help", "-h", "--install-completion", "--show-completion"}
+    if (
+        len(_sys.argv) > 1
+        and not _local_only_flags.intersection(_sys.argv[1:])
+        and _submit_argv_if_running("train_cli", _sys.argv[1:])
+    ):
+        raise SystemExit(0)
+
 from pathlib import Path
 
 import typer

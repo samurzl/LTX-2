@@ -14,6 +14,19 @@ Can be used as a standalone script:
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    import sys as _sys
+
+    from ltx_trainer.warm_client import submit_argv_if_running as _submit_argv_if_running
+
+    _local_only_flags = {"--help", "-h", "--install-completion", "--show-completion"}
+    if (
+        len(_sys.argv) > 1
+        and not _local_only_flags.intersection(_sys.argv[1:])
+        and _submit_argv_if_running("latents_cli", _sys.argv[1:])
+    ):
+        raise SystemExit(0)
+
 import json
 import math
 import os
@@ -129,7 +142,7 @@ class MediaDataset(Dataset):
     - Optionally extract audio from video files
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         dataset_file: str | Path,
         main_media_column: str,
@@ -140,6 +153,8 @@ class MediaDataset(Dataset):
         audio_min_rms_db: float = -60.0,
         audio_min_active_ratio: float = 0.01,
         audio_activity_window_ms: float = 100.0,
+        filter_invalid_videos: bool = True,
+        frame_count_cache_path: Path | None = None,
     ) -> None:
         """
         Initialize the media dataset.
@@ -168,10 +183,13 @@ class MediaDataset(Dataset):
         self.main_media_paths = self._load_video_paths(main_media_column)
 
         # Then load reference video paths
-        self.video_paths = self._load_video_paths(video_column)
+        self.video_paths = (
+            self.main_media_paths.copy() if video_column == main_media_column else self._load_video_paths(video_column)
+        )
 
         # Filter out videos with insufficient frames
-        self._filter_valid_videos()
+        if filter_invalid_videos:
+            self._filter_valid_videos(frame_count_cache_path=frame_count_cache_path)
 
         self.max_target_frames = max(self.resolution_buckets, key=lambda x: x[0])[0]
 
@@ -353,12 +371,19 @@ class MediaDataset(Dataset):
 
         return video_paths
 
-    def _filter_valid_videos(self) -> None:
-        """Filter out videos with insufficient frames."""
+    def _filter_valid_videos(
+        self,
+        *,
+        frame_count_cache_path: Path | None = None,
+        skip_probe: Callable[[int], bool] | None = None,
+    ) -> None:
+        """Filter videos with insufficient frames, reusing stable metadata."""
         original_length = len(self.video_paths)
         valid_video_paths = []
         valid_main_media_paths = []
         min_frames_required = min(self.resolution_buckets, key=lambda x: x[0])[0]
+        frame_count_cache = self._load_frame_count_cache(frame_count_cache_path)
+        cache_changed = False
 
         for i, video_path in enumerate(self.video_paths):
             if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
@@ -366,8 +391,31 @@ class MediaDataset(Dataset):
                 valid_main_media_paths.append(self.main_media_paths[i])
                 continue
 
+            # Completed outputs never reach __getitem__, so avoid opening their
+            # source videos solely to rediscover metadata we will not consume.
+            if skip_probe is not None and skip_probe(i):
+                valid_video_paths.append(video_path)
+                valid_main_media_paths.append(self.main_media_paths[i])
+                continue
+
             try:
-                frame_count = get_video_frame_count(video_path)
+                cache_key = str(video_path.expanduser().resolve())
+                stat = video_path.stat()
+                cached = frame_count_cache.get(cache_key)
+                if (
+                    cached is not None
+                    and cached.get("size") == stat.st_size
+                    and cached.get("mtime_ns") == stat.st_mtime_ns
+                ):
+                    frame_count = int(cached["frame_count"])
+                else:
+                    frame_count = get_video_frame_count(video_path)
+                    frame_count_cache[cache_key] = {
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "frame_count": frame_count,
+                    }
+                    cache_changed = True
 
                 if frame_count >= min_frames_required:
                     valid_video_paths.append(video_path)
@@ -380,6 +428,9 @@ class MediaDataset(Dataset):
             except Exception as e:
                 logger.warning(f"Failed to read video at {video_path}: {e!s}")
 
+        if cache_changed and frame_count_cache_path is not None:
+            self._save_frame_count_cache(frame_count_cache_path, frame_count_cache)
+
         # Update both path lists to maintain synchronization
         self.video_paths = valid_video_paths
         self.main_media_paths = valid_main_media_paths
@@ -389,6 +440,26 @@ class MediaDataset(Dataset):
                 f"Filtered out {original_length - len(self.video_paths)} videos with insufficient frames. "
                 f"Proceeding with {len(self.video_paths)} valid videos."
             )
+
+    @staticmethod
+    def _load_frame_count_cache(cache_path: Path | None) -> dict[str, dict[str, int]]:
+        if cache_path is None or not cache_path.is_file():
+            return {}
+        try:
+            with cache_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            return payload.get("files", {}) if payload.get("version") == 1 else {}
+        except Exception as error:
+            logger.warning("Ignoring unreadable media metadata cache %s: %s", cache_path, error)
+            return {}
+
+    @staticmethod
+    def _save_frame_count_cache(cache_path: Path, files: dict[str, dict[str, int]]) -> None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(f"{cache_path.suffix}.tmp.{os.getpid()}")
+        with temporary.open("w", encoding="utf-8") as file:
+            json.dump({"version": 1, "files": files}, file, separators=(",", ":"))
+        temporary.replace(cache_path)
 
     def _preprocess_image(self, path: Path) -> torch.Tensor:
         """Preprocess a single image by resizing and applying transforms."""
@@ -562,6 +633,13 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     console = Console()
     torch_device = torch.device(device)
 
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    audio_output_path: Path | None = None
+    if with_audio:
+        audio_output_path = Path(audio_output_dir)
+        audio_output_path.mkdir(parents=True, exist_ok=True)
+
     dataset = MediaDataset(
         dataset_file=dataset_file,
         main_media_column=main_media_column or video_column,
@@ -572,15 +650,8 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
         audio_min_rms_db=audio_min_rms_db,
         audio_min_active_ratio=audio_min_active_ratio,
         audio_activity_window_ms=audio_activity_window_ms,
+        filter_invalid_videos=False,
     )
-    logger.info(f"Loaded {len(dataset)} valid media files")
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    audio_output_path: Path | None = None
-    if with_audio:
-        audio_output_path = Path(audio_output_dir)
-        audio_output_path.mkdir(parents=True, exist_ok=True)
 
     # Audio processing requires batch_size=1; must be applied before the dataloader is built.
     if with_audio and batch_size > 1:
@@ -596,6 +667,12 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
         if allow_missing_audio:
             return True
         return audio_output_path is None or (audio_output_path / rel).is_file()
+
+    dataset._filter_valid_videos(
+        frame_count_cache_path=output_path.parent / ".media_metadata.json",
+        skip_probe=lambda idx: not overwrite and _is_done(idx),
+    )
+    logger.info(f"Loaded {len(dataset)} valid media files")
 
     dataloader = _build_sharded_dataloader(
         dataset,

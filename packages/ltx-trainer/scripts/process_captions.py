@@ -13,6 +13,19 @@ Can be used as a standalone script:
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    import sys as _sys
+
+    from ltx_trainer.warm_client import submit_argv_if_running as _submit_argv_if_running
+
+    _local_only_flags = {"--help", "-h", "--install-completion", "--show-completion"}
+    if (
+        len(_sys.argv) > 1
+        and not _local_only_flags.intersection(_sys.argv[1:])
+        and _submit_argv_if_running("captions_cli", _sys.argv[1:])
+    ):
+        raise SystemExit(0)
+
 import json
 import os
 from collections.abc import Callable
@@ -327,14 +340,6 @@ def compute_captions_embeddings(  # noqa: PLR0913
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # TODO(batch-tokenization): The current Gemma tokenizer doesn't support batched tokenization.
-    if batch_size > 1:
-        logger.warning(
-            "Batch size greater than 1 is not currently supported with the Gemma tokenizer. "
-            "Overriding batch_size to 1. This will be fixed in a future update."
-        )
-        batch_size = 1
-
     dataloader = _build_sharded_dataloader(
         dataset,
         batch_size=batch_size,
@@ -407,14 +412,16 @@ def compute_captions_embeddings(  # noqa: PLR0913
             # (returns video/audio features before connector).
             # The connector is applied during training via embeddings_processor
             with torch.inference_mode():
-                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
-                # For now, process one at a time:
+                hidden_states, prompt_attention_mask = text_encoder.encode_batch(
+                    list(batch["prompt"]),
+                    padding_side="left",
+                )
+                video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
+                    hidden_states,
+                    prompt_attention_mask,
+                    "left",
+                )
                 for i in range(len(batch["prompt"])):
-                    hidden_states, prompt_attention_mask = text_encoder.encode(batch["prompt"][i], padding_side="left")
-                    video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
-                        hidden_states, prompt_attention_mask, "left"
-                    )
-
                     output_rel_path = Path(batch["output_path"][i])
 
                     # Create output directory maintaining structure
@@ -422,11 +429,11 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     output_dir_path.mkdir(parents=True, exist_ok=True)
 
                     embedding_data = {
-                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
-                        "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
+                        "video_prompt_embeds": video_prompt_embeds[i].cpu().contiguous(),
+                        "prompt_attention_mask": prompt_attention_mask[i].cpu().contiguous(),
                     }
                     if audio_prompt_embeds is not None:
-                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
+                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[i].cpu().contiguous()
 
                     output_file = output_path / output_rel_path
                     _atomic_save(embedding_data, output_file)

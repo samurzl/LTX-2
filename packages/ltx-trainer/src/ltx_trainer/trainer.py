@@ -40,6 +40,7 @@ from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import (
+    PRECOMPUTED_DIR_NAME,
     AnchorSampleDataset,
     OptionalSourceGroupedBatchSampler,
     PrecomputedDataset,
@@ -123,23 +124,34 @@ class TrainerPreflightResult:
 
     checkpoint_path: Path | None = None
     resume_state: tuple[int, TrainingState | None] | None = None
+    training_dataset: PrecomputedDataset | None = None
+    validation_dataset: PrecomputedDataset | None = None
 
 
 class LtxvTrainer:
     @classmethod
-    def preflight_config(cls, trainer_config: LtxTrainerConfig) -> TrainerPreflightResult:
+    def preflight_config(
+        cls,
+        trainer_config: LtxTrainerConfig,
+        model_pool: WarmModelPool | None = None,
+    ) -> TrainerPreflightResult:
         """Run cheap validation before model/text/dataloader-heavy initialization."""
         cls._preflight_optimization_config(trainer_config)
         cls._preflight_model_paths(trainer_config)
         cls._preflight_output_dir(trainer_config)
-        cls._preflight_dataset(trainer_config)
+        training_dataset, validation_dataset = cls._preflight_dataset(trainer_config, model_pool=model_pool)
 
         checkpoint_path = cls._preflight_checkpoint(trainer_config)
         resume_state = None
         if checkpoint_path is not None:
             resume_state = cls._resolve_resume_state_from_checkpoint(trainer_config, checkpoint_path)
 
-        return TrainerPreflightResult(checkpoint_path=checkpoint_path, resume_state=resume_state)
+        return TrainerPreflightResult(
+            checkpoint_path=checkpoint_path,
+            resume_state=resume_state,
+            training_dataset=training_dataset,
+            validation_dataset=validation_dataset,
+        )
 
     @classmethod
     def _preflight_optimization_config(cls, trainer_config: LtxTrainerConfig) -> None:
@@ -218,7 +230,7 @@ class LtxvTrainer:
             raise ValueError(f"scheduler_params.{name} must be >= {ge}")
 
     @classmethod
-    def _preflight_model_paths(cls, trainer_config: LtxTrainerConfig) -> None:
+    def _preflight_model_paths(cls, trainer_config: LtxTrainerConfig) -> None:  # noqa: PLR0912
         model_cfg = trainer_config.model
         if model_cfg.model_path is not None:
             cls._require_safetensors_file("model.model_path", model_cfg.model_path)
@@ -242,10 +254,10 @@ class LtxvTrainer:
         text_encoder_path = component_paths.text_encoder or model_cfg.text_encoder_path
         if text_encoder_path is not None:
             text_encoder_path = cls._require_existing_file_or_dir("model.text_encoder_path", text_encoder_path)
-        elif trainer_config.validation.prompts:
+        elif cls._validation_sampling_enabled(trainer_config):
             raise ValueError("model.text_encoder_path or model.component_paths.text_encoder is required for validation")
 
-        if trainer_config.acceleration.load_text_encoder_in_8bit:
+        if trainer_config.acceleration.load_text_encoder_in_8bit and cls._validation_sampling_enabled(trainer_config):
             if text_encoder_path is None:
                 raise ValueError("load_text_encoder_in_8bit requires a text encoder directory")
             if not text_encoder_path.is_dir():
@@ -255,11 +267,11 @@ class LtxvTrainer:
             if importlib.util.find_spec("bitsandbytes") is None:
                 raise ValueError("load_text_encoder_in_8bit requires bitsandbytes to be installed")
 
-        training_strategy = get_training_strategy(trainer_config.training_strategy)
-        need_vae_encoder = (
+        sampling_enabled = cls._validation_sampling_enabled(trainer_config)
+        need_vae_encoder = sampling_enabled and (
             trainer_config.validation.images is not None or trainer_config.validation.reference_videos is not None
         )
-        load_audio = training_strategy.requires_audio or trainer_config.validation.generate_audio
+        load_audio = sampling_enabled and trainer_config.validation.generate_audio
 
         required_component_paths = [
             ("model.component_paths.transformer", cls._component_path_for_config(trainer_config, "transformer")),
@@ -267,11 +279,14 @@ class LtxvTrainer:
                 "model.component_paths.embeddings_processor",
                 cls._component_path_for_config(trainer_config, "embeddings_processor"),
             ),
-            (
-                "model.component_paths.video_vae_decoder",
-                cls._video_vae_component_path_for_config(trainer_config, "decoder"),
-            ),
         ]
+        if sampling_enabled:
+            required_component_paths.append(
+                (
+                    "model.component_paths.video_vae_decoder",
+                    cls._video_vae_component_path_for_config(trainer_config, "decoder"),
+                )
+            )
         if need_vae_encoder:
             required_component_paths.append(
                 (
@@ -293,8 +308,17 @@ class LtxvTrainer:
         for label, path in required_component_paths:
             cls._require_safetensors_file(label, path)
 
+    @staticmethod
+    def _validation_sampling_enabled(trainer_config: LtxTrainerConfig) -> bool:
+        return bool(trainer_config.validation.interval and trainer_config.validation.prompts)
+
     @classmethod
-    def _preflight_dataset(cls, trainer_config: LtxTrainerConfig) -> None:
+    def _preflight_dataset(
+        cls,
+        trainer_config: LtxTrainerConfig,
+        *,
+        model_pool: WarmModelPool | None = None,
+    ) -> tuple[PrecomputedDataset, PrecomputedDataset | None]:
         training_strategy = get_training_strategy(trainer_config.training_strategy)
         data_sources = training_strategy.get_data_sources()
         optional_data_sources = set(training_strategy.get_optional_data_sources())
@@ -304,21 +328,68 @@ class LtxvTrainer:
                 data_sources = {source: source for source in data_sources}
             data_sources[trainer_config.lora.nsync.negative_latents_dir] = "negative_latents"
 
-        dataset = PrecomputedDataset(
+        dataset = cls._get_precomputed_dataset(
             trainer_config.data.preprocessed_data_root,
             data_sources=data_sources,
             optional_data_sources=optional_data_sources,
+            model_pool=model_pool,
         )
 
         if cls._config_nsync_requires_anchor(trainer_config) and len(dataset) < 2:
             raise ValueError("NSYNC anchor training requires at least two positive samples")
 
+        validation_dataset = None
         if trainer_config.data.validation_data_root is not None:
-            PrecomputedDataset(
+            validation_dataset = cls._get_precomputed_dataset(
                 trainer_config.data.validation_data_root,
                 data_sources=training_strategy.get_data_sources(),
                 optional_data_sources=set(training_strategy.get_optional_data_sources()),
+                model_pool=model_pool,
             )
+        return dataset, validation_dataset
+
+    @staticmethod
+    def _get_precomputed_dataset(
+        data_root: str,
+        *,
+        data_sources: dict[str, str] | list[str],
+        optional_data_sources: set[str],
+        model_pool: WarmModelPool | None,
+    ) -> PrecomputedDataset:
+        if model_pool is None:
+            return PrecomputedDataset(
+                data_root,
+                data_sources=data_sources,
+                optional_data_sources=optional_data_sources,
+            )
+
+        normalized_sources = (
+            tuple(sorted(data_sources.items()))
+            if isinstance(data_sources, dict)
+            else tuple((source, source) for source in data_sources)
+        )
+        resolved_root = Path(data_root).expanduser().resolve()
+        if (resolved_root / PRECOMPUTED_DIR_NAME).is_dir():
+            resolved_root /= PRECOMPUTED_DIR_NAME
+        source_mtimes = tuple(
+            (name, (resolved_root / name).stat().st_mtime_ns if (resolved_root / name).exists() else None)
+            for name, _ in normalized_sources
+        )
+        cache_key = (
+            "precomputed_dataset",
+            str(resolved_root),
+            normalized_sources,
+            tuple(sorted(optional_data_sources)),
+            source_mtimes,
+        )
+        return model_pool.get_or_create_artifact(
+            cache_key,
+            lambda: PrecomputedDataset(
+                data_root,
+                data_sources=data_sources,
+                optional_data_sources=optional_data_sources,
+            ),
+        )
 
     @staticmethod
     def _preflight_output_dir(trainer_config: LtxTrainerConfig) -> None:
@@ -447,8 +518,8 @@ class LtxvTrainer:
         self._collect_trainable_params()
         self._load_checkpoint()
         self._prepare_models_for_training()
-        self._dataset = None
-        self._validation_dataset = None
+        self._dataset = preflight_result.training_dataset if preflight_result is not None else None
+        self._validation_dataset = preflight_result.validation_dataset if preflight_result is not None else None
         self._validation_dataloader = None
         self._global_step = -1
         self._checkpoint_paths: list[Path] = []
@@ -542,7 +613,7 @@ class LtxvTrainer:
             if cfg.validation.loss_interval and not cfg.validation.skip_initial_validation:
                 self._run_validation_loss()
 
-            if cfg.validation.interval and not cfg.validation.skip_initial_validation:
+            if cfg.validation.interval and cfg.validation.prompts and not cfg.validation.skip_initial_validation:
                 with self._offloaded_optimizer_state():
                     sampled_videos_paths = self._run_distributed_validation(progress)
 
@@ -595,6 +666,7 @@ class LtxvTrainer:
                     # Generate validation samples if needed
                     if (
                         cfg.validation.interval
+                        and cfg.validation.prompts
                         and self._global_step > 0
                         and self._global_step % cfg.validation.interval == 0
                         and is_optimization_step
@@ -1011,7 +1083,9 @@ class LtxvTrainer:
         )
 
     @free_gpu_memory_context(after=True)
-    def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:  # noqa: PLR0912
+    def _load_text_encoder_and_cache_embeddings(  # noqa: PLR0912, PLR0915
+        self,
+    ) -> list[CachedPromptEmbeddings] | None:
         """Load text encoder + embeddings processor, compute and cache validation embeddings."""
 
         # This method:
@@ -1023,11 +1097,14 @@ class LtxvTrainer:
         # LOCAL_RANK before Accelerator exists
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        validation_prompts = self._config.validation.prompts if self._validation_sampling_enabled(self._config) else []
 
         # Load embeddings processor (feature extractor + connectors)
         logger.debug("Loading embeddings processor...")
         embeddings_path = self._component_path("embeddings_processor")
         text_key = None
+        validation_embeddings_key = None
+        cached_embeddings = None
         if self._model_pool is None:
             self._embeddings_processor = load_embeddings_processor(
                 checkpoint_path=embeddings_path,
@@ -1041,18 +1118,30 @@ class LtxvTrainer:
                 torch.bfloat16,
             )
             active_keys = {self._warm_embeddings_key}
-            if self._config.validation.prompts:
+            if validation_prompts:
                 text_key = ModelCacheKey.create(
                     "text_encoder",
                     self._text_encoder_path,
                     torch.bfloat16,
                     load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
                 )
-                active_keys.add(text_key)
+                validation_embeddings_key = (
+                    "validation_embeddings",
+                    text_key,
+                    self._warm_embeddings_key,
+                    tuple(validation_prompts),
+                    self._config.validation.negative_prompt,
+                )
+                cached = self._model_pool.get_artifact(validation_embeddings_key)
+                if cached is not None:
+                    cached_embeddings = cached
+                    logger.info("Reusing cached validation prompt embeddings")
+                else:
+                    active_keys.add(text_key)
             # Gemma needs substantial VRAM, so clear other cached components only
             # when prompts actually require it. With no prompts, this preserves a
             # transformer already warm on GPU between consecutive LoRA jobs.
-            if self._config.validation.prompts:
+            if validation_prompts and cached_embeddings is None:
                 self._model_pool.offload_all(exclude=active_keys)
             self._embeddings_processor = self._model_pool.get_or_load(
                 self._warm_embeddings_key,
@@ -1065,8 +1154,7 @@ class LtxvTrainer:
             )
 
         # Cache validation embeddings if prompts are configured
-        cached_embeddings = None
-        if self._config.validation.prompts:
+        if validation_prompts and cached_embeddings is None:
             logger.debug("Loading text encoder...")
             if self._model_pool is None:
                 text_encoder = load_text_encoder(
@@ -1087,26 +1175,29 @@ class LtxvTrainer:
                     init_device,
                     offloadable=not self._config.acceleration.load_text_encoder_in_8bit,
                 )
-            logger.info(f"Pre-computing embeddings for {len(self._config.validation.prompts)} validation prompts...")
+            logger.info(f"Pre-computing embeddings for {len(validation_prompts)} validation prompts...")
             cached_embeddings = []
             with torch.inference_mode():
-                for prompt in self._config.validation.prompts:
+                neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
+                neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
+                negative_video = neg_out.video_encoding.cpu()
+                negative_audio = neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
+                for prompt in validation_prompts:
                     pos_hs, pos_mask = text_encoder.encode(prompt)
                     pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
-
-                    neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
-                    neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
 
                     cached_embeddings.append(
                         CachedPromptEmbeddings(
                             video_context_positive=pos_out.video_encoding.cpu(),
-                            audio_context_positive=pos_out.audio_encoding.cpu(),
-                            video_context_negative=neg_out.video_encoding.cpu(),
-                            audio_context_negative=(
-                                neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
+                            audio_context_positive=(
+                                pos_out.audio_encoding.cpu() if pos_out.audio_encoding is not None else None
                             ),
+                            video_context_negative=negative_video,
+                            audio_context_negative=negative_audio,
                         )
                     )
+            if self._model_pool is not None:
+                self._model_pool.put_artifact(validation_embeddings_key, cached_embeddings)
             del text_encoder
             if self._model_pool is not None:
                 self._model_pool.offload(text_key)
@@ -1117,7 +1208,7 @@ class LtxvTrainer:
         elif self._embeddings_processor.feature_extractor is not None:
             # Preserve it for later preprocessing/validation jobs while keeping
             # only the small connector modules resident on the training device.
-            self._embeddings_processor.feature_extractor.to("cpu")
+            WarmModelPool.move_model(self._embeddings_processor.feature_extractor, "cpu")
         self._embeddings_processor.requires_grad_(False)
         self._embeddings_processor.eval()
 
@@ -1129,18 +1220,21 @@ class LtxvTrainer:
 
     def _load_models(self) -> None:
         """Load the LTX-2 model components."""
-        # Load audio components if:
-        # 1. Training strategy requires audio (training the audio branch), OR
-        # 2. Validation is configured to generate audio (even if not training audio)
-        load_audio = self._training_strategy.requires_audio or self._config.validation.generate_audio
+        sampling_enabled = self._validation_sampling_enabled(self._config)
+        load_video_decoder = sampling_enabled
+        load_audio = sampling_enabled and self._config.validation.generate_audio
 
         # Check if we need VAE encoder (for image or reference video conditioning)
-        need_vae_encoder = (
+        need_vae_encoder = sampling_enabled and (
             self._config.validation.images is not None or self._config.validation.reference_videos is not None
         )
 
         if self._model_pool is not None and self._config.model.training_mode == "lora":
-            self._load_warm_lora_models(load_audio=load_audio, need_vae_encoder=need_vae_encoder)
+            self._load_warm_lora_models(
+                load_video_decoder=load_video_decoder,
+                load_audio=load_audio,
+                need_vae_encoder=need_vae_encoder,
+            )
             return
 
         # Load all model components (except text encoder - already handled)
@@ -1152,20 +1246,22 @@ class LtxvTrainer:
             device="cpu",
             dtype=torch.bfloat16,
             with_video_vae_encoder=need_vae_encoder,  # Needed for image conditioning
-            with_video_vae_decoder=True,  # Needed for validation sampling
+            with_video_vae_decoder=load_video_decoder,
             with_audio_vae_decoder=load_audio,
             with_vocoder=load_audio,
             with_text_encoder=False,  # Text encoder handled separately
             transformer_path=self._component_path("transformer"),
             video_vae_encoder_path=video_vae_encoder_path,
-            video_vae_decoder_path=self._video_vae_component_path("decoder"),
+            video_vae_decoder_path=self._video_vae_component_path("decoder") if load_video_decoder else None,
             audio_vae_decoder_path=audio_vae_decoder_path,
             vocoder_path=vocoder_path,
         )
 
         # Extract components
         self._transformer = components.transformer
-        self._vae_decoder = components.video_vae_decoder.to(dtype=torch.bfloat16)
+        self._vae_decoder = components.video_vae_decoder
+        if self._vae_decoder is not None:
+            self._vae_decoder = self._vae_decoder.to(dtype=torch.bfloat16)
         self._vae_encoder = components.video_vae_encoder
         if self._vae_encoder is not None:
             self._vae_encoder = self._vae_encoder.to(dtype=torch.bfloat16)
@@ -1192,7 +1288,8 @@ class LtxvTrainer:
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
-        self._vae_decoder.requires_grad_(False)
+        if self._vae_decoder is not None:
+            self._vae_decoder.requires_grad_(False)
         if self._vae_encoder is not None:
             self._vae_encoder.requires_grad_(False)
         self._transformer.requires_grad_(False)
@@ -1201,7 +1298,13 @@ class LtxvTrainer:
         if self._vocoder is not None:
             self._vocoder.requires_grad_(False)
 
-    def _load_warm_lora_models(self, *, load_audio: bool, need_vae_encoder: bool) -> None:
+    def _load_warm_lora_models(
+        self,
+        *,
+        load_video_decoder: bool,
+        load_audio: bool,
+        need_vae_encoder: bool,
+    ) -> None:
         """Load or reuse frozen components for a compatible LoRA training job."""
         pool = self._model_pool
         transformer_path = self._component_path("transformer")
@@ -1229,13 +1332,15 @@ class LtxvTrainer:
             move_cached=False,
         )
 
-        decoder_path = self._video_vae_component_path("decoder")
-        decoder_key = ModelCacheKey.create("video_vae_decoder", decoder_path, torch.bfloat16)
-        self._vae_decoder = pool.get_or_load(
-            decoder_key,
-            lambda target: load_video_vae_decoder(decoder_path, device=target, dtype=torch.bfloat16),
-            "cpu",
-        )
+        self._vae_decoder = None
+        if load_video_decoder:
+            decoder_path = self._video_vae_component_path("decoder")
+            decoder_key = ModelCacheKey.create("video_vae_decoder", decoder_path, torch.bfloat16)
+            self._vae_decoder = pool.get_or_load(
+                decoder_key,
+                lambda target: load_video_vae_decoder(decoder_path, device=target, dtype=torch.bfloat16),
+                "cpu",
+            )
 
         self._vae_encoder = None
         if need_vae_encoder:
@@ -1266,7 +1371,8 @@ class LtxvTrainer:
             )
 
         self._scheduler = LTX2Scheduler()
-        self._vae_decoder.requires_grad_(False)
+        if self._vae_decoder is not None:
+            self._vae_decoder.requires_grad_(False)
         if self._vae_encoder is not None:
             self._vae_encoder.requires_grad_(False)
         self._transformer.requires_grad_(False)
@@ -1699,9 +1805,10 @@ class LtxvTrainer:
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
 
         # Keep frozen models on CPU for memory efficiency
-        self._vae_decoder = self._vae_decoder.to("cpu")
+        if self._vae_decoder is not None:
+            WarmModelPool.move_model(self._vae_decoder, "cpu")
         if self._vae_encoder is not None:
-            self._vae_encoder = self._vae_encoder.to("cpu")
+            WarmModelPool.move_model(self._vae_encoder, "cpu")
 
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
@@ -1759,9 +1866,10 @@ class LtxvTrainer:
                 data_sources=data_sources,
                 optional_data_sources=optional_data_sources,
             )
-            if self._nsync_requires_anchor:
-                self._dataset = AnchorSampleDataset(self._dataset)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
+
+        if self._nsync_requires_anchor and not isinstance(self._dataset, AnchorSampleDataset):
+            self._dataset = AnchorSampleDataset(self._dataset)
 
         dataloader = self._create_dataloader(self._dataset, shuffle=True, drop_last=True)
         self._dataloader = self._accelerator.prepare(dataloader)
@@ -1771,11 +1879,12 @@ class LtxvTrainer:
             self._validation_dataloader = None
             return
 
-        self._validation_dataset = PrecomputedDataset(
-            validation_root,
-            data_sources=self._training_strategy.get_data_sources(),
-            optional_data_sources=set(self._training_strategy.get_optional_data_sources()),
-        )
+        if self._validation_dataset is None:
+            self._validation_dataset = PrecomputedDataset(
+                validation_root,
+                data_sources=self._training_strategy.get_data_sources(),
+                optional_data_sources=set(self._training_strategy.get_optional_data_sources()),
+            )
         validation_dataloader = self._create_dataloader(
             self._validation_dataset,
             shuffle=False,

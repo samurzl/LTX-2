@@ -99,7 +99,7 @@ def _base_preflight_config(tmp_path: Path, *, sample_count: int = 1) -> LtxTrain
         model={"model_path": model_path, "text_encoder_path": text_encoder_path, "training_mode": "lora"},
         lora={"rank": 8, "alpha": 8, "target_modules": ["to_q"]},
         data={"preprocessed_data_root": str(data_root), "num_dataloader_workers": 0},
-        validation={"prompts": [], "interval": None, "generate_audio": False},
+        validation={"prompts": [], "interval": None, "generate_audio": True},
         output_dir=str(tmp_path / "outputs"),
     )
 
@@ -262,11 +262,10 @@ def test_validation_metric_logging_does_not_advance_wandb_step() -> None:
     assert run.calls == [({"validation/loss": 2.5}, 12, False)]
 
 
-def test_trainer_preflight_accepts_split_components_without_unused_audio(tmp_path: Path) -> None:
+def test_trainer_preflight_accepts_split_components_without_unused_validation_models(tmp_path: Path) -> None:
     data_root = _write_preflight_dataset(tmp_path / "data")
     transformer = _write_preflight_file(tmp_path / "transformer.safetensors")
     embeddings_processor = _write_preflight_file(tmp_path / "embeddings_processor.safetensors")
-    video_vae = _write_preflight_file(tmp_path / "video_vae.safetensors")
 
     config = LtxTrainerConfig(
         model={
@@ -275,7 +274,6 @@ def test_trainer_preflight_accepts_split_components_without_unused_audio(tmp_pat
             "component_paths": {
                 "transformer": transformer,
                 "embeddings_processor": embeddings_processor,
-                "video_vae_decoder": video_vae,
             },
         },
         lora={"rank": 8, "alpha": 8, "target_modules": ["to_q"]},
@@ -295,6 +293,7 @@ def test_trainer_preflight_requires_used_split_audio_components(tmp_path: Path) 
     embeddings_processor = _write_preflight_file(tmp_path / "embeddings_processor.safetensors")
     video_vae = _write_preflight_file(tmp_path / "video_vae.safetensors")
     audio_vae = _write_preflight_file(tmp_path / "audio_vae.safetensors")
+    text_encoder = _write_preflight_file(tmp_path / "text_encoder.safetensors")
 
     config = LtxTrainerConfig(
         model={
@@ -305,11 +304,12 @@ def test_trainer_preflight_requires_used_split_audio_components(tmp_path: Path) 
                 "embeddings_processor": embeddings_processor,
                 "video_vae_decoder": video_vae,
                 "audio_vae_decoder": audio_vae,
+                "text_encoder": text_encoder,
             },
         },
         lora={"rank": 8, "alpha": 8, "target_modules": ["to_q"]},
         data={"preprocessed_data_root": str(data_root), "num_dataloader_workers": 0},
-        validation={"prompts": [], "interval": None, "generate_audio": True},
+        validation={"prompts": ["validation prompt"], "interval": 10, "generate_audio": True},
         output_dir=str(tmp_path / "outputs"),
     )
 
@@ -447,8 +447,7 @@ def test_gemma_key_ops_accept_hf_and_comfy_single_file_layouts() -> None:
         == "model.model.language_model.layers.47.self_attn.q_norm.weight"
     )
     assert (
-        GEMMA_LLM_KEY_OPS.apply_to_key("model.embed_tokens.weight")
-        == "model.model.language_model.embed_tokens.weight"
+        GEMMA_LLM_KEY_OPS.apply_to_key("model.embed_tokens.weight") == "model.model.language_model.embed_tokens.weight"
     )
     assert GEMMA_LLM_KEY_OPS.apply_to_key("_quantization_metadata") is None
 

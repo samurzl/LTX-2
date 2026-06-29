@@ -134,7 +134,6 @@ class ModelConfig(ConfigBaseModel):
         required_component_paths = {
             "transformer": self.component_paths.transformer,
             "embeddings_processor": self.component_paths.embeddings_processor,
-            "video_vae_decoder": self.component_paths.video_vae_decoder or self.component_paths.video_vae,
         }
         missing = [name for name, path in required_component_paths.items() if path is None]
         if missing:
@@ -744,6 +743,7 @@ class LtxTrainerConfig(ConfigBaseModel):
         if (
             self.training_strategy.name == "video_to_video"
             and self.validation.interval
+            and self.validation.prompts
             and not self.validation.reference_videos
         ):
             raise ValueError(

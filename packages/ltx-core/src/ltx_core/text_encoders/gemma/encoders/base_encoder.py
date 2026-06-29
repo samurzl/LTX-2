@@ -33,17 +33,25 @@ class GemmaTextEncoder(torch.nn.Module):
     def encode(
         self,
         text: str,
-        padding_side: str = "left",  # noqa: ARG002
+        padding_side: str = "left",
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """Run Gemma LLM and return raw hidden states + attention mask.
         Calls the inner model (self.model.model) to skip lm_head logits computation (~500 MiB saving).
         Returns:
             (hidden_states, attention_mask) where hidden_states is a tuple of per-layer tensors.
         """
-        token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
+        return self.encode_batch([text], padding_side=padding_side)
+
+    def encode_batch(
+        self,
+        texts: list[str],
+        padding_side: str = "left",  # noqa: ARG002
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Run the Gemma backbone once for a padded batch of prompts."""
         device = _language_model_device(self.model)
-        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=device)
-        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=device)
+        input_ids, attention_mask = self.tokenizer.tokenize_batch(texts)
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
         outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = outputs.hidden_states
         del outputs
@@ -208,9 +216,7 @@ def gemma_weight_paths_from_source(gemma_source: str | Path) -> tuple[str, ...]:
         model_folder = find_matching_file(str(source_path), "model*.safetensors").parent
         return tuple(str(path) for path in sorted(model_folder.rglob("*.safetensors")))
 
-    raise FileNotFoundError(
-        f"Gemma source must be a directory or a single .safetensors file: {gemma_source}"
-    )
+    raise FileNotFoundError(f"Gemma source must be a directory or a single .safetensors file: {gemma_source}")
 
 
 def _find_optional_asset_root(gemma_source: str | Path, pattern: str) -> str | None:

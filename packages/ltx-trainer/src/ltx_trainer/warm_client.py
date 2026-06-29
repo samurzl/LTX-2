@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,11 @@ def submit_if_running(command: str, args: dict[str, Any]) -> bool:
     return response is not None
 
 
+def submit_argv_if_running(command: str, argv: list[str]) -> bool:
+    """Lightweight early-entry path used before importing Torch-heavy CLI modules."""
+    return submit_if_running(command, {"argv": argv})
+
+
 def request(command: str, args: dict[str, Any] | None = None, *, required: bool = True) -> dict[str, Any] | None:
     """Send one request and wait for the final response."""
     socket_path = default_socket_path()
@@ -66,6 +73,12 @@ def request(command: str, args: dict[str, Any] | None = None, *, required: bool 
         "protocol": PROTOCOL_VERSION,
         "command": command,
         "args": args or {},
+        "cwd": str(Path.cwd()),
+        "terminal": {
+            "stdout_isatty": sys.stdout.isatty(),
+            "stderr_isatty": sys.stderr.isatty(),
+            "columns": shutil.get_terminal_size(fallback=(100, 24)).columns,
+        },
     }
     try:
         client.sendall((json.dumps(payload, default=str) + "\n").encode())
@@ -74,10 +87,12 @@ def request(command: str, args: dict[str, Any] | None = None, *, required: bool 
                 response = json.loads(line)
                 status = response.get("status")
                 if status == "accepted":
-                    logger.info(
-                        "Warm model server accepted the %s job. Live progress is shown in the server terminal.",
-                        command,
-                    )
+                    logger.info("Warm model server accepted the %s job", command)
+                    continue
+                if status == "output":
+                    target = sys.stderr if response.get("stream") == "stderr" else sys.stdout
+                    target.write(str(response.get("text", "")))
+                    target.flush()
                     continue
                 if status == "ok":
                     return response

@@ -128,11 +128,14 @@ def main(
         for index, (kind, job) in enumerate(zip(kinds, jobs, strict=True), start=1):
             console.rule(f"Job {index}/{len(jobs)}: {kind}")
             if kind == "preprocess":
-                preprocess_dataset(**_preprocess_args(job, index), model_pool=model_pool)
+                try:
+                    preprocess_dataset(**_preprocess_args(job, index), model_pool=model_pool)
+                finally:
+                    model_pool.clear_artifacts("precomputed_dataset")
                 continue
 
             config, disable_progress_bars = training_jobs[index]
-            preflight = LtxvTrainer.preflight_config(config)
+            preflight = LtxvTrainer.preflight_config(config, model_pool=model_pool)
             use_warm_pool = config.model.training_mode == "lora"
             if not use_warm_pool:
                 console.print(

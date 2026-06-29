@@ -1,5 +1,6 @@
 from enum import Enum
 
+from torch import Tensor
 from transformers import AutoTokenizer
 
 
@@ -57,16 +58,7 @@ class LTXVGemmaTokenizer:
             >>> tokenizer.tokenize_with_weights("hello world")
             {'gemma': [(1234, 1), (5678, 1), (2, 0), ...]}
         """
-        text = text.strip()
-        encoded = self.tokenizer(
-            text,
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        input_ids = encoded.input_ids
-        attention_mask = encoded.attention_mask
+        input_ids, attention_mask = self.tokenize_batch([text])
         tuples = [
             (token_id, attn, i) for i, (token_id, attn) in enumerate(zip(input_ids[0], attention_mask[0], strict=True))
         ]
@@ -77,3 +69,14 @@ class LTXVGemmaTokenizer:
             out = {k: [(t, w) for t, w, _ in v] for k, v in out.items()}
 
         return out
+
+    def tokenize_batch(self, texts: list[str]) -> tuple[Tensor, Tensor]:
+        """Tokenize a batch with the same padding/truncation semantics as the scalar API."""
+        encoded = self.tokenizer(
+            [text.strip() for text in texts],
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        return encoded.input_ids, encoded.attention_mask
